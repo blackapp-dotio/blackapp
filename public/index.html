@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BlackApp Checkout</title>
+  <script src="https://js.braintreegateway.com/web/dropin/1.43.0/js/dropin.min.js"></script>
+  <style>
+    body {
+      background-color: #000;
+      color: #fff;
+      font-family: 'Helvetica Neue', sans-serif;
+      padding: 30px;
+      text-align: center;
+    }
+    #dropin-container {
+      margin: 30px auto;
+      max-width: 400px;
+    }
+    .button {
+      background-color: #1DB954;
+      color: white;
+      padding: 12px 24px;
+      font-size: 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    select {
+      padding: 10px;
+      margin-top: 10px;
+      font-size: 16px;
+      background: #111;
+      color: white;
+      border-radius: 6px;
+      border: 1px solid #555;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎟️ BlackApp Secure Checkout</h1>
+  <p id="desc">Loading...</p>
+
+  <select id="purchaseType">
+    <option value="ticket">🎟️ Buy Ticket</option>
+    <option value="table">🍽️ Book Table</option>
+  </select>
+
+  <div id="dropin-container"></div>
+  <button class="button" id="submit-button">Pay Now</button>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const ticketPrice = parseFloat(params.get("ticket")) || 20;
+    const tablePrice = parseFloat(params.get("table")) || 100;
+    const desc = params.get("desc") || "Event Purchase";
+
+    let selectedType = "ticket";
+    let selectedAmount = ticketPrice;
+
+    document.getElementById("desc").textContent = `Paying $${selectedAmount} for: ${desc}`;
+
+    const purchaseDropdown = document.getElementById("purchaseType");
+    purchaseDropdown.addEventListener("change", () => {
+      selectedType = purchaseDropdown.value;
+      selectedAmount = selectedType === "table" ? tablePrice : ticketPrice;
+      document.getElementById("desc").textContent = `Paying $${selectedAmount} for: ${desc}`;
+    });
+
+    fetch("https://us-central1-blackappios.cloudfunctions.net/generateClientToken")
+      .then(res => res.json())
+      .then(data => {
+        braintree.dropin.create({
+          authorization: data.clientToken,
+          container: '#dropin-container',
+          paypal: {
+            flow: 'checkout',
+            amount: selectedAmount,
+            currency: 'USD'
+          }
+        }, function (createErr, instance) {
+          if (createErr) {
+            console.error("Drop-in creation error:", createErr);
+            return;
+          }
+
+          const button = document.getElementById('submit-button');
+          button.addEventListener('click', () => {
+            instance.requestPaymentMethod((err, payload) => {
+              if (err) {
+                console.error("Payment method error:", err);
+                return;
+              }
+
+              fetch("https://us-central1-blackappios.cloudfunctions.net/createTransaction", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  amount: selectedAmount,
+                  paymentMethodNonce: payload.nonce,
+                  type: selectedType
+                })
+              })
+              .then(res => res.json())
+              .then(result => {
+                if (result.success || result.transaction) {
+                  window.location.href = "blackappios://payment-success";
+                  // Optional app redirect
+                  // window.location.href = "blackappios://payment-success";
+                } else {
+                  alert("❌ Payment failed: " + result.error);
+                }
+              })
+              .catch(err => {
+                console.error("Transaction error:", err);
+                alert("❌ Payment error: " + err.message);
+              });
+            });
+          });
+        });
+      })
+      .catch(err => {
+        console.error("Token fetch error:", err);
+        alert("Unable to initialize payment. Try again later.");
+      });
+  </script>
+</body>
+</html>
+

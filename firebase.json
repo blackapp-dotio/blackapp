@@ -1,0 +1,32 @@
+{
+  "functions": {
+    "source": "functions"
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/generateClientToken",
+        "function": "generateClientToken"
+      },
+      {
+        "source": "/createTransaction",
+        "function": "createTransaction"
+      },
+      {
+        "source": "/getCheckoutURL",
+        "function": "getCheckoutURL"
+      },
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
+
