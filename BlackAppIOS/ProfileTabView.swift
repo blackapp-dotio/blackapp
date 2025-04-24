@@ -1,109 +1,190 @@
 import SwiftUI
+import FirebaseDatabase
 import FirebaseAuth
+import SDWebImageSwiftUI
 
 struct ProfileTabView: View {
-    @EnvironmentObject var authVM: AuthViewModel
+    @State private var name = ""
+    @State private var bio = ""
+    @State private var profileImage: UIImage? = nil
+    @State private var showImagePicker = false
+    @State private var brands: [BrandModel] = []
     @State private var showCreateBrand = false
-    @State private var showEditAccount = false
+    @State private var isAdmin = false
+    @State private var showAGDashboard = false
 
     var body: some View {
         NavigationView {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    // ✅ Profile Header
+                VStack(spacing: 24) {
+                    // Admin button
                     HStack {
-                        Image(systemName: "person.circle.fill")
-                            .resizable()
-                            .frame(width: 60, height: 60)
-                            .foregroundColor(.blue)
+                        Spacer()
+                        if isAdmin {
+                            Button(action: { showAGDashboard = true }) {
+                                Image("ag-global-logo")
+                                    .resizable()
+                                    .frame(width: 40, height: 40)
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
 
-                        VStack(alignment: .leading) {
-                            Text(authVM.user?.email ?? "User Email")
+                    // Profile Info Section
+                    VStack(spacing: 10) {
+                        if let profileImage = profileImage {
+                            Image(uiImage: profileImage)
+                                .resizable()
+                                .frame(width: 100, height: 100)
+                                .clipShape(Circle())
+                        } else {
+                            Circle()
+                                .fill(Color.gray.opacity(0.4))
+                                .frame(width: 100, height: 100)
+                                .overlay(
+                                    Image(systemName: "person.fill")
+                                        .foregroundColor(.white)
+                                )
+                        }
+
+                        Button("Edit Profile Picture") {
+                            showImagePicker = true
+                        }
+
+                        TextField("Your Name", text: $name)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                        TextField("Short Bio", text: $bio)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                    }
+                    .padding(.horizontal)
+
+                    Divider()
+
+                    // Brand Management Section
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Your Brands")
                                 .font(.headline)
-                            Text("Manage your account and settings")
-                                .font(.caption)
-                                .foregroundColor(.gray)
-                        }
-                    }
-
-                    Divider()
-
-                    // ✅ Account Settings Section
-                    Section(header: Text("Account Settings").font(.title3).bold()) {
-                        Button("Edit Account Details") {
-                            showEditAccount = true
+                            Spacer()
+                            Button("Create a Brand") {
+                                showCreateBrand = true
+                            }
                         }
 
-                        Button("Sign Out") {
-                            authVM.signOut()
-                        }
-                        .foregroundColor(.red)
-                    }
-
-                    Divider()
-
-                    // ✅ Brand Management Section
-                    Section(header: Text("My Brands").font(.title3).bold()) {
-                        Button("Create a Brand") {
-                            showCreateBrand = true
-                        }
-
-                        // Placeholder brand list
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 16) {
-                                // TODO: Replace with actual user brands
-                                ForEach(0..<3) { _ in
+                            HStack(spacing: 12) {
+                                ForEach(brands) { brand in
                                     VStack {
-                                        Image(systemName: "building.2.fill")
-                                            .resizable()
-                                            .frame(width: 50, height: 50)
-                                            .foregroundColor(.purple)
-                                        Text("Brand Name")
+                                        if let url = URL(string: brand.logoURL ?? "") {
+                                            WebImage(url: url)
+                                                .resizable()
+                                                .frame(width: 80, height: 80)
+                                                .clipShape(Circle())
+                                        } else {
+                                            Circle()
+                                                .fill(Color.gray)
+                                                .frame(width: 80, height: 80)
+                                        }
+
+                                        Text(brand.name)
                                             .font(.caption)
+                                            .foregroundColor(.white)
                                     }
-                                    .padding()
-                                    .background(Color.gray.opacity(0.1))
-                                    .cornerRadius(10)
+                                    .onTapGesture {
+                                        // Navigate to backend dashboard
+                                        // Navigation logic for brand backend can be placed here
+                                    }
                                 }
                             }
                         }
                     }
+                    .padding(.horizontal)
 
                     Divider()
 
-                    // ✅ Social Sync Section
-                    Section(header: Text("Connected Platforms").font(.title3).bold()) {
-                        Text("Meta: Synced")
-                        Text("X: Not Synced")
-                        // Add buttons for connect/disconnect later
-                    }
+                    // Social Media Sync Section
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Connected Accounts")
+                            .font(.headline)
 
-                    Divider()
-
-                    // ✅ User Wall Section
-                    Section(header: Text("Your Wall").font(.title3).bold()) {
-                        Text("This is where your personal posts live.")
-                        // Placeholder for user posts
-                        VStack(spacing: 12) {
-                            ForEach(0..<2) { _ in
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.gray.opacity(0.2))
-                                    .frame(height: 100)
-                                    .overlay(Text("Post Content"))
+                        HStack(spacing: 16) {
+                            ForEach(["facebook", "twitter", "instagram", "tiktok", "youtube"], id: \.self) { platform in
+                                Image(platform)
+                                    .resizable()
+                                    .frame(width: 32, height: 32)
                             }
                         }
                     }
+                    .padding(.horizontal)
+
+                    Divider()
+
+                    // User Wall Section
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Your Wall")
+                            .font(.headline)
+                        Text("This space will stream your posts from connected platforms.")
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+                            .padding(.bottom, 4)
+
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.gray.opacity(0.2))
+                            .frame(height: 120)
+                            .overlay(
+                                Text("Your social feed goes here.")
+                                    .foregroundColor(.gray)
+                            )
+                    }
+                    .padding(.horizontal)
                 }
-                .padding()
+                .padding(.top)
             }
-            .navigationTitle("My Profile")
+            .navigationTitle("Your Profile")
+            .background(Color.black)
+            .preferredColorScheme(.dark)
+            .sheet(isPresented: $showImagePicker) {
+                ImagePicker(selectedImage: $profileImage)
+            }
             .sheet(isPresented: $showCreateBrand) {
                 CreateBrandView()
             }
-            .sheet(isPresented: $showEditAccount) {
-                EditAccountView()
+            .sheet(isPresented: $showAGDashboard) {
+                AGDashboardView()
+            }
+            .onAppear {
+                checkAdminStatus()
+                fetchUserBrands()
             }
         }
-        .preferredColorScheme(.dark)
+    }
+
+    func checkAdminStatus() {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("admins").child(uid)
+        ref.observeSingleEvent(of: .value) { snapshot in
+            isAdmin = snapshot.exists()
+        }
+    }
+
+    func fetchUserBrands() {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("brands")
+
+        ref.observeSingleEvent(of: .value, with: { snapshot in
+            var userBrands: [BrandModel] = []
+            for case let child as DataSnapshot in snapshot.children {
+                if let dict = child.value as? [String: Any],
+                   let brand = BrandModel.from(dict: dict, id: child.key),
+                   brand.ownerId == uid {
+                    userBrands.append(brand)
+                }
+            }
+            DispatchQueue.main.async {
+                self.brands = userBrands
+            }
+        })
+
+
     }
 }

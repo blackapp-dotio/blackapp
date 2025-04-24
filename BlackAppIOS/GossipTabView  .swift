@@ -13,34 +13,18 @@ struct GossipTabView: View {
     @State private var isLoading = true
 
     let rssFeedURLs = [
-        "https://rss.app/feeds/hXAXAKLk6J0sbRX0.xml",
         "https://rss.app/feeds/a0BC3EgcQ2gi6jt9.xml",
         "https://rss.app/feeds/MDlghVUX5yvecvRG.xml",
-        "https://www.pulse.ng/entertainment/rss",
-        "https://www.theafricanmirror.africa/arts-and-entertainment/feed/",
-        "https://www.africanexponent.com/rss/entertainment",
         "https://www.okayafrica.com/music/rss/",
         "https://celebrity.nine.com.au/rss",
         "https://www.allabouttrh.com/feed/",
         "https://bckonline.com/feed/",
         "https://balleralert.com/feed/",
-        "https://rss.app/feeds/nsmT2WdQXSlshmcy.xml",
-        "https://rss.app/feeds/XqrrnyuiP2E5gvZY.xml",
-        "https://rss.app/feeds/Vgjdsm6FBHT3mj4G.xml",
         "https://www.buzzfeed.com/celebrity.xml",
-        "https://rss.app/feeds/3zTVOBAND5ezpD5g.xml",
         "https://sahiphopmag.co.za/feed/",
-        "https://naijavibes.com/feed/",
         "https://tooxclusive.com/feed/",
         "https://theshaderoom.com/latest-tea/feed/",
-        "https://www.ghanacelebrities.com/feed/",
-        "https://theblackmedia.org/feed/",
         "https://afro.com/section/arts-entertainment/feed/",
-        "https://globalgrind.com/category/entertainment/feed/",
-        "https://www.thesouthafrican.com/culture/entertainment/",
-        "https://rss.app/feeds/keM7mXLp4OlutaGg.xml",
-        "https://rss.app/feeds/KwsTlmbvwXiY4YX6.xml",
-        "https://rss.app/feeds/fQ6cY8V57Sk5ayox.xml"
     ]
 
     var body: some View {
