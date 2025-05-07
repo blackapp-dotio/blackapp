@@ -19,7 +19,7 @@ struct MainTabView: View {
                     Text("Explore")
                 }
             
-            Text("Chat Tab Coming Soon")
+            ChatTabView()
                 .tabItem {
                     Label("Chat", systemImage: "message")
                 }

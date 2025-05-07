@@ -2,77 +2,52 @@ import SwiftUI
 import SDWebImageSwiftUI
 
 struct BrandStorefrontView: View {
-    let brand: BrandModel
+    var brand: BrandModel
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                // Logo
-                if !brand.logoURL.isEmpty, let url = URL(string: brand.logoURL) {
-                    WebImage(url: url)                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity)
-                        .cornerRadius(12)
+            VStack(spacing: 20) {
+                if let logoURL = brand.logoURL, let url = URL(string: logoURL) {
+                    WebImage(url: url)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 120, height: 120)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                        .shadow(radius: 5)
+                } else {
+                    Image(systemName: "building.2.crop.circle.fill")
+                        .resizable()
+                        .frame(width: 120, height: 120)
+                        .foregroundColor(.gray)
                 }
 
-                // Name & Description
                 Text(brand.name)
                     .font(.largeTitle)
                     .bold()
                     .foregroundColor(.white)
 
-                Text(brand.description)
-                    .font(.body)
-                    .foregroundColor(.gray)
-
-                Divider()
-
-                // 🛍️ Products Section
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("🛍️ Products")
-                        .font(.headline)
+                if let desc = brand.description, !desc.isEmpty {
+                    Text(desc)
                         .foregroundColor(.white)
-                    Text("List of products offered by the brand will appear here.")
-                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
                 }
 
-                Divider()
+                Divider().background(Color.white.opacity(0.2))
 
-                // 🧰 Services Section
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("🧰 Services")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                    Text("List of services provided by the brand will appear here.")
-                        .foregroundColor(.gray)
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Shop")
+                    Text("Services")
+                    Text("Blog")
+                    Text("Bookings")
                 }
-
-                Divider()
-
-                // 📝 Blog Section
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("📝 Blog")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                    Text("Latest blog posts from this brand will be shown here.")
-                        .foregroundColor(.gray)
-                }
-
-                Divider()
-
-                // 📅 Booking/Reservation Section
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("📅 Bookings")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                    Text("Reservation or table booking tools will be displayed here.")
-                        .foregroundColor(.gray)
-                }
+                .foregroundColor(.white)
+                .padding(.horizontal)
             }
             .padding()
         }
         .background(Color.black.ignoresSafeArea())
-        .navigationTitle(brand.name)
+        .navigationTitle("Storefront")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
