@@ -8,7 +8,7 @@ struct MainTabView: View {
                     Label("Gossip", systemImage: "quote.bubble")
                 }
 
-            EventsTabView()
+            EventTabView()
                 .tabItem {
                     Label("Events", systemImage: "calendar")
                 }

@@ -29,13 +29,23 @@ exports.generateClientToken = functions.https.onRequest((req, res) => {
 // ✅ 2. Public transaction creation with 2% platform fee
 exports.createTransaction = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
-    const { amount, paymentMethodNonce, type } = req.body;
+    const {
+      amount,
+      paymentMethodNonce,
+      userId,
+      eventId,
+      eventName,
+      type,
+      quantity
+    } = req.body;
 
-    if (!amount || !paymentMethodNonce) {
-      return res.status(400).send({ error: "Missing amount or paymentMethodNonce" });
+    if (!amount || !paymentMethodNonce || !userId || !eventId || !eventName || !type || !quantity) {
+      return res.status(400).send({ error: "Missing required transaction fields" });
     }
 
-    const total = (parseFloat(amount) * 1.02).toFixed(2); // 2% fee
+    const baseAmount = parseFloat(amount);
+    const total = (baseAmount * 1.02).toFixed(2); // 2% platform fee
+    const platformFee = (total - baseAmount).toFixed(2);
 
     try {
       const result = await gateway.transaction.sale({
@@ -48,7 +58,23 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
         throw new Error(result.message);
       }
 
-      res.status(200).send(result);
+      // ✅ Save purchase data to Firebase
+      const ref = admin.database().ref(`purchases/${userId}`).push();
+      const timestamp = Date.now();
+
+      await ref.set({
+        id: ref.key,
+        eventId,
+        eventName,
+        type,
+        quantity,
+        amount: total,
+        baseAmount: baseAmount.toFixed(2),
+        platformFee,
+        timestamp
+      });
+
+      res.status(200).send({ success: true, transactionId: result.transaction.id });
     } catch (error) {
       console.error("Transaction failed:", error);
       res.status(500).send({ error: error.message });
@@ -69,4 +95,5 @@ exports.getCheckoutURL = functions.https.onRequest((req, res) => {
     res.status(200).send({ checkoutURL: redirectURL });
   });
 });
+
 
