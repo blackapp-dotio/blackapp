@@ -6,6 +6,7 @@ import FirebaseStorage
 import FirebaseDatabase
 import FeedKit
 import WebKit
+// import SharedModels // if it’s inside a module
 
 struct EventModel: Identifiable {
     var id: String
@@ -47,6 +48,169 @@ struct EventModel: Identifiable {
         )
     }
 }
+
+// MARK: - MyEventsView
+import SwiftUI
+import Firebase
+
+struct MyEventsView: View {
+    @State private var myCreatedEvents: [EventModel] = []
+    @State private var myPurchasedEvents: [PurchaseModel] = []
+    @State private var selectedURL: URL? = nil
+    @State private var showWebView = false
+
+    @State private var selectedEventToEdit: EventModel? = nil
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text("Events I've Created")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    ForEach(myCreatedEvents) { event in
+                        VStack(alignment: .leading) {
+                            EventCardView(event: event, selectedURL: $selectedURL, showWebView: $showWebView)
+
+                            HStack {
+                                Button("Edit") {
+                                    selectedEventToEdit = event
+                                }
+                                .padding(8)
+                                .background(Color.orange)
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
+
+                                Button("Delete") {
+                                    deleteEvent(event)
+                                }
+                                .padding(8)
+                                .background(Color.red)
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+
+                    Divider().padding(.vertical)
+
+                    Text("Events I've Purchased")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    ForEach(myPurchasedEvents) { purchase in
+                        VStack(alignment: .leading) {
+                            EventImageView(imagePath: purchase.eventImagePath)
+                                .frame(height: 200)
+                                .cornerRadius(10)
+
+                            Text(purchase.eventTitle)
+                                .font(.headline)
+
+                            Text("Date: \(formattedDate(from: purchase.timestamp))")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+
+                            Button("View Ticket") {
+                                selectedURL = URL(string: "https://blackappios.web.app/receipt?purchaseId=\(purchase.id)")
+                                showWebView = true
+                            }
+                            .padding(8)
+                            .background(Color.green)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                        .padding(.horizontal)
+                    }
+                }
+            }
+            .navigationTitle("My Events")
+            .onAppear {
+                fetchMyEvents()
+                fetchMyPurchasedEvents()
+            }
+            .sheet(item: $selectedEventToEdit) { event in
+                EditEventView(event: event)
+            }
+            .sheet(isPresented: $showWebView) {
+                if let url = selectedURL {
+                    WebView(url: url).edgesIgnoringSafeArea(.all)
+                }
+            }
+        }
+    }
+
+    private func fetchMyEvents() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("events")
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            var createdEvents: [EventModel] = []
+
+            for child in snapshot.children {
+                if let childSnapshot = child as? DataSnapshot,
+                   let event = EventModel.from(snapshot: childSnapshot),
+                   event.userId == userId {
+                    createdEvents.append(event)
+                }
+            }
+
+            self.myCreatedEvents = createdEvents.sorted { $0.date > $1.date }
+        }
+    }
+
+    private func fetchMyPurchasedEvents() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("purchases").child(userId)
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            var purchases: [PurchaseModel] = []
+
+            for case let child as DataSnapshot in snapshot.children {
+                guard let value = child.value as? [String: Any] else { continue }
+
+                let model = PurchaseModel(
+                    id: child.key,
+                    userId: value["userId"] as? String ?? "",
+                    eventId: value["eventId"] as? String ?? "",
+                    eventTitle: value["eventTitle"] as? String ?? "Untitled Event",
+                    eventImagePath: value["eventImagePath"] as? String ?? "",
+                    quantity: value["quantity"] as? Int ?? 0,
+                    type: value["type"] as? String ?? "ticket",
+                    totalAmount: value["totalAmount"] as? Double ?? 0.0,
+                    timestamp: value["timestamp"] as? TimeInterval ?? 0.0
+                )
+
+                purchases.append(model)
+            }
+
+            let sortedPurchases = purchases.sorted { $0.timestamp > $1.timestamp }
+            self.myPurchasedEvents = sortedPurchases
+        }
+    }
+
+    private func deleteEvent(_ event: EventModel) {
+        let ref = Database.database().reference().child("events").child(event.id)
+        ref.removeValue { error, _ in
+            if let error = error {
+                print("❌ Failed to delete event: \(error.localizedDescription)")
+            } else {
+                self.myCreatedEvents.removeAll { $0.id == event.id }
+            }
+        }
+    }
+
+    private func formattedDate(from timestamp: TimeInterval) -> String {
+        let date = Date(timeIntervalSince1970: timestamp)
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
 
 // MARK: - EventTabView
 struct EventTabView: View {
@@ -502,227 +666,67 @@ struct EditEventView: View {
         }
     }
 }
-// MARK: - MyEventsView
-import SwiftUI
-import Firebase
 
-struct MyEventsView: View {
-    @State private var myCreatedEvents: [EventModel] = []
-    @State private var myPurchasedEvents: [EventModel] = []
-    @State private var selectedURL: URL? = nil
-    @State private var showWebView = false
-
-    // For editing modal
-    @State private var selectedEventToEdit: EventModel? = nil
-
-    var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    Text("Events I've Created")
-                        .font(.headline)
-                        .padding(.horizontal)
-
-                    ForEach(myCreatedEvents) { event in
-                        VStack(alignment: .leading) {
-                            EventCardView(event: event, selectedURL: $selectedURL, showWebView: $showWebView)
-
-                            HStack {
-                                Button("Edit") {
-                                    selectedEventToEdit = event
-                                }
-                                .padding(8)
-                                .background(Color.orange)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
-
-                                Button("Delete") {
-                                    deleteEvent(event)
-                                }
-                                .padding(8)
-                                .background(Color.red)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
-                            }
-                            .padding(.horizontal)
-                        }
-                    }
-
-                    Divider().padding(.vertical)
-
-                    Text("Events I've Purchased")
-                        .font(.headline)
-                        .padding(.horizontal)
-
-                    ForEach(myPurchasedEvents) { event in
-                        EventCardView(event: event, selectedURL: $selectedURL, showWebView: $showWebView)
-                    }
-                }
-            }
-            .navigationTitle("My Events")
-            .onAppear {
-                fetchMyEvents()
-                fetchMyPurchasedEvents()
-            }
-            .sheet(item: $selectedEventToEdit) { event in
-                EditEventView(event: event)
-            }
-            .sheet(isPresented: $showWebView) {
-                if let url = selectedURL {
-                    WebView(url: url).edgesIgnoringSafeArea(.all)
-                }
-            }
-        }
-    }
-
-    private func fetchMyEvents() {
-        guard let userId = Auth.auth().currentUser?.uid else { return }
-        let ref = Database.database().reference().child("events")
-
-        ref.observeSingleEvent(of: .value, with: { snapshot in
-            var createdEvents: [EventModel] = []
-
-            for child in snapshot.children {
-                if let childSnapshot = child as? DataSnapshot,
-                   let event = EventModel.from(snapshot: childSnapshot),
-                   event.userId == userId {
-                    createdEvents.append(event)
-                }
-            }
-
-            self.myCreatedEvents = createdEvents.sorted { $0.date > $1.date }
-        })
-    }
-
-    private func fetchMyPurchasedEvents() {
-        // Placeholder logic
-        self.myPurchasedEvents = []
-    }
-
-    private func deleteEvent(_ event: EventModel) {
-        let ref = Database.database().reference().child("events").child(event.id)
-        ref.removeValue { error, _ in
-            if let error = error {
-                print("❌ Failed to delete event: \(error.localizedDescription)")
-            } else {
-                self.myCreatedEvents.removeAll { $0.id == event.id }
-            }
-        }
-    }
-}
 
 import SwiftUI
 import FirebaseStorage
 
-// MARK: - EventCardView with Floating Purchase Overlay
 struct EventCardView: View {
     let event: EventModel
     @Binding var selectedURL: URL?
     @Binding var showWebView: Bool
 
-    @State private var showOverlay = false
-    @State private var purchaseType: String = "ticket"
-    @State private var selectedQuantity = 1
-
     var body: some View {
-        ZStack {
-            VStack(alignment: .leading) {
-                EventImageView(imagePath: event.imagePath)
-                    .frame(height: 200)
-                    .clipped()
-                    .cornerRadius(10)
+        VStack(alignment: .leading) {
+            EventImageView(imagePath: event.imagePath)
+                .frame(height: 200)
+                .clipped()
+                .cornerRadius(10)
 
-                Text(event.title)
-                    .font(.headline)
-                    .padding(.top, 5)
+            Text(event.title)
+                .font(.headline)
+                .padding(.top, 5)
 
-                Text(event.description)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
+            Text(event.description)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
 
-                if event.ticketPrice > 0 && event.ticketQuantity > 0 {
-                    Button(action: {
-                        purchaseType = "ticket"
-                        selectedQuantity = 1
-                        showOverlay = true
-                    }) {
-                        Text("Buy Ticket - $\(String(format: "%.2f", event.ticketPrice * 1.02))")
-                            .font(.subheadline)
-                            .foregroundColor(.white)
-                            .padding()
-                            .frame(maxWidth: .infinity)
-                            .background(Color.blue)
-                            .cornerRadius(8)
-                    }
-                    .padding(.top, 8)
-                }
-
-                if event.tablePrice > 0 && event.tableQuantity > 0 {
-                    Button(action: {
-                        purchaseType = "table"
-                        selectedQuantity = 1
-                        showOverlay = true
-                    }) {
-                        Text("Book Table - $\(String(format: "%.2f", event.tablePrice * 1.02))")
-                            .font(.subheadline)
-                            .foregroundColor(.white)
-                            .padding()
-                            .frame(maxWidth: .infinity)
-                            .background(Color.purple)
-                            .cornerRadius(8)
-                    }
-                    .padding(.top, 4)
-                }
-            }
-            .padding()
-            .onTapGesture {
-                if let url = URL(string: event.description) {
-                    selectedURL = url
-                    showWebView = true
-                }
-            }
-
-            if showOverlay {
-                Color.black.opacity(0.5)
-                    .edgesIgnoringSafeArea(.all)
-
-                VStack(spacing: 16) {
-                    Text("Confirm \(purchaseType.capitalized) Purchase")
-                        .font(.headline)
-
-                    Stepper("Quantity: \(selectedQuantity)", value: $selectedQuantity, in: 1...(purchaseType == "ticket" ? event.ticketQuantity : event.tableQuantity))
-                        .padding(.horizontal)
-
-                    let unitPrice = purchaseType == "ticket" ? event.ticketPrice : event.tablePrice
-                    let totalPrice = unitPrice * Double(selectedQuantity) * 1.02
-
-                    Text("Total: $\(String(format: "%.2f", totalPrice))")
-                        .font(.title2)
-                        .bold()
-
-                    HStack(spacing: 20) {
-                        Button("Cancel") {
-                            showOverlay = false
-                        }
-                        .foregroundColor(.red)
-
-                        Button("Confirm & Pay") {
-                            openCheckout(for: event, type: purchaseType, quantity: selectedQuantity)
-                            showOverlay = false
-                        }
+            if event.ticketPrice > 0 && event.ticketQuantity > 0 {
+                Button(action: {
+                    openCheckout(for: event, type: "ticket", quantity: 1)
+                }) {
+                    Text("Buy Ticket - $\(String(format: "%.2f", event.ticketPrice * 1.02))")
+                        .font(.subheadline)
                         .foregroundColor(.white)
-                        .padding(.horizontal)
-                        .padding(.vertical, 8)
-                        .background(Color.green)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue)
                         .cornerRadius(8)
-                    }
                 }
-                .padding()
-                .frame(maxWidth: 300)
-                .background(Color.white)
-                .cornerRadius(12)
-                .shadow(radius: 10)
+                .padding(.top, 8)
+            }
+
+            if event.tablePrice > 0 && event.tableQuantity > 0 {
+                Button(action: {
+                    openCheckout(for: event, type: "table", quantity: 1)
+                }) {
+                    Text("Book Table - $\(String(format: "%.2f", event.tablePrice * 1.02))")
+                        .font(.subheadline)
+                        .foregroundColor(.white)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.purple)
+                        .cornerRadius(8)
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding()
+        .onTapGesture {
+            if let url = URL(string: event.description) {
+                selectedURL = url
+                showWebView = true
             }
         }
     }
@@ -731,7 +735,7 @@ struct EventCardView: View {
         let unitPrice = type == "ticket" ? event.ticketPrice : event.tablePrice
         let totalPrice = unitPrice * Double(quantity) * 1.02
 
-        var components = URLComponents(string: "https://checkout.blackapp.com/buy")!
+        var components = URLComponents(string: "https://blackappios.web.app")!
         components.queryItems = [
             URLQueryItem(name: "eventId", value: event.id),
             URLQueryItem(name: "type", value: type),
@@ -742,12 +746,12 @@ struct EventCardView: View {
         ]
 
         if let url = components.url {
+            print("🌐 Opening checkout: \(url.absoluteString)")
             selectedURL = url
             showWebView = true
         }
     }
 }
-
 
             // MARK: - RSSCardView
             struct RSSCardView: View {
@@ -803,59 +807,101 @@ struct EventCardView: View {
             }
             
             
-            // MARK: - EventDetailView
-            struct EventDetailView: View {
-                let event: EventModel
-                @State private var showWebView = false
-                @State private var selectedURL: URL?
-                
-                var body: some View {
-                    ScrollView {
-                        VStack(alignment: .leading) {
-                            EventImageView(imagePath: event.imagePath)
-                                .frame(height: 250)
-                                .cornerRadius(12)
-                            
-                            Text(event.title)
-                                .font(.title)
-                                .bold()
-                                .padding(.top)
-                            
-                            Text(event.description)
-                                .padding(.vertical)
-                            
-                            Text("Date: \(formattedDate(event.date))")
-                                .font(.subheadline)
-                                .foregroundColor(.gray)
-                            
-                            Button("Buy Ticket") {
-                                selectedURL = URL(string: "https://checkout.blackapp.com/event/\(event.id)")
-                                showWebView = true
-                            }
-                            .padding()
-                            .frame(maxWidth: .infinity)
-                            .background(Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
-                        }
-                        .padding()
+import SwiftUI
+import Firebase
+
+// MARK: - EventDetailView
+struct EventDetailView: View {
+    let event: EventModel
+    @State private var showWebView = false
+    @State private var selectedURL: URL?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading) {
+                EventImageView(imagePath: event.imagePath)
+                    .frame(height: 250)
+                    .cornerRadius(12)
+
+                Text(event.title)
+                    .font(.title)
+                    .bold()
+                    .padding(.top)
+
+                Text(event.description)
+                    .padding(.vertical)
+
+                Text("Date: \(formattedDate(event.date))")
+                    .font(.subheadline)
+                    .foregroundColor(.gray)
+
+                if event.ticketPrice > 0 && event.ticketQuantity > 0 {
+                    Button("Buy Ticket - $\(String(format: "%.2f", event.ticketPrice * 1.02))") {
+                        openCheckout(type: "ticket", price: event.ticketPrice)
                     }
-                    .sheet(isPresented: $showWebView) {
-                        if let url = selectedURL {
-                            WebView(url: url).edgesIgnoringSafeArea(.all)
-                        }
-                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
                 }
-                
-                func formattedDate(_ date: Date) -> String {
-                    let formatter = DateFormatter()
-                    formatter.dateStyle = .medium
-                    formatter.timeStyle = .short
-                    return formatter.string(from: date)
+
+                if event.tablePrice > 0 && event.tableQuantity > 0 {
+                    Button("Book Table - $\(String(format: "%.2f", event.tablePrice * 1.02))") {
+                        openCheckout(type: "table", price: event.tablePrice)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.purple)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
                 }
             }
-            
-            // MARK: - EventFeedView
+            .padding()
+        }
+        .fullScreenCover(isPresented: $showWebView) {
+            if let url = selectedURL {
+                NavigationView {
+                    WebView(url: url)
+                        .navigationBarTitle("Secure Checkout", displayMode: .inline)
+                        .navigationBarItems(trailing: Button("Close") {
+                            showWebView = false
+                        })
+                }
+            }
+        }
+    }
+
+    func openCheckout(type: String, price: Double) {
+        let totalPrice = price * 1.02
+        var components = URLComponents(string: "https://blackappios.web.app")!
+        components.queryItems = [
+            URLQueryItem(name: "eventId", value: event.id),
+            URLQueryItem(name: "type", value: type),
+            URLQueryItem(name: "price", value: String(format: "%.2f", totalPrice)),
+            URLQueryItem(name: "quantity", value: "1"),
+            URLQueryItem(name: "payoutMethod", value: event.payoutMethod),
+            URLQueryItem(name: "payoutDetails", value: event.payoutDetails)
+        ]
+
+        if let url = components.url {
+            print("🌐 Opening checkout: \(url.absoluteString)")
+            selectedURL = url
+            showWebView = true
+        } else {
+            print("❌ Failed to generate checkout URL")
+        }
+    }
+
+    func formattedDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
+// MARK: - EventFeedView
             struct EventFeedView: View {
                 @State private var platformEvents: [EventModel] = []
                 @State private var rssArticles: [RSSArticle] = []

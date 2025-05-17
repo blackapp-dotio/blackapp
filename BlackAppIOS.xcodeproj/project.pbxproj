@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		4D145EED2DD81E8800187598 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 4D145EEC2DD81E8800187598 /* FirebaseMessaging */; };
 		4DC652C82DC48F6C00647786 /* FontAwesome in Frameworks */ = {isa = PBXBuildFile; productRef = 4DC652C72DC48F6C00647786 /* FontAwesome */; };
 		4DC652CA2DC48F6C00647786 /* tools in Frameworks */ = {isa = PBXBuildFile; productRef = 4DC652C92DC48F6C00647786 /* tools */; };
 		DF2C69222D9E3DA8006B738D /* BraintreeApplePay in Frameworks */ = {isa = PBXBuildFile; productRef = DF2C69212D9E3DA8006B738D /* BraintreeApplePay */; };
@@ -99,6 +100,7 @@
 				DF6B9A492DADAE7200C228A2 /* SDWebImageSwiftUI in Frameworks */,
 				DF2C695E2D9ED959006B738D /* BraintreeAmericanExpress in Frameworks */,
 				DF3D08BC2D9B7BF500674B8E /* FirebaseCore in Frameworks */,
+				4D145EED2DD81E8800187598 /* FirebaseMessaging in Frameworks */,
 				DF3D08C92D9BA0E000674B8E /* GoogleSignInSwift in Frameworks */,
 				DF2C692A2D9E543D006B738D /* BraintreeCore in Frameworks */,
 				DF3D08C02D9B7BF500674B8E /* FirebaseStorage in Frameworks */,
@@ -197,6 +199,7 @@
 				DF6B9A482DADAE7200C228A2 /* SDWebImageSwiftUI */,
 				4DC652C72DC48F6C00647786 /* FontAwesome */,
 				4DC652C92DC48F6C00647786 /* tools */,
+				4D145EEC2DD81E8800187598 /* FirebaseMessaging */,
 			);
 			productName = BlackAppIOS;
 			productReference = DFFD0B082D97B84100202596 /* BlackAppIOS.app */;
@@ -749,6 +752,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		4D145EEC2DD81E8800187598 /* FirebaseMessaging */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DF3D08BA2D9B302900674B8E /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseMessaging;
+		};
 		4DC652C72DC48F6C00647786 /* FontAwesome */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 4DC652C62DC48F6C00647786 /* XCRemoteSwiftPackageReference "FontAwesome" */;

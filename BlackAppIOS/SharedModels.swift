@@ -1,26 +1,29 @@
 import SwiftUI
 
 
-    // Message Model
-    struct ChatMessage: Identifiable {
-        let id = UUID()
-        let text: String
-        let isSender: Bool
-    }
-    
+struct ChatMessage: Identifiable {
+    var id: String
+    var text: String?
+    var mediaURL: String?
+    var type: String
+    var isSender: Bool
+    var documentId: String?
+    var edited: Bool
+    var likes: [String]
+    var comments: [[String: String]]
+    var reposts: [String]
+}
+
+
     // User Profile for Chats
-    struct ChatUserProfile: Identifiable {
-        let id: String
-        let name: String
-        let username: String  // ✅ Changed from 'email' to match usage
-    }
+struct ChatUserProfile: Identifiable, Codable {
+    let id: String
+    let name: String
+    let username: String
+    var profileImageURL: String? // ✅ Add this
+}
+
     
-    // Group Model
-    struct GroupChat: Identifiable {
-        let id: String
-        let name: String
-        let members: [String]
-    }
     
     // Chat Bubble Shape
     struct WaterDropShape: Shape {
