@@ -5,6 +5,8 @@ import FirebaseDatabase
 
 struct AGDashboardView: View {
     @State private var pendingBrands: [BrandModel] = []
+    @State private var approvedBrands: [BrandModel] = []
+    @State private var suspendedBrands: [BrandModel] = []
     @State private var users: [DashboardUser] = []
     @State private var filteredUsers: [DashboardUser] = []
     @State private var searchQuery: String = ""
@@ -12,27 +14,28 @@ struct AGDashboardView: View {
     @State private var superadmins: Set<String> = []
     @State private var platformStats: PlatformStats = .empty
     @State private var revenueStats: RevenueStats = .empty
+    @State private var selectedTile: String? = nil
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("🛠️ AG Dashboard")
+                Text("AG Dashboard")
                     .font(.largeTitle)
                     .bold()
                     .padding(.bottom, 10)
 
-                statsSection
-                Divider()
-                revenueSection
-                Divider()
-                brandApprovalSection
-                Divider()
-                userManagementSection
+                tileGridSection
+
+                if selectedTile == "users" { userManagementSection }
+                if selectedTile == "pendingBrands" { brandApprovalSection }
+                if selectedTile == "approvedBrands" { approvedBrandSection }
+                if selectedTile == "suspendedBrands" { suspendedBrandSection }
+                if selectedTile == "revenue" { revenueSection }
             }
             .padding()
         }
         .onAppear {
-            fetchPendingBrands()
+            fetchAllBrands()
             fetchUsers()
             fetchAdminList()
             fetchSuperAdminList()
@@ -43,57 +46,80 @@ struct AGDashboardView: View {
         .background(Color.black.ignoresSafeArea())
     }
 
-    // MARK: - UI Sections
+    // MARK: - Tile Grid
 
-    private var statsSection: some View {
-        VStack(alignment: .leading) {
-            Text("📊 Platform Stats").font(.title2).bold()
-            HStack(spacing: 32) {
-                statCard(label: "Users", value: "\(platformStats.totalUsers)")
-                statCard(label: "Brands", value: "\(platformStats.totalBrands)")
-                statCard(label: "Approved", value: "\(platformStats.approvedBrands)")
+    private var tileGridSection: some View {
+        LazyVGrid(columns: Array(repeating: .init(.flexible()), count: 2), spacing: 20) {
+            dashboardTile("Users", value: "\(platformStats.totalUsers)", tag: "users")
+            dashboardTile("Brands", value: "\(platformStats.totalBrands)", tag: "approvedBrands")
+            dashboardTile("Pending Brands", value: "\(pendingBrands.count)", tag: "pendingBrands")
+            dashboardTile("Suspended Brands", value: "\(suspendedBrands.count)", tag: "suspendedBrands")
+            dashboardTile("Revenue", value: "$\(revenueStats.total)", tag: "revenue")
+        }
+    }
+
+    private func dashboardTile(_ title: String, value: String, tag: String) -> some View {
+        Button(action: { selectedTile = tag }) {
+            VStack(spacing: 8) {
+                Text(value).font(.title).bold().foregroundColor(.white)
+                Text(title).font(.caption).foregroundColor(.gray)
             }
+            .frame(maxWidth: .infinity, minHeight: 100)
+            .background(Color.blue.opacity(0.2))
+            .cornerRadius(12)
         }
     }
 
-    private var revenueSection: some View {
-        VStack(alignment: .leading) {
-            Text("💰 Revenue").font(.title2).bold()
-            Text("Monthly: $\(revenueStats.monthly)")
-            Text("Total: $\(revenueStats.total)")
-                .foregroundColor(.green)
-        }
-    }
+    // MARK: - Brand Sections
 
     private var brandApprovalSection: some View {
         VStack(alignment: .leading) {
-            Text("✅ Approve Brands").font(.title2).bold()
-            ForEach(pendingBrands.filter { !$0.suspended }, id: \.id) { brand in
-                HStack {
-                    Text(brand.name)
-                        .bold()
-                        .foregroundColor(.white)
-                    Spacer()
-                    Button("Approve") { approveBrand(brand) }
-                        .buttonStyle(.borderedProminent)
-                    Button("Suspend") { suspendBrand(brand) }
-                        .foregroundColor(.yellow)
-                }
-                .padding(8)
-                .background(Color.gray.opacity(0.2))
-                .cornerRadius(8)
+            Text("Pending Brand Approvals").font(.title2).bold()
+            ForEach(pendingBrands, id: \..id) { brand in
+                brandRow(brand, showApprove: true, showSuspend: true)
             }
         }
+    }
+
+    private var approvedBrandSection: some View {
+        VStack(alignment: .leading) {
+            Text("Approved Brands").font(.title2).bold()
+            ForEach(approvedBrands, id: \..id) { brand in
+                brandRow(brand, showSuspend: true, showDelete: true)
+            }
+        }
+    }
+
+    private var suspendedBrandSection: some View {
+        VStack(alignment: .leading) {
+            Text("Suspended Brands").font(.title2).bold()
+            ForEach(suspendedBrands, id: \..id) { brand in
+                brandRow(brand, showApprove: true, showDelete: true)
+            }
+        }
+    }
+
+    private func brandRow(_ brand: BrandModel, showApprove: Bool = false, showSuspend: Bool = false, showDelete: Bool = false) -> some View {
+        HStack {
+            Text(brand.name).bold().foregroundColor(.white)
+            Spacer()
+            if showApprove { Button("Approve") { approveBrand(brand) }.buttonStyle(.borderedProminent) }
+            if showSuspend { Button("Suspend") { suspendBrand(brand) }.foregroundColor(.yellow) }
+            if showDelete { Button("Delete") { deleteBrand(brand) }.foregroundColor(.red) }
+        }
+        .padding(8)
+        .background(Color.gray.opacity(0.2))
+        .cornerRadius(8)
     }
 
     private var userManagementSection: some View {
         VStack(alignment: .leading) {
-            Text("👥 Manage Users").font(.title2).bold()
+            Text("Manage Users").font(.title2).bold()
             TextField("Search users", text: $searchQuery)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .onChange(of: searchQuery) { _ in filterUsers() }
 
-            ForEach(filteredUsers.filter { !$0.suspended }, id: \.id) { user in
+            ForEach(filteredUsers, id: \..id) { user in
                 HStack {
                     VStack(alignment: .leading) {
                         Text(user.name).bold()
@@ -105,17 +131,11 @@ struct AGDashboardView: View {
                     if superadmins.contains(user.id) {
                         Text("Superadmin").foregroundColor(.green)
                     } else if admins.contains(user.id) {
-                        Button("Remove Admin") {
-                            updateAdminStatus(user.id, makeAdmin: false)
-                        }.foregroundColor(.red)
+                        Button("Remove Admin") { updateAdminStatus(user.id, makeAdmin: false) }.foregroundColor(.red)
                     } else {
-                        Button("Make Admin") {
-                            updateAdminStatus(user.id, makeAdmin: true)
-                        }
+                        Button("Make Admin") { updateAdminStatus(user.id, makeAdmin: true) }
                     }
-                    Button("Suspend") {
-                        suspendUser(user)
-                    }.foregroundColor(.yellow)
+                    Button("Suspend") { suspendUser(user) }.foregroundColor(.yellow)
                 }
                 .padding(8)
                 .background(Color.gray.opacity(0.1))
@@ -124,40 +144,58 @@ struct AGDashboardView: View {
         }
     }
 
-    private func statCard(label: String, value: String) -> some View {
-        VStack {
-            Text(value)
-                .font(.system(size: 28, weight: .bold))
-                .foregroundColor(.white)
-            Text(label)
-                .font(.caption)
-                .foregroundColor(.gray)
+    private var revenueSection: some View {
+        VStack(alignment: .leading) {
+            Text("Revenue Report").font(.title2).bold()
+            Text("Monthly: $\(revenueStats.monthly)")
+            Text("Total: $\(revenueStats.total)").foregroundColor(.green)
         }
-        .frame(width: 100, height: 80)
-        .background(Color.blue.opacity(0.2))
-        .cornerRadius(12)
     }
 
-    // MARK: - Logic Functions
+    // MARK: - Firebase Logic
 
-    private func fetchPendingBrands() {
+    private func fetchAllBrands() {
         let ref = Database.database().reference().child("brands")
-        ref.observeSingleEvent(of: .value) { snapshot in
-            var brands: [BrandModel] = []
+        ref.observe(.value) { snapshot in
+            var pending: [BrandModel] = []
+            var approved: [BrandModel] = []
+            var suspended: [BrandModel] = []
             for case let child as DataSnapshot in snapshot.children {
                 if let dict = child.value as? [String: Any],
-                   let brand = BrandModel.from(dict: dict, id: child.key),
-                   brand.approved == false {
-                    brands.append(brand)
+                   let brand = BrandModel.from(dict: dict, id: child.key) {
+                    if brand.suspended {
+                        suspended.append(brand)
+                    } else if brand.approved {
+                        approved.append(brand)
+                    } else {
+                        pending.append(brand)
+                    }
                 }
             }
-            self.pendingBrands = brands
+            self.pendingBrands = pending
+            self.approvedBrands = approved
+            self.suspendedBrands = suspended
         }
+    }
+
+    private func approveBrand(_ brand: BrandModel) {
+        let ref = Database.database().reference().child("brands").child(brand.id)
+        ref.updateChildValues(["approved": true, "suspended": false])
+    }
+
+    private func suspendBrand(_ brand: BrandModel) {
+        let ref = Database.database().reference().child("brands").child(brand.id)
+        ref.updateChildValues(["suspended": true])
+    }
+
+    private func deleteBrand(_ brand: BrandModel) {
+        let ref = Database.database().reference().child("brands").child(brand.id)
+        ref.removeValue()
     }
 
     private func fetchUsers() {
         let ref = Database.database().reference().child("users")
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             var results: [DashboardUser] = []
             for case let child as DataSnapshot in snapshot.children {
                 if let dict = child.value as? [String: Any] {
@@ -177,7 +215,7 @@ struct AGDashboardView: View {
 
     private func fetchAdminList() {
         let ref = Database.database().reference().child("admins")
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             if let dict = snapshot.value as? [String: Bool] {
                 self.admins = Set(dict.compactMap { $0.value ? $0.key : nil })
             }
@@ -186,22 +224,11 @@ struct AGDashboardView: View {
 
     private func fetchSuperAdminList() {
         let ref = Database.database().reference().child("superadmin")
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             if let dict = snapshot.value as? [String: Bool] {
                 self.superadmins = Set(dict.compactMap { $0.value ? $0.key : nil })
             }
         }
-    }
-
-    private func approveBrand(_ brand: BrandModel) {
-        let ref = Database.database().reference().child("brands").child(brand.id)
-        ref.updateChildValues(["approved": true])
-        pendingBrands.removeAll { $0.id == brand.id }
-    }
-
-    private func suspendBrand(_ brand: BrandModel) {
-        let ref = Database.database().reference().child("brands").child(brand.id)
-        ref.updateChildValues(["suspended": true])
     }
 
     private func suspendUser(_ user: DashboardUser) {
@@ -220,34 +247,24 @@ struct AGDashboardView: View {
     }
 
     private func filterUsers() {
-        if searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-            filteredUsers = users
-        } else {
-            filteredUsers = users.filter {
-                $0.name.localizedCaseInsensitiveContains(searchQuery)
-            }
+        filteredUsers = searchQuery.trimmingCharacters(in: .whitespaces).isEmpty ? users : users.filter {
+            $0.name.localizedCaseInsensitiveContains(searchQuery)
         }
     }
 
     private func calculatePlatformStats() {
         let ref = Database.database().reference()
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             let userCount = snapshot.childSnapshot(forPath: "users").childrenCount
             let brandCount = snapshot.childSnapshot(forPath: "brands").childrenCount
 
             var approved = 0
             for case let child as DataSnapshot in snapshot.childSnapshot(forPath: "brands").children {
-                if let dict = child.value as? [String: Any],
-                   dict["approved"] as? Bool == true {
+                if let dict = child.value as? [String: Any], dict["approved"] as? Bool == true {
                     approved += 1
                 }
             }
-
-            self.platformStats = PlatformStats(
-                totalUsers: Int(userCount),
-                totalBrands: Int(brandCount),
-                approvedBrands: approved
-            )
+            self.platformStats = PlatformStats(totalUsers: Int(userCount), totalBrands: Int(brandCount), approvedBrands: approved)
         }
     }
 
@@ -257,7 +274,7 @@ struct AGDashboardView: View {
         var monthly: Double = 0
         let currentMonth = Calendar.current.component(.month, from: Date())
 
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             for case let child as DataSnapshot in snapshot.children {
                 if let dict = child.value as? [String: Any],
                    let amount = dict["amount"] as? Double,
@@ -269,15 +286,12 @@ struct AGDashboardView: View {
                     }
                 }
             }
-            self.revenueStats = RevenueStats(
-                monthly: Int(monthly),
-                total: Int(total)
-            )
+            self.revenueStats = RevenueStats(monthly: Int(monthly), total: Int(total))
         }
     }
 }
 
-// MARK: - Dashboard Models
+// MARK: - Models
 
 struct DashboardUser: Identifiable {
     var id: String

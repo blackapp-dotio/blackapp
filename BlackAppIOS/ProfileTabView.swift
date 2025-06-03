@@ -212,7 +212,7 @@ struct ProfileTabView: View {
     private func fetchBrands() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("brands")
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
             var userBrands: [BrandModel] = []
             for case let child as DataSnapshot in snapshot.children {
                 if let dict = child.value as? [String: Any],

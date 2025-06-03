@@ -35,6 +35,24 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                      options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
         return GIDSignIn.sharedInstance.handle(url)
     }
+    
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        // Show the notification as a banner even if app is in the foreground
+        completionHandler([.banner, .list, .sound])
+    }
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let userInfo = response.notification.request.content.userInfo
+        print("🔔 User tapped notification with payload: \(userInfo)")
+
+        // Example: Post a notification to app to navigate to the chat
+        NotificationCenter.default.post(name: NSNotification.Name("NotificationTapped"), object: nil, userInfo: userInfo)
+
+        completionHandler()
+    }
 }
 
 @main

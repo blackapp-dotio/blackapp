@@ -211,7 +211,7 @@ struct GossipTabView: View {
             AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.title) {
                 VStack(alignment: .leading) {
                     RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
-                    HStack(spacing: 20) {
+                   /* HStack(spacing: 20) {
                         Button(action: {
                             print("👍 Like tapped for article: \(article.title)")
                             // Optionally store in local state or Firebase
@@ -234,7 +234,7 @@ struct GossipTabView: View {
                         }) {
                             Label("Share", systemImage: "square.and.arrow.up")
                         }
-                    }
+                    } */
                     .font(.caption)
                     .foregroundColor(.gray)
 
@@ -263,7 +263,7 @@ struct GossipTabView: View {
                         .font(.caption)
                         .foregroundColor(.gray)
 
-                    HStack(spacing: 20) {
+                   /* HStack(spacing: 20) {
                         Button(action: {
                             let ref = Database.database().reference().child("likes").child(post.id)
                             let userId = Auth.auth().currentUser?.uid ?? "anonymous"
@@ -286,7 +286,7 @@ struct GossipTabView: View {
                         }) {
                             Label("Share", systemImage: "square.and.arrow.up")
                         }
-                    }
+                    } */
                     .font(.caption)
                     .foregroundColor(.gray)
 
