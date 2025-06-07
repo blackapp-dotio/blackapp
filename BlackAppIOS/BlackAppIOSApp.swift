@@ -1,5 +1,6 @@
 import SwiftUI
 import Firebase
+import FirebaseAuth
 import GoogleSignIn
 import GoogleSignInSwift
 import FirebaseMessaging
@@ -28,8 +29,24 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
         print("✅ FCM Token: \(fcmToken ?? "nil")")
-        // Optional: Store this token in Firestore under the user's profile
+
+        guard let fcmToken = fcmToken, let userId = Auth.auth().currentUser?.uid else {
+            print("❌ No FCM token or user ID")
+            return
+        }
+
+        let db = Firestore.firestore()
+        db.collection("users").document(userId).updateData([
+            "fcmToken": fcmToken
+        ]) { error in
+            if let error = error {
+                print("❌ Failed to save FCM token: \(error.localizedDescription)")
+            } else {
+                print("✅ FCM token saved to Firestore for user \(userId)")
+            }
+        }
     }
+
 
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {

@@ -1,7 +1,10 @@
 {
-  "functions": {
-    "source": "functions"
-  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default"
+    }
+  ],
   "hosting": {
     "public": "public",
     "ignore": [
@@ -33,5 +36,3 @@
     ]
   }
 }
-
-

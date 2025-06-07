@@ -16,6 +16,7 @@ struct ProfileTabView: View {
     @State private var showImagePicker = false
     @State private var brands: [BrandModel] = []
     @State private var isAdmin = false
+    @State private var isEditingProfile = false
 
     var body: some View {
         NavigationView {
@@ -62,42 +63,75 @@ struct ProfileTabView: View {
     }
 
     private var profileSection: some View {
-        VStack(spacing: 10) {
-            if let imageURL = profileImageURL, let url = URL(string: imageURL) {
+        VStack(spacing: 12) {
+            if let image = profileImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 100, height: 100)
+                    .clipShape(Circle())
+                    .shadow(radius: 10)
+            } else if let imageURL = profileImageURL, let url = URL(string: imageURL) {
                 WebImage(url: url)
                     .resizable()
                     .scaledToFill()
                     .frame(width: 100, height: 100)
                     .clipShape(Circle())
+                    .shadow(radius: 10)
             } else {
-                Image(systemName: "person.circle.fill")
+                Image(systemName: "person.crop.circle.fill")
                     .resizable()
                     .scaledToFill()
                     .frame(width: 100, height: 100)
                     .foregroundColor(.gray)
+                    .shadow(radius: 10)
             }
 
-            Button("Change Profile Picture") {
-                showImagePicker = true
+            if isEditingProfile {
+                Button("Change Profile Picture") {
+                    showImagePicker = true
+                }
+                .font(.subheadline)
+                .foregroundColor(.blue)
+
+                TextField("Name", text: $name)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .padding(.horizontal)
+
+                TextEditor(text: $bio)
+                    .frame(height: 100)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(8)
+                    .padding(.horizontal)
+
+                Button("Save") {
+                    saveProfile()
+                    withAnimation { isEditingProfile = false }
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.bottom)
+            } else {
+                Text(name.isEmpty ? "Unnamed" : name)
+                    .font(.title2)
+                    .foregroundColor(.white)
+                    .fontWeight(.bold)
+
+                Text(bio.isEmpty ? "No bio added yet." : bio)
+                    .font(.subheadline)
+                    .foregroundColor(.gray)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                Button("Edit Profile") {
+                    withAnimation { isEditingProfile = true }
+                }
+                .buttonStyle(.bordered)
+                .padding(.top, 8)
             }
-            .foregroundColor(.blue)
-
-            TextField("Name", text: $name)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .padding(.horizontal)
-
-            TextEditor(text: $bio)
-                .frame(height: 100)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray))
-                .padding(.horizontal)
-
-            Button("Save Profile") {
-                saveProfile()
-            }
-            .buttonStyle(.borderedProminent)
-            .padding(.bottom)
         }
         .padding(.top)
+        .frame(maxWidth: .infinity)
+        .animation(.easeInOut, value: isEditingProfile) // 👈 Smooth transitions!
     }
 
     private var createBrandSection: some View {
@@ -179,23 +213,53 @@ struct ProfileTabView: View {
     private func saveProfile() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("users").child(uid)
-        var data: [String: Any] = ["name": name, "bio": bio]
 
-        if let image = profileImage, let imageData = image.jpegData(compressionQuality: 0.8) {
-            let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
-            storageRef.putData(imageData) { _, error in
-                guard error == nil else { return }
-                storageRef.downloadURL { url, _ in
-                    if let url = url {
-                        data["profileImageURL"] = url.absoluteString
-                        ref.setValue(data)
-                    }
+        if profileImage == nil {
+            // Same as previous fix to preserve profileImageURL
+            ref.observeSingleEvent(of: .value) { snapshot in
+                var data: [String: Any] = ["name": name, "bio": bio]
+
+                if let existingData = snapshot.value as? [String: Any],
+                   let existingProfileURL = existingData["profileImageURL"] as? String {
+                    data["profileImageURL"] = existingProfileURL
                 }
+
+                ref.setValue(data)
             }
         } else {
-            ref.setValue(data)
+            if let image = profileImage, let imageData = image.jpegData(compressionQuality: 0.8) {
+                print("✅ Image data size: \(imageData.count) bytes")
+                let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
+                storageRef.putData(imageData) { metadata, error in
+                    if let error = error {
+                        print("❌ Upload failed: \(error.localizedDescription)")
+                        return
+                    }
+                    print("✅ Upload success, metadata: \(String(describing: metadata))")
+                    storageRef.downloadURL { url, error in
+                        if let error = error {
+                            print("❌ Failed to get download URL: \(error.localizedDescription)")
+                            return
+                        }
+                        if let url = url {
+                            print("✅ Got download URL: \(url.absoluteString)")
+                            let data: [String: Any] = [
+                                "name": name,
+                                "bio": bio,
+                                "profileImageURL": url.absoluteString
+                            ]
+                            ref.setValue(data)
+                        } else {
+                            print("❌ Download URL is nil")
+                        }
+                    }
+                }
+            } else {
+                print("❌ Failed to create image data.")
+            }
         }
     }
+
 
     private func fetchProfile() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
@@ -259,6 +323,7 @@ private func signOutSection(authVM: AuthViewModel) -> some View {
     .padding(.horizontal)
     .padding(.bottom, 40)
 }
+
 
 
 
