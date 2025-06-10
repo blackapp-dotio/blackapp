@@ -1,5 +1,15 @@
 import SwiftUI
 import FirebaseDatabase
+import FirebaseAuth
+import Foundation
+
+struct UserProfile: Identifiable {
+    let id: String
+    let name: String
+    let username: String
+    var bio: String? = ""
+    var profileImageURL: String? = ""
+}
 
 struct SearchView: View {
     @State private var searchText = ""
@@ -8,79 +18,137 @@ struct SearchView: View {
     @State private var filteredUsers: [UserProfile] = []
     @State private var filteredArticles: [RSSArticle] = []
 
+    @State private var selectedUser: UserProfile? = nil
+    @State private var selectedUserBio: String = ""
+    @State private var selectedUserProfileImageURL: String?
+    @State private var isConnected: Bool = false
+
     var body: some View {
-        VStack {
-            // Search Bar
-            TextField("Search for users or articles...", text: $searchText)
-                .padding()
-                .background(Color(.systemGray6))
-                .cornerRadius(10)
-                .padding()
+        NavigationView {
+            VStack {
+                // Search Bar
+                TextField("Search for users or articles...", text: $searchText)
+                    .padding()
+                    .background(Color(.systemGray6))
+                    .cornerRadius(10)
+                    .padding()
 
-            if searchText.isEmpty {
-                Spacer()
-                Text("Start typing to search...")
-                    .foregroundColor(.gray)
-                Spacer()
-            } else {
-                List {
-                    if !filteredUsers.isEmpty {
-                        Section(header: Text("Users")) {
-                            ForEach(filteredUsers) { user in
-                                VStack(alignment: .leading) {
-                                    Text(user.name)
-                                        .foregroundColor(.white)
-                                        .font(.headline)
-                                    Text(user.username)
-                                        .foregroundColor(.gray)
-                                        .font(.subheadline)
-                                }
-                                .padding(.vertical, 4)
+                // Mini Profile Preview
+                if let user = selectedUser {
+                    VStack(spacing: 12) {
+                        if let imageURL = selectedUserProfileImageURL, let url = URL(string: imageURL) {
+                            AsyncImage(url: url) { img in
+                                img.resizable().scaledToFill()
+                            } placeholder: {
+                                ProgressView()
                             }
+                            .frame(width: 100, height: 100)
+                            .clipShape(Circle())
+                        } else {
+                            Image(systemName: "person.crop.circle.fill")
+                                .resizable()
+                                .frame(width: 100, height: 100)
+                                .foregroundColor(.gray)
                         }
-                    }
 
-                    if !filteredArticles.isEmpty {
-                        Section(header: Text("Articles")) {
-                            ForEach(filteredArticles) { article in
-                                VStack(alignment: .leading) {
-                                    Text(article.title)
-                                        .foregroundColor(.white)
-                                        .font(.headline)
-                                    Text(article.pubDate, style: .date)
-                                        .foregroundColor(.gray)
-                                        .font(.subheadline)
-                                }
-                                .padding(.vertical, 4)
-                            }
+                        Text(user.name)
+                            .foregroundColor(.white)
+                            .font(.title2)
+
+                        Text("@\(user.username)")
+                            .foregroundColor(.gray)
+
+                        if !selectedUserBio.isEmpty {
+                            Text(selectedUserBio)
+                                .foregroundColor(.white)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
                         }
+
+                        Button(action: {
+                            connectWithUser(user.id)
+                        }) {
+                            Text(isConnected ? "Connected" : "Connect")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .padding()
+                                .background(isConnected ? Color.green : Color.blue)
+                                .cornerRadius(10)
+                        }
+
+                        Divider().background(Color.gray)
                     }
+                    .padding(.vertical)
                 }
-                .listStyle(.plain)
-                .background(Color.black)
+
+                if searchText.isEmpty {
+                    Spacer()
+                    Text("Start typing to search...")
+                        .foregroundColor(.gray)
+                    Spacer()
+                } else {
+                    List {
+                        if !filteredUsers.isEmpty {
+                            Section(header: Text("Users")) {
+                                ForEach(filteredUsers) { user in
+                                    Button(action: {
+                                        fetchUserProfile(user)
+                                    }) {
+                                        VStack(alignment: .leading) {
+                                            Text(user.name)
+                                                .foregroundColor(.white)
+                                                .font(.headline)
+                                            Text(user.username)
+                                                .foregroundColor(.gray)
+                                                .font(.subheadline)
+                                        }
+                                        .padding(.vertical, 4)
+                                    }
+                                }
+                            }
+                        }
+
+                        if !filteredArticles.isEmpty {
+                            Section(header: Text("Articles")) {
+                                ForEach(filteredArticles) { article in
+                                    VStack(alignment: .leading) {
+                                        Text(article.title)
+                                            .foregroundColor(.white)
+                                            .font(.headline)
+                                        Text(article.pubDate, style: .date)
+                                            .foregroundColor(.gray)
+                                            .font(.subheadline)
+                                    }
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.plain)
+                    .background(Color.black)
+                }
             }
-        }
-        .background(Color.black.edgesIgnoringSafeArea(.all))
-        .preferredColorScheme(.dark)
-        .onAppear {
-            loadUsers()
-            loadArticles()
-        }
-        .onChange(of: searchText) { _ in
-            performSearch()
+            .background(Color.black.edgesIgnoringSafeArea(.all))
+            .preferredColorScheme(.dark)
+            .onAppear {
+                loadUsers()
+                loadArticles()
+            }
+            .onChange(of: searchText) { _ in
+                performSearch()
+            }
+            .navigationTitle("Search")
         }
     }
 
     func performSearch() {
-        let lowercasedQuery = searchText.lowercased()
-
+        let query = searchText.lowercased()
         filteredUsers = allUsers.filter {
-            $0.name.lowercased().contains(lowercasedQuery) ||
-            $0.username.lowercased().contains(lowercasedQuery)
+            $0.name.lowercased().contains(query) ||
+            $0.username.lowercased().contains(query)
         }
-
         filteredArticles = allArticles.filter {
-            $0.title.lowercased().contains(lowercasedQuery)
+            $0.title.lowercased().contains(query)
         }
     }
 
@@ -100,16 +168,42 @@ struct SearchView: View {
     }
 
     func loadArticles() {
-        // This assumes you are loading articles from elsewhere.
-        // For now, it just uses whatever articles are already pulled into the app.
-        // Ideally, we should pass `rssArticles` from GossipTabView when opening SearchView.
+        // Placeholder for articles loading
+        // Ideally, pass articles from GossipTabView.
     }
-}
 
-// MARK: - Models
+    // MARK: - Mini Profile Logic
+    func fetchUserProfile(_ user: UserProfile) {
+        let ref = Database.database().reference().child("users").child(user.id)
+        ref.observeSingleEvent(of: .value) { snapshot in
+            if let dict = snapshot.value as? [String: Any] {
+                self.selectedUser = user
+                self.selectedUserBio = dict["bio"] as? String ?? ""
+                self.selectedUserProfileImageURL = dict["profileImageURL"] as? String
+                checkConnectionStatus(user.id)
+            }
+        }
+    }
 
-struct UserProfile: Identifiable {
-    let id: String
-    let name: String
-    let username: String
+    func checkConnectionStatus(_ userId: String) {
+        guard let currentUserID = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference()
+            .child("connections").child(currentUserID).child(userId)
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            isConnected = snapshot.exists()
+        }
+    }
+
+    func connectWithUser(_ userId: String) {
+        guard let currentUserID = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference()
+            .child("connections").child(currentUserID).child(userId)
+
+        ref.setValue(true) { error, _ in
+            if error == nil {
+                isConnected = true
+            }
+        }
+    }
 }

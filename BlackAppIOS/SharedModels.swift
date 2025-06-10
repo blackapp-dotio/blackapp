@@ -1,28 +1,31 @@
 import SwiftUI
+import Foundation
 
 
-struct ChatMessage: Identifiable {
-    var id: String
-    var text: String?
-    var mediaURL: String?
-    var type: String
-    var isSender: Bool
-    var documentId: String?
-    var edited: Bool
-    var likes: [String]
-    var comments: [[String: String]]
-    var reposts: [String]
-}
-
-
+    
+    struct ChatMessage: Identifiable {
+        var id: String
+        var text: String?
+        var mediaURL: String?
+        var type: String
+        var isSender: Bool
+        var documentId: String?
+        var edited: Bool
+        var likes: [String]
+        var comments: [[String: String]]
+        var reposts: [String]
+    }
+    
+    
     // User Profile for Chats
-struct ChatUserProfile: Identifiable, Codable {
-    let id: String
-    let name: String
-    let username: String
-    var profileImageURL: String? // ✅ Add this
-}
-
+    struct ChatUserProfile: Identifiable, Codable {
+        let id: String
+        let name: String
+        let username: String
+        var profileImageURL: String? // ✅ Add this
+        var bio: String? = ""
+    }
+    
     
     
     // Chat Bubble Shape
@@ -46,4 +49,4 @@ struct ChatUserProfile: Identifiable, Codable {
             return path
         }
     }
-
+    
