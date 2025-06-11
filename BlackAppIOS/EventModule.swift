@@ -21,6 +21,7 @@ struct EventModel: Identifiable {
     var tablePrice: Double
     var tableQuantity: Int
     var userId: String
+    var location: String
 
     static func from(snapshot: DataSnapshot) -> EventModel? {
         guard let value = snapshot.value as? [String: Any],
@@ -32,19 +33,28 @@ struct EventModel: Identifiable {
             return nil
         }
 
+        let payoutMethod = value["payoutMethod"] as? String ?? ""
+        let payoutDetails = value["payoutDetails"] as? String ?? ""
+        let ticketPrice = value["ticketPrice"] as? Double ?? 0.0
+        let ticketQuantity = value["ticketQuantity"] as? Int ?? 0
+        let tablePrice = value["tablePrice"] as? Double ?? 0.0
+        let tableQuantity = value["tableQuantity"] as? Int ?? 0
+        let location = value["location"] as? String ?? ""
+
         return EventModel(
             id: snapshot.key,
             title: title,
             description: description,
             imagePath: imagePath,
             date: Date(timeIntervalSince1970: timestamp),
-            payoutMethod: value["payoutMethod"] as? String ?? "",
-            payoutDetails: value["payoutDetails"] as? String ?? "",
-            ticketPrice: value["ticketPrice"] as? Double ?? 0.0,
-            ticketQuantity: value["ticketQuantity"] as? Int ?? 0,
-            tablePrice: value["tablePrice"] as? Double ?? 0.0,
-            tableQuantity: value["tableQuantity"] as? Int ?? 0,
-            userId: userId
+            payoutMethod: payoutMethod,
+            payoutDetails: payoutDetails,
+            ticketPrice: ticketPrice,
+            ticketQuantity: ticketQuantity,
+            tablePrice: tablePrice,
+            tableQuantity: tableQuantity,
+            userId: userId,
+            location: location
         )
     }
 }
@@ -71,7 +81,8 @@ struct MyEventsView: View {
 
                     ForEach(myCreatedEvents) { event in
                         VStack(alignment: .leading) {
-                            EventCardView(event: event, selectedURL: $selectedURL, showWebView: $showWebView)
+                            EventCardView(event: event)
+
 
                             HStack {
                                 Button("Edit") {
@@ -350,7 +361,8 @@ struct CreateEventView: View {
     @State private var selectedImage: UIImage?
     @State private var isUploading = false
     @State private var showImagePicker = false
-    
+    @State private var location = ""
+
     let payoutOptions = ["PayPal", "CashApp"]
     
     var body: some View {
@@ -358,6 +370,7 @@ struct CreateEventView: View {
             Form {
                 Section(header: Text("Event Details")) {
                     TextField("Event Title", text: $title)
+                    TextField("Event Location", text: $location)
                     TextField("Event Description", text: $description)
                     DatePicker("Event Date & Time", selection: $selectedDate)
                 }
@@ -483,6 +496,7 @@ struct CreateEventView: View {
                         "timestamp": Date().timeIntervalSince1970,
                         "payoutMethod": payoutMethod,
                         "payoutDetails": payoutDetails,
+                        "location": location,
                         "ticketPrice": ticketPrice,
                         "ticketQuantity": ticketQuantity,
                         "tablePrice": tablePrice,
@@ -519,7 +533,7 @@ struct EditEventView: View {
     @State private var ticketQuantity: Int
     @State private var tablePrice: Double
     @State private var tableQuantity: Int
-
+    @State private var location: String
     @State private var selectedImage: UIImage?
     @State private var showImagePicker = false
     @State private var isUploading = false
@@ -530,6 +544,7 @@ struct EditEventView: View {
         self.event = event
         _title = State(initialValue: event.title)
         _description = State(initialValue: event.description)
+        _location = State(initialValue: event.location)
         _selectedDate = State(initialValue: event.date)
         _payoutMethod = State(initialValue: event.payoutMethod)
         _payoutDetails = State(initialValue: event.payoutDetails)
@@ -545,6 +560,7 @@ struct EditEventView: View {
                 Section(header: Text("Event Details")) {
                     TextField("Event Title", text: $title)
                     TextField("Event Description", text: $description)
+                    TextField("Event Location", text: $location)
                     DatePicker("Event Date & Time", selection: $selectedDate)
                 }
 
@@ -644,6 +660,7 @@ struct EditEventView: View {
         let data: [String: Any] = [
             "title": title,
             "description": description,
+            "location": location,
             "date": selectedDate.timeIntervalSince1970,
             "timestamp": Date().timeIntervalSince1970,
             "payoutMethod": payoutMethod,
@@ -723,17 +740,34 @@ import SwiftUI
 import Firebase
 
 // MARK: - EventDetailView
+import SwiftUI
+import Firebase
+
 struct EventDetailView: View {
     let event: EventModel
     @State private var showWebView = false
     @State private var selectedURL: URL?
+    @State private var showCheckoutConfirmation = false
+    @State private var selectedTicketQuantity = 0
+    @State private var selectedTableQuantity = 0
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                EventImageView(imagePath: event.imagePath)
-                    .frame(height: 250)
-                    .cornerRadius(12)
+                ZStack(alignment: .bottomLeading) {
+                    EventImageView(imagePath: event.imagePath)
+                        .frame(height: 250)
+                        .cornerRadius(12)
+
+                    Text(formattedDate(event.date))
+                        .font(.caption)
+                        .bold()
+                        .padding(8)
+                        .background(Color.black.opacity(0.7))
+                        .foregroundColor(.white)
+                        .cornerRadius(6)
+                        .padding()
+                }
 
                 Text(event.title)
                     .font(.title)
@@ -745,42 +779,17 @@ struct EventDetailView: View {
                     .foregroundColor(.white)
                     .padding(.vertical, 8)
 
-                HStack {
-                    Image(systemName: "calendar")
-                        .foregroundColor(.gray)
-                    Text(formattedDate(event.date))
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                }
-
-                if event.ticketPrice > 0 && event.ticketQuantity > 0 {
+                if event.ticketPrice > 0 || event.tablePrice > 0 {
                     Button(action: {
-                        openCheckout(type: "ticket", price: event.ticketPrice)
+                        showCheckoutConfirmation = true
                     }) {
                         HStack {
-                            Image(systemName: "ticket")
-                            Text("Buy Ticket - $\(String(format: "%.2f", event.ticketPrice * 1.02))")
+                            Image(systemName: "cart.fill")
+                            Text("Buy Tickets / Tables")
                         }
                         .padding()
                         .frame(maxWidth: .infinity)
                         .background(Color.blue)
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                    }
-                    .padding(.top)
-                }
-
-                if event.tablePrice > 0 && event.tableQuantity > 0 {
-                    Button(action: {
-                        openCheckout(type: "table", price: event.tablePrice)
-                    }) {
-                        HStack {
-                            Image(systemName: "person.3.fill")
-                            Text("Book Table - $\(String(format: "%.2f", event.tablePrice * 1.02))")
-                        }
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.purple)
                         .foregroundColor(.white)
                         .cornerRadius(10)
                     }
@@ -790,7 +799,7 @@ struct EventDetailView: View {
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
         .preferredColorScheme(.dark)
-        .fullScreenCover(isPresented: $showWebView) {
+        .sheet(isPresented: $showWebView) {
             if let url = selectedURL {
                 NavigationView {
                     WebView(url: url)
@@ -799,27 +808,26 @@ struct EventDetailView: View {
                             showWebView = false
                         })
                 }
-            } else {
-                VStack {
-                    Text("No valid checkout URL.")
-                        .foregroundColor(.white)
-                    Spacer()
-                }
-                .background(Color.black)
             }
+        }
+        .sheet(isPresented: $showCheckoutConfirmation) {
+            CheckoutConfirmationView(
+                event: event,
+                onConfirm: { ticketQty, tableQty in
+                    openCheckout(ticketQty: ticketQty, tableQty: tableQty)
+                }
+            )
         }
     }
 
-    private func openCheckout(type: String, price: Double) {
-        let totalPrice = price * 1.02
+    private func openCheckout(ticketQty: Int, tableQty: Int) {
         let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
         let payoutDetails = event.payoutDetails.isEmpty ? "N/A" : event.payoutDetails
 
-        print("🔍 Event ID: \(event.id)")
-        print("🔍 Type: \(type)")
-        print("🔍 Price: \(totalPrice)")
-        print("🔍 Payout Method: \(payoutMethod)")
-        print("🔍 Payout Details: \(payoutDetails)")
+        let ticketTotal = Double(ticketQty) * event.ticketPrice
+        let tableTotal = Double(tableQty) * event.tablePrice
+        let grossTotal = (ticketTotal + tableTotal)
+        let totalWithFee = grossTotal * 1.02
 
         var components = URLComponents()
         components.scheme = "https"
@@ -827,21 +835,17 @@ struct EventDetailView: View {
         components.path = "/checkout"
         components.queryItems = [
             URLQueryItem(name: "eventId", value: event.id),
-            URLQueryItem(name: "type", value: type),
-            URLQueryItem(name: "price", value: String(format: "%.2f", totalPrice)),
-            URLQueryItem(name: "quantity", value: "1"),
+            URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
+            URLQueryItem(name: "tableQty", value: "\(tableQty)"),
+            URLQueryItem(name: "baseTotal", value: String(format: "%.2f", grossTotal)),
+            URLQueryItem(name: "totalWithFee", value: String(format: "%.2f", totalWithFee)),
             URLQueryItem(name: "payoutMethod", value: payoutMethod),
             URLQueryItem(name: "payoutDetails", value: payoutDetails)
         ]
 
         if let url = components.url {
-            print("🌐 Opening checkout: \(url.absoluteString)")
             selectedURL = url
             showWebView = true
-        } else {
-            print("❌ Failed to generate checkout URL")
-            selectedURL = nil
-            showWebView = true // fallback modal
         }
     }
 

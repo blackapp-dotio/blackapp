@@ -31,7 +31,8 @@ struct EventFeedView: View {
                     List {
                         Section(header: Text("BlackApp Events")) {
                             ForEach(platformEvents) { event in
-                                EventCardView(event: event, selectedURL: $selectedURL, showWebView: $showWebView)
+                                EventCardView(event: event)
+
                             }
                         }
                         
@@ -146,10 +147,11 @@ struct EventFeedView: View {
     }
 }
 
+import SwiftUI
+
 struct EventCardView: View {
     let event: EventModel
-    @Binding var selectedURL: URL?
-    @Binding var showWebView: Bool
+    @State private var showCheckoutConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -166,50 +168,56 @@ struct EventCardView: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .lineLimit(2)
-
-            if event.ticketPrice > 0 && event.ticketQuantity > 0 {
-                Button(action: {
-                    openCheckout(type: "ticket", price: event.ticketPrice)
-                }) {
-                    Text("Buy Ticket - $\(String(format: "%.2f", event.ticketPrice * 1.02))")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.blue)
-                        .cornerRadius(8)
-                }
-                .padding(.top, 8)
+            
+            HStack {
+                Image(systemName: "mappin.and.ellipse")
+                    .foregroundColor(.gray)
+                Text(event.location)
+                    .font(.subheadline)
+                    .foregroundColor(.gray)
             }
 
-            if event.tablePrice > 0 && event.tableQuantity > 0 {
-                Button(action: {
-                    openCheckout(type: "table", price: event.tablePrice)
-                }) {
-                    Text("Book Table - $\(String(format: "%.2f", event.tablePrice * 1.02))")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.purple)
-                        .cornerRadius(8)
+            HStack(spacing: 16) {
+                if event.ticketPrice > 0 {
+                    Label("$\(String(format: "%.2f", event.ticketPrice)) Tickets", systemImage: "ticket")
+                        .font(.caption)
                 }
-                .padding(.top, 4)
+                if event.tablePrice > 0 {
+                    Label("$\(String(format: "%.2f", event.tablePrice)) Tables", systemImage: "person.3.fill")
+                        .font(.caption)
+                }
             }
+            .foregroundColor(.white)
+
+            Button(action: {
+                showCheckoutConfirmation = true
+            }) {
+                Text("Buy Tickets / Tables")
+                    .font(.subheadline)
+                    .foregroundColor(.white)
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.blue)
+                    .cornerRadius(8)
+            }
+            .padding(.top, 8)
         }
         .padding()
+        .sheet(isPresented: $showCheckoutConfirmation) {
+            CheckoutConfirmationView(event: event) { ticketQty, tableQty in
+                openCheckout(ticketQty: ticketQty, tableQty: tableQty)
+            }
+        }
     }
 
-    private func openCheckout(type: String, price: Double) {
-        let totalPrice = price * 1.02
+    private func openCheckout(ticketQty: Int, tableQty: Int) {
         let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
         let payoutDetails = event.payoutDetails.isEmpty ? "N/A" : event.payoutDetails
 
-        print("🔍 Event ID: \(event.id)")
-        print("🔍 Type: \(type)")
-        print("🔍 Price: \(totalPrice)")
-        print("🔍 Payout Method: \(payoutMethod)")
-        print("🔍 Payout Details: \(payoutDetails)")
+        let ticketTotal = Double(ticketQty) * event.ticketPrice
+        let tableTotal = Double(tableQty) * event.tablePrice
+        let grossTotal = ticketTotal + tableTotal
+        let totalWithFee = grossTotal * 1.02
 
         var components = URLComponents()
         components.scheme = "https"
@@ -217,21 +225,18 @@ struct EventCardView: View {
         components.path = "/checkout"
         components.queryItems = [
             URLQueryItem(name: "eventId", value: event.id),
-            URLQueryItem(name: "type", value: type),
-            URLQueryItem(name: "price", value: String(format: "%.2f", totalPrice)),
-            URLQueryItem(name: "quantity", value: "1"),
+            URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
+            URLQueryItem(name: "tableQty", value: "\(tableQty)"),
+            URLQueryItem(name: "baseTotal", value: String(format: "%.2f", grossTotal)),
+            URLQueryItem(name: "totalWithFee", value: String(format: "%.2f", totalWithFee)),
             URLQueryItem(name: "payoutMethod", value: payoutMethod),
             URLQueryItem(name: "payoutDetails", value: payoutDetails)
         ]
 
         if let url = components.url {
-            print("🌐 Opening checkout: \(url.absoluteString)")
-            selectedURL = url
-            showWebView = true
-        } else {
-            print("❌ Failed to generate checkout URL")
-            selectedURL = nil
-            showWebView = true // fallback modal to show error message
+            UIApplication.shared.open(url)
         }
     }
 }
+
+
