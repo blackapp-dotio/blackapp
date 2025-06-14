@@ -70,6 +70,8 @@ struct MyEventsView: View {
     @State private var showWebView = false
 
     @State private var selectedEventToEdit: EventModel? = nil
+    @State private var selectedEventForStats: EventModel? = nil
+    @State private var selectedPurchase: PurchaseModel? = nil
 
     var body: some View {
         NavigationView {
@@ -83,8 +85,7 @@ struct MyEventsView: View {
                         VStack(alignment: .leading) {
                             EventCardView(event: event)
 
-
-                            HStack {
+                            HStack(spacing: 10) {
                                 Button("Edit") {
                                     selectedEventToEdit = event
                                 }
@@ -100,6 +101,14 @@ struct MyEventsView: View {
                                 .background(Color.red)
                                 .foregroundColor(.white)
                                 .cornerRadius(8)
+
+                                Button("Stats") {
+                                    selectedEventForStats = event
+                                }
+                                .padding(8)
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
                             }
                             .padding(.horizontal)
                         }
@@ -112,7 +121,7 @@ struct MyEventsView: View {
                         .padding(.horizontal)
 
                     ForEach(myPurchasedEvents) { purchase in
-                        VStack(alignment: .leading) {
+                        VStack(alignment: .leading, spacing: 10) {
                             EventImageView(imagePath: purchase.eventImagePath)
                                 .frame(height: 200)
                                 .cornerRadius(10)
@@ -125,8 +134,7 @@ struct MyEventsView: View {
                                 .foregroundColor(.gray)
 
                             Button("View Ticket") {
-                                selectedURL = URL(string: "https://blackappios.web.app/receipt?purchaseId=\(purchase.id)")
-                                showWebView = true
+                                selectedPurchase = purchase
                             }
                             .padding(8)
                             .background(Color.green)
@@ -144,6 +152,12 @@ struct MyEventsView: View {
             }
             .sheet(item: $selectedEventToEdit) { event in
                 EditEventView(event: event)
+            }
+            .sheet(item: $selectedEventForStats) { event in
+                EventStatsView(event: event)
+            }
+            .sheet(item: $selectedPurchase) { purchase in
+                ShowTicketView(purchase: purchase)
             }
             .sheet(isPresented: $showWebView) {
                 if let url = selectedURL {
@@ -219,6 +233,186 @@ struct MyEventsView: View {
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+}
+
+import SwiftUI
+import Firebase
+
+struct ShowTicketView: View {
+    let purchase: PurchaseModel
+    @Environment(\.presentationMode) var presentationMode
+    @State private var isCheckedIn = false
+    @State private var checkInSuccess = false
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("🎟️ Your Ticket")
+                .font(.title)
+                .bold()
+
+            Text(purchase.eventTitle)
+                .font(.headline)
+
+            Text("Type: \(purchase.type.capitalized)")
+            Text("Quantity: \(purchase.quantity)")
+            Text("Amount Paid: $\(String(format: "%.2f", purchase.totalAmount))")
+
+            Text("Purchase ID")
+                .font(.caption)
+                .foregroundColor(.gray)
+
+            Text(purchase.id)
+                .font(.system(.body, design: .monospaced))
+                .foregroundColor(.blue)
+
+            if checkInSuccess {
+                Label("✅ Checked In", systemImage: "checkmark.circle.fill")
+                    .foregroundColor(.green)
+                    .font(.headline)
+            } else {
+                Button(action: handleCheckIn) {
+                    Text("Check In")
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .disabled(isCheckedIn)
+            }
+
+            Spacer()
+        }
+        .padding()
+        .onAppear {
+            loadCheckInStatus()
+        }
+    }
+
+    private func loadCheckInStatus() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("purchases").child(userId).child(purchase.id)
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            if let data = snapshot.value as? [String: Any],
+               let checked = data["checkedIn"] as? Bool {
+                self.isCheckedIn = checked
+                self.checkInSuccess = checked
+            }
+        }
+    }
+
+    private func handleCheckIn() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("purchases").child(userId).child(purchase.id)
+
+        ref.updateChildValues(["checkedIn": true]) { error, _ in
+            if error == nil {
+                self.checkInSuccess = true
+                self.isCheckedIn = true
+            }
+        }
+    }
+}
+
+// MARK: - EventStatsView.swift
+
+import SwiftUI
+import Firebase
+
+struct EventStatsView: View {
+    let event: EventModel
+    @State private var checkIns: [PurchaseModel] = []
+    @State private var totalTickets = 0
+    @State private var totalTables = 0
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Event Stats")
+                    .font(.largeTitle)
+                    .bold()
+
+                Text("Title: \(event.title)")
+                    .font(.headline)
+
+                Text("Total Tickets Sold: \(totalTickets)")
+                Text("Total Tables Booked: \(totalTables)")
+                Text("Checked-In Attendees: \(checkIns.count)")
+
+                Divider()
+
+                Text("Checked-In Users")
+                    .font(.title3)
+                    .bold()
+
+                if checkIns.isEmpty {
+                    Text("No one has checked in yet.")
+                        .foregroundColor(.gray)
+                        .padding(.top, 4)
+                } else {
+                    ForEach(checkIns) { purchase in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("User ID: \(purchase.userId.prefix(8))...")
+                            Text("Type: \(purchase.type.capitalized) | Qty: \(purchase.quantity)")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+                            Divider()
+                        }
+                    }
+                }
+            }
+            .padding()
+            .onAppear {
+                loadStats()
+            }
+        }
+    }
+
+    private func loadStats() {
+        let ref = Database.database().reference().child("purchases")
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            var checked: [PurchaseModel] = []
+            var ticketTotal = 0
+            var tableTotal = 0
+
+            for case let userSnapshot as DataSnapshot in snapshot.children {
+                for case let purchaseSnapshot as DataSnapshot in userSnapshot.children {
+                    guard let value = purchaseSnapshot.value as? [String: Any],
+                          value["eventId"] as? String == event.id else { continue }
+
+                    let type = value["type"] as? String ?? "ticket"
+                    let quantity = value["quantity"] as? Int ?? 0
+
+                    if type == "ticket" {
+                        ticketTotal += quantity
+                    } else if type == "table" {
+                        tableTotal += quantity
+                    }
+
+                    if value["checkedIn"] as? Bool == true {
+                        let model = PurchaseModel(
+                            id: purchaseSnapshot.key,
+                            userId: value["userId"] as? String ?? "",
+                            eventId: event.id,
+                            eventTitle: value["eventTitle"] as? String ?? "",
+                            eventImagePath: value["eventImagePath"] as? String ?? "",
+                            quantity: quantity,
+                            type: type,
+                            totalAmount: value["totalAmount"] as? Double ?? 0.0,
+                            timestamp: value["timestamp"] as? TimeInterval ?? 0.0
+                        )
+                        checked.append(model)
+                    }
+                }
+            }
+
+            self.totalTickets = ticketTotal
+            self.totalTables = tableTotal
+            self.checkIns = checked
+        }
     }
 }
 

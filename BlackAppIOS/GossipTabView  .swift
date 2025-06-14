@@ -30,9 +30,7 @@ struct UserPost: Identifiable {
         f.timeStyle = .short
         return f.string(from: Date(timeIntervalSince1970: timestamp))
     }
-}
-
-// MARK: - Wrapper for Mixed RSS + Post Feed
+}// MARK: - Wrapper for Mixed RSS + Post Feed
 
 struct AnyIdentifiablePost: Identifiable {
     let timestamp: TimeInterval
@@ -56,7 +54,7 @@ struct GossipTabView: View {
     @State private var newPostText: String = ""
     @State private var editingPostId: String? = nil
     @State private var selectedImage: UIImage? = nil
-
+    
     // UI state
     @State private var selectedURL: URL? = nil
     @State private var showWebView = false
@@ -64,6 +62,7 @@ struct GossipTabView: View {
     @State private var isLoading = true
     @State private var commentTargetPost: UserPost? = nil
     @State private var commentText: String = ""
+    @State private var userProfiles: [String: (name: String, imageURL: String?)] = [:]
 
     // RSS URLs
     private let rssFeedURLs = [
@@ -80,7 +79,7 @@ struct GossipTabView: View {
         "https://theshaderoom.com/latest-tea/feed/",
         "https://afro.com/section/arts-entertainment/feed/"
     ]
-
+    
     var body: some View {
         VStack {
             TopToolbarView(onLogoTap: reloadContent, onSearchTap: {
@@ -88,7 +87,7 @@ struct GossipTabView: View {
                       let root = scene.windows.first?.rootViewController else { return }
                 root.present(UIHostingController(rootView: SearchView()), animated: true)
             })
-
+            
             VStack(alignment: .leading, spacing: 12) {
                 // Text field with placeholder
                 ZStack(alignment: .topLeading) {
@@ -107,7 +106,7 @@ struct GossipTabView: View {
                         .background(Color.black)
                 }
                 .padding(.horizontal)
-
+                
                 // Image preview if selected
                 if let img = selectedImage {
                     Image(uiImage: img)
@@ -117,7 +116,7 @@ struct GossipTabView: View {
                         .cornerRadius(8)
                         .padding(.horizontal)
                 }
-
+                
                 // Buttons: Camera + Post
                 HStack(spacing: 20) {
                     Button(action: { showImagePicker = true }) {
@@ -127,7 +126,7 @@ struct GossipTabView: View {
                             .foregroundColor(.white)
                             .clipShape(Circle())
                     }
-
+                    
                     Button(action: {
                         if let id = editingPostId {
                             updatePost(id)
@@ -143,9 +142,9 @@ struct GossipTabView: View {
                     }
                 }
                 .padding(.horizontal)
-
+                
                 Divider().background(Color.gray)
-
+                
                 // Feed listing
                 if isLoading {
                     ProgressView("Loading...").padding()
@@ -184,9 +183,9 @@ struct GossipTabView: View {
         .background(Color.black)
         .preferredColorScheme(.dark)
     }
-
+    
     // MARK: - CRUD + Comments + Likes + Share
-
+    
     func reloadContent() {
         rssArticles = []
         userPosts = []
@@ -195,15 +194,15 @@ struct GossipTabView: View {
         fetchFeedsInChunks()
         fetchUserPosts()
     }
-
+    
     func postToFirebase() {
         guard !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let uid = Auth.auth().currentUser?.uid else { return }
-
+        
         let ref = Database.database().reference().child("posts").childByAutoId()
         let id = ref.key ?? UUID().uuidString
         let ts = Date().timeIntervalSince1970
-
+        
         func save(_ imgURL: String?) {
             ref.setValue([
                 "text": newPostText,
@@ -213,7 +212,7 @@ struct GossipTabView: View {
             ])
             resetPostFields()
         }
-
+        
         if let img = selectedImage?.jpegData(compressionQuality: 0.8) {
             let sref = Storage.storage().reference().child("post_images/\(id).jpg")
             sref.putData(img, metadata: nil) { _, _ in
@@ -225,21 +224,21 @@ struct GossipTabView: View {
             save(nil)
         }
     }
-
+    
     func updatePost(_ id: String) {
         let ref = Database.database().reference().child("posts").child(id)
         ref.updateChildValues(["text": newPostText]) { _, _ in
             resetPostFields()
         }
     }
-
+    
     func resetPostFields() {
         newPostText = ""
         selectedImage = nil
         editingPostId = nil
         fetchUserPosts()
     }
-
+    
     func deletePost(_ post: UserPost) {
         Database.database().reference()
             .child("posts").child(post.id)
@@ -247,7 +246,7 @@ struct GossipTabView: View {
                 fetchUserPosts()
             }
     }
-
+    
     func postComment(to post: UserPost) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference()
@@ -260,7 +259,7 @@ struct GossipTabView: View {
             resetPostFields()
         }
     }
-
+    
     func toggleLike(for id: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let r = Database.database().reference()
@@ -273,26 +272,26 @@ struct GossipTabView: View {
             }
         }
     }
-
+    
     func sharePost(_ post: UserPost) {
         guard let root = UIApplication.shared.windows.first?.rootViewController else { return }
         root.present(UIActivityViewController(activityItems: [post.text], applicationActivities: nil), animated: true)
     }
-
+    
     func shareArticle(_ article: RSSArticle) {
         guard let url = URL(string: article.link),
               let root = UIApplication.shared.windows.first?.rootViewController else { return }
         root.present(UIActivityViewController(activityItems: [url], applicationActivities: nil), animated: true)
     }
-
+    
     // MARK: - Fetch User Posts + Likes + Comments
-
+    
     func fetchUserPosts() {
         let pRef = Database.database().reference().child("posts")
         let lRef = Database.database().reference().child("likes")
         let cRef = Database.database().reference().child("comments")
         guard let uid = Auth.auth().currentUser?.uid else { return }
-
+        
         pRef.observeSingleEvent(of: .value) { snap in
             var arr: [UserPost] = []
             for case let cs as DataSnapshot in snap.children {
@@ -335,14 +334,29 @@ struct GossipTabView: View {
                         arr[i].comments = cm[p] ?? []
                     }
                     userPosts = arr
-                    mergeContent()
+                    
+                    let uniqueUserIds = Set(arr.map { $0.userId })
+                    let usersRef = Database.database().reference().child("users")
+                    for uid in uniqueUserIds {
+                        usersRef.child(uid).observeSingleEvent(of: .value) { snapshot in
+                            if let dict = snapshot.value as? [String: Any] {
+                                let name = dict["name"] as? String ?? "User"
+                                let img = dict["profileImageURL"] as? String
+                                DispatchQueue.main.async {
+                                    userProfiles[uid] = (name, img)
+                                    mergeContent()
+                                }
+                            }
+                        }
+                    }
+
                 }
             }
         }
     }
-
+    
     // MARK: - Fetch RSS Articles with Media Only
-
+    
     func fetchFeedsInChunks(chunkSize: Int = 3) {
         Task {
             let chunks = rssFeedURLs.chunked(into: chunkSize)
@@ -364,7 +378,7 @@ struct GossipTabView: View {
             }
         }
     }
-
+    
     func fetchFeed(urlString: String) async -> [RSSArticle] {
         guard let url = URL(string: urlString) else { return [] }
         do {
@@ -385,7 +399,7 @@ struct GossipTabView: View {
             return []
         }
     }
-
+    
     func extractImageURL(from html: String) -> String? {
         guard let re = try? NSRegularExpression(pattern: "<img[^>]+src=[\"']([^\"']+)[\"']", options: .caseInsensitive),
               let m = re.firstMatch(in: html, options: [], range: NSRange(location: 0, length: (html as NSString).length)),
@@ -393,28 +407,53 @@ struct GossipTabView: View {
         else { return nil }
         return (html as NSString).substring(with: m.range(at: 1))
     }
-
+    
     // MARK: - Combine and Render Posts
 
     func mergeContent() {
         let rss = rssArticles.map { article in
             AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.title) {
-                VStack(alignment: .leading) {
+                Button(action: {
+                    selectedURL = URL(string: article.link)
+                    showWebView = true
+                }) {
                     RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
-                    HStack(spacing: 20) {
-                        Button(action: { shareArticle(article) }) {
-                            Image(systemName: "square.and.arrow.up")
-                                .foregroundColor(.gray)
-                        }
-                    }
-                    .padding(.top, 4)
                 }
+                .buttonStyle(PlainButtonStyle()) // So it doesn’t show tap effects
             }
         }
 
+
         let users = userPosts.map { post in
-            AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
+            let profile = userProfiles[post.userId]
+            let displayName = profile?.name ?? "User"
+            let profileURL = profile?.imageURL
+            
+            return AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
                 VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        if let imgURL = profileURL, let url = URL(string: imgURL) {
+                            AsyncImage(url: url) { image in
+                                image.resizable()
+                            } placeholder: {
+                                Circle().fill(Color.gray)
+                            }
+                            .frame(width: 32, height: 32)
+                            .clipShape(Circle())
+                        } else {
+                            Circle()
+                                .fill(Color.gray)
+                                .overlay(Text(String(displayName.prefix(1)))
+                                            .foregroundColor(.white)
+                                            .font(.caption))
+                                .frame(width: 32, height: 32)
+                        }
+
+                        Text(displayName)
+                            .foregroundColor(.white)
+                            .font(.subheadline)
+                    }
+
                     Text(post.text)
                         .foregroundColor(.white)
                         .padding(.vertical, 4)
@@ -485,3 +524,6 @@ struct GossipTabView: View {
         combinedFeed = (users + rss).sorted(by: { $0.timestamp > $1.timestamp })
     }
 }
+
+
+

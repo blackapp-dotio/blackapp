@@ -36,9 +36,9 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         }
 
         let db = Firestore.firestore()
-        db.collection("users").document(userId).updateData([
+        db.collection("users").document(userId).setData([
             "fcmToken": fcmToken
-        ]) { error in
+        ], merge: true) { error in
             if let error = error {
                 print("❌ Failed to save FCM token: \(error.localizedDescription)")
             } else {
@@ -47,27 +47,25 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-
     func application(_ app: UIApplication, open url: URL,
                      options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
         return GIDSignIn.sharedInstance.handle(url)
     }
-    
+
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         // Show the notification as a banner even if app is in the foreground
         completionHandler([.banner, .list, .sound])
     }
+
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
         print("🔔 User tapped notification with payload: \(userInfo)")
 
-        // Example: Post a notification to app to navigate to the chat
         NotificationCenter.default.post(name: NSNotification.Name("NotificationTapped"), object: nil, userInfo: userInfo)
-
         completionHandler()
     }
 }
@@ -84,6 +82,9 @@ struct BlackAppIOSApp: App {
                 if authVM.user != nil {
                     MainTabView()
                         .environmentObject(authVM)
+                        .onAppear {
+                            updateFCMTokenIfNeeded()
+                        }
                         .onOpenURL { url in
                             if url.absoluteString == "blackappios://payment-success" {
                                 paymentSuccess = true
@@ -114,6 +115,34 @@ struct BlackAppIOSApp: App {
                     LoginView()
                         .environmentObject(authVM)
                 }
+            }
+        }
+    }
+}
+
+// MARK: - Manual FCM Token Sync
+func updateFCMTokenIfNeeded() {
+    guard let user = Auth.auth().currentUser else { return }
+
+    Messaging.messaging().token { token, error in
+        if let error = error {
+            print("❌ Error retrieving FCM token: \(error.localizedDescription)")
+            return
+        }
+
+        guard let token = token else {
+            print("❌ FCM token is nil")
+            return
+        }
+
+        print("📡 Retrieved FCM token manually: \(token)")
+
+        let userRef = Firestore.firestore().collection("users").document(user.uid)
+        userRef.setData(["fcmToken": token], merge: true) { error in
+            if let error = error {
+                print("❌ Failed to save FCM token manually: \(error.localizedDescription)")
+            } else {
+                print("✅ Manually synced FCM token to Firestore")
             }
         }
     }
