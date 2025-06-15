@@ -1,6 +1,7 @@
 import SwiftUI
 import GoogleSignInSwift
 import FirebaseAuth
+import FirebaseMessaging
 
 struct LoginView: View {
     @EnvironmentObject var authVM: AuthViewModel
@@ -63,6 +64,8 @@ struct LoginView: View {
                         authVM.signUp(email: email, password: password, name: name, username: username) { error in
                             if let error = error {
                                 errorMessage = error.localizedDescription
+                            } else {
+                                updateFCMTokenIfNeeded() // ✅ Call global function
                             }
                         }
                     } else {
@@ -76,6 +79,8 @@ struct LoginView: View {
                         authVM.signIn(email: email, password: password) { error in
                             if let error = error {
                                 errorMessage = error.localizedDescription
+                            } else {
+                                updateFCMTokenIfNeeded() // ✅ Call global function
                             }
                         }
                     }
@@ -85,7 +90,8 @@ struct LoginView: View {
 
             Divider().padding(.vertical)
 
-            /* GoogleSignInButton {
+            /*
+            GoogleSignInButton {
                 if let rootVC = UIApplication.shared.connectedScenes
                     .compactMap({ ($0 as? UIWindowScene)?.keyWindow })
                     .first?.rootViewController {
@@ -96,7 +102,8 @@ struct LoginView: View {
                         }
                     }
                 }
-            } */
+            }
+            */
             .frame(height: 44)
         }
         .padding()
