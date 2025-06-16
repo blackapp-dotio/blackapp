@@ -65,7 +65,10 @@ struct LoginView: View {
                             if let error = error {
                                 errorMessage = error.localizedDescription
                             } else {
-                                updateFCMTokenIfNeeded() // ✅ Call global function
+                                print("✅ Signed up, scheduling FCM sync...")
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    updateFCMTokenIfNeeded()
+                                }
                             }
                         }
                     } else {
@@ -80,7 +83,10 @@ struct LoginView: View {
                             if let error = error {
                                 errorMessage = error.localizedDescription
                             } else {
-                                updateFCMTokenIfNeeded() // ✅ Call global function
+                                print("✅ Signed in, scheduling FCM sync...")
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    updateFCMTokenIfNeeded()
+                                }
                             }
                         }
                     }

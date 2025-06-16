@@ -28,21 +28,25 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
-        print("✅ FCM Token: \(fcmToken ?? "nil")")
+        print("✅ FCM Token received (delegate): \(fcmToken ?? "nil")")
 
-        guard let fcmToken = fcmToken, let userId = Auth.auth().currentUser?.uid else {
-            print("❌ No FCM token or user ID")
+        guard let userId = Auth.auth().currentUser?.uid else {
+            print("⚠️ No user signed in yet. Token not saved.")
             return
         }
 
-        let db = Firestore.firestore()
-        db.collection("users").document(userId).setData([
+        guard let fcmToken = fcmToken else {
+            print("❌ Token is nil in delegate.")
+            return
+        }
+
+        Firestore.firestore().collection("users").document(userId).setData([
             "fcmToken": fcmToken
         ], merge: true) { error in
             if let error = error {
-                print("❌ Failed to save FCM token: \(error.localizedDescription)")
+                print("❌ Failed to save token via delegate: \(error.localizedDescription)")
             } else {
-                print("✅ FCM token saved to Firestore for user \(userId)")
+                print("✅ Token saved via delegate for user \(userId)")
             }
         }
     }
@@ -55,7 +59,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // Show the notification as a banner even if app is in the foreground
         completionHandler([.banner, .list, .sound])
     }
 
@@ -120,9 +123,12 @@ struct BlackAppIOSApp: App {
     }
 }
 
-// MARK: - Manual FCM Token Sync
-func updateFCMTokenIfNeeded() {
-    guard let user = Auth.auth().currentUser else { return }
+// MARK: - Manual FCM Token Sync with Retry
+func updateFCMTokenIfNeeded(retryCount: Int = 0) {
+    guard let user = Auth.auth().currentUser else {
+        print("❌ No authenticated user for FCM token sync.")
+        return
+    }
 
     Messaging.messaging().token { token, error in
         if let error = error {
@@ -131,14 +137,18 @@ func updateFCMTokenIfNeeded() {
         }
 
         guard let token = token else {
-            print("❌ FCM token is nil")
+            print("⚠️ FCM token is nil (attempt \(retryCount)). Retrying...")
+            if retryCount < 3 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    updateFCMTokenIfNeeded(retryCount: retryCount + 1)
+                }
+            }
             return
         }
 
         print("📡 Retrieved FCM token manually: \(token)")
 
-        let userRef = Firestore.firestore().collection("users").document(user.uid)
-        userRef.setData(["fcmToken": token], merge: true) { error in
+        Firestore.firestore().collection("users").document(user.uid).setData(["fcmToken": token], merge: true) { error in
             if let error = error {
                 print("❌ Failed to save FCM token manually: \(error.localizedDescription)")
             } else {
