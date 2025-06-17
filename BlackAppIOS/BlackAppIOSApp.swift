@@ -9,7 +9,6 @@ import UserNotifications
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate, MessagingDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-
         FirebaseApp.configure()
         Messaging.messaging().delegate = self
 
@@ -29,26 +28,7 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
     func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
         print("✅ FCM Token received (delegate): \(fcmToken ?? "nil")")
-
-        guard let userId = Auth.auth().currentUser?.uid else {
-            print("⚠️ No user signed in yet. Token not saved.")
-            return
-        }
-
-        guard let fcmToken = fcmToken else {
-            print("❌ Token is nil in delegate.")
-            return
-        }
-
-        Firestore.firestore().collection("users").document(userId).setData([
-            "fcmToken": fcmToken
-        ], merge: true) { error in
-            if let error = error {
-                print("❌ Failed to save token via delegate: \(error.localizedDescription)")
-            } else {
-                print("✅ Token saved via delegate for user \(userId)")
-            }
-        }
+        FCMTokenManager.syncFCMTokenToFirestore()
     }
 
     func application(_ app: UIApplication, open url: URL,
@@ -67,7 +47,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
         print("🔔 User tapped notification with payload: \(userInfo)")
-
         NotificationCenter.default.post(name: NSNotification.Name("NotificationTapped"), object: nil, userInfo: userInfo)
         completionHandler()
     }
@@ -86,7 +65,7 @@ struct BlackAppIOSApp: App {
                     MainTabView()
                         .environmentObject(authVM)
                         .onAppear {
-                            updateFCMTokenIfNeeded()
+                            FCMTokenManager.syncFCMTokenToFirestore()
                         }
                         .onOpenURL { url in
                             if url.absoluteString == "blackappios://payment-success" {
@@ -118,41 +97,6 @@ struct BlackAppIOSApp: App {
                     LoginView()
                         .environmentObject(authVM)
                 }
-            }
-        }
-    }
-}
-
-// MARK: - Manual FCM Token Sync with Retry
-func updateFCMTokenIfNeeded(retryCount: Int = 0) {
-    guard let user = Auth.auth().currentUser else {
-        print("❌ No authenticated user for FCM token sync.")
-        return
-    }
-
-    Messaging.messaging().token { token, error in
-        if let error = error {
-            print("❌ Error retrieving FCM token: \(error.localizedDescription)")
-            return
-        }
-
-        guard let token = token else {
-            print("⚠️ FCM token is nil (attempt \(retryCount)). Retrying...")
-            if retryCount < 3 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                    updateFCMTokenIfNeeded(retryCount: retryCount + 1)
-                }
-            }
-            return
-        }
-
-        print("📡 Retrieved FCM token manually: \(token)")
-
-        Firestore.firestore().collection("users").document(user.uid).setData(["fcmToken": token], merge: true) { error in
-            if let error = error {
-                print("❌ Failed to save FCM token manually: \(error.localizedDescription)")
-            } else {
-                print("✅ Manually synced FCM token to Firestore")
             }
         }
     }

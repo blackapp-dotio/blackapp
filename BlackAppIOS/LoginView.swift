@@ -67,7 +67,7 @@ struct LoginView: View {
                             } else {
                                 print("✅ Signed up, scheduling FCM sync...")
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    updateFCMTokenIfNeeded()
+                                    FCMTokenManager.syncFCMTokenToFirestore()
                                 }
                             }
                         }
@@ -85,7 +85,7 @@ struct LoginView: View {
                             } else {
                                 print("✅ Signed in, scheduling FCM sync...")
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    updateFCMTokenIfNeeded()
+                                    FCMTokenManager.syncFCMTokenToFirestore()
                                 }
                             }
                         }

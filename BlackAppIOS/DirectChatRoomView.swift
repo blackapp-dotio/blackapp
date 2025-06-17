@@ -146,39 +146,43 @@ struct DirectChatRoomView: View {
     func sendMessage() {
         guard !messageText.trimmingCharacters(in: .whitespaces).isEmpty,
               let uid = Auth.auth().currentUser?.uid else { return }
-        
+
         let messageData: [String: Any] = [
             "text": messageText,
             "senderId": uid,
+            "recipientId": recipient.id, // ✅ Required for push notification
             "type": "text",
             "timestamp": Timestamp(),
             "edited": editingMessageId != nil
         ]
-        
+
         let messageRef = Firestore.firestore().collection("directChats").document(chatId).collection("messages")
-        
+
         if let messageId = editingMessageId {
             messageRef.document(messageId).updateData(messageData)
             editingMessageId = nil
         } else {
             messageRef.addDocument(data: messageData)
         }
-        
+
         messageText = ""
     }
+
     
     func sendMediaMessage(url: String, type: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        
+
         let messageData: [String: Any] = [
             "type": type,
             "mediaURL": url,
             "senderId": uid,
+            "recipientId": recipient.id, // ✅ Required for push notification
             "timestamp": Timestamp()
         ]
-        
+
         Firestore.firestore().collection("directChats").document(chatId).collection("messages").addDocument(data: messageData)
     }
+
     
     func deleteMessage(_ msg: ChatMessage) {
         guard let docId = msg.documentId else { return }

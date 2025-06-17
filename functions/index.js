@@ -19,7 +19,7 @@ exports.generateClientToken = functions.https.onRequest((req, res) => {
       const response = await gateway.clientToken.generate({});
       res.status(200).send({ clientToken: response.clientToken });
     } catch (error) {
-      console.error("Token generation failed:", error);
+      console.error("❌ Token generation failed:", error);
       res.status(500).send({ error: "Token generation failed" });
     }
   });
@@ -66,7 +66,7 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
 
       res.status(200).send({ success: true, transactionId: result.transaction.id });
     } catch (error) {
-      console.error("Transaction failed:", error);
+      console.error("❌ Transaction failed:", error);
       res.status(500).send({ error: error.message });
     }
   });
@@ -86,48 +86,56 @@ exports.getCheckoutURL = functions.https.onRequest((req, res) => {
   });
 });
 
-// 4️⃣ sendNewMessageNotification
+// 4️⃣ sendNewMessageNotification (Updated trigger path)
 exports.sendNewMessageNotification = functions.firestore
-  .document("chats/{chatId}/messages/{messageId}")
+  .document("directChats/{chatId}/messages/{messageId}")
   .onCreate(async (snap, context) => {
+    console.log("🚀 New message detected in directChats!");
+
     const messageData = snap.data();
     const recipientId = messageData.recipientId;
     const senderName = messageData.senderName || "Someone";
     const messageText = messageData.text || "New message";
 
     console.log("📨 Message data:", messageData);
-    console.log("📨 Recipient ID:", recipientId);
+    console.log("👤 Recipient ID:", recipientId);
 
     if (!recipientId) {
-      console.log("⚠️ Missing recipient ID.");
+      console.log("⚠️ Missing recipient ID. Aborting FCM send.");
       return;
     }
-
-    const userDoc = await admin.firestore().collection("users").doc(recipientId).get();
-    const fcmToken = userDoc.data()?.fcmToken;
-    console.log("📨 FCM Token:", fcmToken);
-
-    if (!fcmToken) {
-      console.log("⚠️ No FCM token for recipient:", recipientId);
-      return;
-    }
-
-    const payload = {
-      notification: {
-        title: `New message from ${senderName}`,
-        body: messageText.substring(0, 50),
-        sound: "default"
-      },
-      data: {
-        type: "chat",
-        chatId: context.params.chatId
-      }
-    };
 
     try {
+      const userDoc = await admin.firestore().collection("users").doc(recipientId).get();
+
+      if (!userDoc.exists) {
+        console.log("⚠️ Recipient user doc not found:", recipientId);
+        return;
+      }
+
+      const fcmToken = userDoc.data()?.fcmToken;
+      console.log("📲 FCM Token:", fcmToken);
+
+      if (!fcmToken) {
+        console.log("⚠️ No FCM token available for recipient:", recipientId);
+        return;
+      }
+
+      const payload = {
+        notification: {
+          title: `New message from ${senderName}`,
+          body: messageText.substring(0, 50),
+          sound: "default"
+        },
+        data: {
+          type: "chat",
+          chatId: context.params.chatId
+        }
+      };
+
       const response = await admin.messaging().sendToDevice(fcmToken, payload);
-      console.log("✅ FCM response:", response);
+      console.log("✅ FCM response sent successfully:", response);
     } catch (error) {
-      console.error("❌ FCM send error:", error);
+      console.error("❌ Error during FCM send:", error);
     }
   });
