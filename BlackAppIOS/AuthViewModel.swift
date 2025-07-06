@@ -4,6 +4,7 @@ import FirebaseAuth
 import FirebaseDatabase
 import FirebaseFirestore
 import GoogleSignIn
+import OneSignalFramework
 
 class AuthViewModel: ObservableObject {
     @Published var user: User?
@@ -11,6 +12,16 @@ class AuthViewModel: ObservableObject {
     init() {
         self.user = Auth.auth().currentUser
         migrateUsersFromRealtimeToFirestore()
+
+        // ✅ Sync OneSignal Player ID if user is already signed in
+        if Auth.auth().currentUser != nil {
+            OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+        }
+    }
+
+    // MARK: - OneSignal Player ID Sync (Replaced with central manager)
+    func updateOneSignalPlayerIdForCurrentUser() {
+        OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
     }
 
     // MARK: - Email Sign Up
@@ -30,13 +41,12 @@ class AuthViewModel: ObservableObject {
                 "profileImageURL": profileImageURL
             ]
 
-            // Save to Realtime Database
+            // Save to both databases
             Database.database().reference().child("users").child(uid).setValue(userData)
-
-            // Save to Firestore
             Firestore.firestore().collection("users").document(uid).setData(userData)
 
             DispatchQueue.main.async {
+                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
                 completion(nil)
             }
         }
@@ -48,6 +58,7 @@ class AuthViewModel: ObservableObject {
             DispatchQueue.main.async {
                 if let result = result {
                     self.user = result.user
+                    OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
                 }
                 completion(error)
             }
@@ -100,7 +111,6 @@ class AuthViewModel: ObservableObject {
                     if let user = authResult?.user {
                         self.user = user
 
-                        // Save user to both databases (if first-time login)
                         let uid = user.uid
                         let name = user.displayName ?? "Unnamed"
                         let username = user.email?.components(separatedBy: "@").first ?? uid.prefix(6).description
@@ -114,6 +124,7 @@ class AuthViewModel: ObservableObject {
 
                         Database.database().reference().child("users").child(uid).setValue(userData)
                         Firestore.firestore().collection("users").document(uid).setData(userData)
+                        OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
                     }
                     completion(error)
                 }

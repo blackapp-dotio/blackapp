@@ -54,6 +54,9 @@ struct GossipTabView: View {
     @State private var newPostText: String = ""
     @State private var editingPostId: String? = nil
     @State private var selectedImage: UIImage? = nil
+    @State private var trendingTags: [String] = []
+    @State private var showAllTags = false
+    @State private var selectedTagFilter: String? = nil
     
     // UI state
     @State private var selectedURL: URL? = nil
@@ -63,7 +66,7 @@ struct GossipTabView: View {
     @State private var commentTargetPost: UserPost? = nil
     @State private var commentText: String = ""
     @State private var userProfiles: [String: (name: String, imageURL: String?)] = [:]
-
+    
     // RSS URLs
     private let rssFeedURLs = [
         "https://rss.app/feeds/a0BC3EgcQ2gi6jt9.xml",
@@ -81,108 +84,161 @@ struct GossipTabView: View {
     ]
     
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
             TopToolbarView(onLogoTap: reloadContent, onSearchTap: {
                 guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
                       let root = scene.windows.first?.rootViewController else { return }
                 root.present(UIHostingController(rootView: SearchView()), animated: true)
             })
             
-            VStack(alignment: .leading, spacing: 12) {
-                // Text field with placeholder
-                ZStack(alignment: .topLeading) {
-                    if newPostText.isEmpty {
-                        Text(editingPostId == nil ? "What's the gist?" : "Editing post...")
-                            .foregroundColor(.white.opacity(0.6))
-                            .padding(.top, 14)
-                            .padding(.leading, 5)
-                    }
-                    TextEditor(text: $newPostText)
-                        .frame(height: 60)
-                        .padding(8)
-                        .background(Color(.systemGray6))
-                        .cornerRadius(8)
-                        .foregroundColor(.white)
-                        .background(Color.black)
-                }
-                .padding(.horizontal)
-                
-                // Image preview if selected
-                if let img = selectedImage {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxHeight: 200)
-                        .cornerRadius(8)
-                        .padding(.horizontal)
-                }
-                
-                // Buttons: Camera + Post
-                HStack(spacing: 20) {
-                    Button(action: { showImagePicker = true }) {
-                        Image(systemName: "photo.on.rectangle")
-                            .padding(8)
-                            .background(Color.gray)
-                            .foregroundColor(.white)
-                            .clipShape(Circle())
-                    }
-                    
-                    Button(action: {
-                        if let id = editingPostId {
-                            updatePost(id)
-                        } else {
-                            postToFirebase()
+            if !trendingTags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(trendingTags, id: \.self) { tag in
+                            Text(tag)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(selectedTagFilter == tag ? Color.blue.opacity(0.7) : Color.gray.opacity(0.3))
+                                .foregroundColor(.white)
+                                .cornerRadius(16)
+                                .onTapGesture {
+                                    if selectedTagFilter == tag {
+                                        selectedTagFilter = nil
+                                    } else {
+                                        selectedTagFilter = tag
+                                    }
+                                    mergeContent()
+                                }
                         }
-                    }) {
-                        Image(systemName: "paperplane.fill")
-                            .padding(8)
-                            .background(editingPostId == nil ? Color.blue : Color.orange)
-                            .foregroundColor(.white)
-                            .clipShape(Circle())
+                        
+                        Button(action: {
+                            showAllTags.toggle()
+                            updateTrendingTags()
+                        }) {
+                            Text(showAllTags ? "Less" : "More")
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.gray.opacity(0.3))
+                                .foregroundColor(.blue)
+                                .cornerRadius(16)
+                        }
                     }
+                    .padding(.horizontal)
+                    .padding(.top, 6)
                 }
-                .padding(.horizontal)
                 
-                Divider().background(Color.gray)
-                
-                // Feed listing
-                if isLoading {
-                    ProgressView("Loading...").padding()
-                } else {
-                    List(combinedFeed.sorted(by: { $0.timestamp > $1.timestamp })) { item in
-                        item.view($selectedURL, $showWebView)
+                if let tag = selectedTagFilter {
+                    HStack(spacing: 10) {
+                        Text("Filtering by \(tag)")
+                            .foregroundColor(.white.opacity(0.8))
+                        Button("Clear") {
+                            selectedTagFilter = nil
+                            mergeContent()
+                        }
+                        .foregroundColor(.blue)
                     }
-                    .listStyle(.plain)
+                    .padding(.horizontal)
+                    .padding(.top, 4)
                 }
             }
-            .onAppear(perform: reloadContent)
-            .sheet(isPresented: $showWebView) {
-                if let url = selectedURL {
-                    WebView(url: url)
+            
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $newPostText)
+                    .frame(height: 60)
+                    .padding(8)
+                    .foregroundColor(.white)
+                    .background(Color(.systemGray6))
+                    .cornerRadius(8)
+                
+                if newPostText.isEmpty {
+                    Text(editingPostId == nil ? "What’s the gist? (use #tags)" : "Editing post...")
+                        .foregroundColor(.white.opacity(0.6))
+                        .padding(.top, 14)
+                        .padding(.horizontal, 14)
+                        .zIndex(1)
                 }
             }
-            .sheet(isPresented: $showImagePicker) {
-                ImagePicker(selectedImage: $selectedImage)
+            .padding(.horizontal)
+            
+            
+            // Image preview if selected
+            if let img = selectedImage {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 200)
+                    .cornerRadius(8)
+                    .padding(.horizontal)
             }
-            .sheet(item: $commentTargetPost) { post in
-                VStack {
-                    Text("Comment").font(.headline).padding(.top)
-                    TextField("Your comment...", text: $commentText)
-                        .padding()
-                        .background(Color.gray.opacity(0.2))
-                        .cornerRadius(8)
+            
+            // Buttons: Camera + Post
+            HStack(spacing: 20) {
+                Button(action: { showImagePicker = true }) {
+                    Image(systemName: "photo.on.rectangle")
+                        .padding(8)
+                        .background(Color.gray)
                         .foregroundColor(.white)
-                    Button("Post Comment") { postComment(to: post) }
-                        .padding()
-                    Spacer()
+                        .clipShape(Circle())
                 }
-                .padding()
-                .background(Color.black)
+                
+                Button(action: {
+                    if let id = editingPostId {
+                        updatePost(id)
+                    } else {
+                        postToFirebase()
+                    }
+                }) {
+                    Image(systemName: "paperplane.fill")
+                        .padding(8)
+                        .background(editingPostId == nil ? Color.blue : Color.orange)
+                        .foregroundColor(.white)
+                        .clipShape(Circle())
+                }
+            }
+            .padding(.horizontal)
+            
+            Divider().background(Color.gray)
+            
+            // Feed listing
+            if isLoading {
+                ProgressView("Loading...").padding()
+            } else {
+                List(combinedFeed.sorted(by: { $0.timestamp > $1.timestamp })) { item in
+                    item.view($selectedURL, $showWebView)
+                }
+                .listStyle(.plain)
             }
         }
+        .onAppear(perform: reloadContent)
+        .background(Color.black)
+        
         .background(Color.black)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showWebView) {
+            if let url = selectedURL {
+                WebView(url: url)
+            }
+        }
+        .sheet(isPresented: $showImagePicker) {
+            ImagePicker(selectedImage: $selectedImage)
+        }
+        .sheet(item: $commentTargetPost) { post in
+            VStack {
+                Text("Comment").font(.headline).padding(.top)
+                TextField("Your comment...", text: $commentText)
+                    .padding()
+                    .background(Color.gray.opacity(0.2))
+                    .cornerRadius(8)
+                    .foregroundColor(.white)
+                Button("Post Comment") { postComment(to: post) }
+                    .padding()
+                Spacer()
+            }
+            .padding()
+            .background(Color.black)
+        }
     }
+    
     
     // MARK: - CRUD + Comments + Likes + Share
     
@@ -193,6 +249,7 @@ struct GossipTabView: View {
         isLoading = true
         fetchFeedsInChunks()
         fetchUserPosts()
+        
     }
     
     func postToFirebase() {
@@ -284,6 +341,22 @@ struct GossipTabView: View {
         root.present(UIActivityViewController(activityItems: [url], applicationActivities: nil), animated: true)
     }
     
+    func updateTrendingTags() {
+        var tagCounts: [String: Int] = [:]
+        for post in userPosts {
+            let tags = post.text.split(separator: " ")
+                .filter { $0.hasPrefix("#") }
+                .map { String($0).lowercased() }
+            
+            for tag in tags {
+                tagCounts[tag, default: 0] += 1
+            }
+        }
+        
+        trendingTags = tagCounts.sorted { $0.value > $1.value }
+            .prefix(showAllTags ? 20 : 5)
+            .map { $0.key }
+    }
     // MARK: - Fetch User Posts + Likes + Comments
     
     func fetchUserPosts() {
@@ -345,11 +418,12 @@ struct GossipTabView: View {
                                 DispatchQueue.main.async {
                                     userProfiles[uid] = (name, img)
                                     mergeContent()
+                                    updateTrendingTags()
                                 }
                             }
                         }
                     }
-
+                    
                 }
             }
         }
@@ -409,7 +483,7 @@ struct GossipTabView: View {
     }
     
     // MARK: - Combine and Render Posts
-
+    
     func mergeContent() {
         let rss = rssArticles.map { article in
             AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.title) {
@@ -422,108 +496,110 @@ struct GossipTabView: View {
                 .buttonStyle(PlainButtonStyle()) // So it doesn’t show tap effects
             }
         }
-
-
-        let users = userPosts.map { post in
-            let profile = userProfiles[post.userId]
-            let displayName = profile?.name ?? "User"
-            let profileURL = profile?.imageURL
-            
-            return AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        if let imgURL = profileURL, let url = URL(string: imgURL) {
-                            AsyncImage(url: url) { image in
-                                image.resizable()
-                            } placeholder: {
-                                Circle().fill(Color.gray)
-                            }
-                            .frame(width: 32, height: 32)
-                            .clipShape(Circle())
-                        } else {
-                            Circle()
-                                .fill(Color.gray)
-                                .overlay(Text(String(displayName.prefix(1)))
-                                            .foregroundColor(.white)
-                                            .font(.caption))
+        
+        
+        let users = userPosts
+            .filter { post in
+                guard let tag = selectedTagFilter else { return true }
+                return post.text.lowercased().contains(tag.lowercased())
+            }
+            .map { post in
+                let profile = userProfiles[post.userId]
+                let displayName = profile?.name ?? "User"
+                let profileURL = profile?.imageURL
+                
+                return AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            if let imgURL = profileURL, let url = URL(string: imgURL) {
+                                AsyncImage(url: url) { image in
+                                    image.resizable()
+                                } placeholder: {
+                                    Circle().fill(Color.gray)
+                                }
                                 .frame(width: 32, height: 32)
+                                .clipShape(Circle())
+                            } else {
+                                Circle()
+                                    .fill(Color.gray)
+                                    .overlay(Text(String(displayName.prefix(1)))
+                                        .foregroundColor(.white)
+                                        .font(.caption))
+                                    .frame(width: 32, height: 32)
+                            }
+                            
+                            Text(displayName)
+                                .foregroundColor(.white)
+                                .font(.subheadline)
                         }
-
-                        Text(displayName)
+                        
+                        Text(post.text)
                             .foregroundColor(.white)
-                            .font(.subheadline)
-                    }
-
-                    Text(post.text)
-                        .foregroundColor(.white)
-                        .padding(.vertical, 4)
-
-                    if let img = post.imageURL, let url = URL(string: img) {
-                        AsyncImage(url: url) { img in
-                            img.resizable().scaledToFit()
-                        } placeholder: {
-                            ProgressView()
-                        }
-                        .frame(maxHeight: 200)
-                        .cornerRadius(10)
-                    }
-
-                    Text(post.dateFormatted)
-                        .font(.caption)
-                        .foregroundColor(.gray)
-
-                    HStack(spacing: 20) {
-                        Button(action: { toggleLike(for: post.id) }) {
-                            Image(systemName: "hand.thumbsup")
-                                .foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
-                        }
-
-                        Button(action: { commentTargetPost = post }) {
-                            Image(systemName: "bubble.right")
-                                .foregroundColor(.gray)
-                        }
-
-                        Button(action: { sharePost(post) }) {
-                            Image(systemName: "square.and.arrow.up")
-                                .foregroundColor(.gray)
-                        }
-
-                        if post.userId == Auth.auth().currentUser?.uid {
-                            Button(action: {
-                                newPostText = post.text
-                                editingPostId = post.id
-                            }) {
-                                Image(systemName: "pencil")
-                                    .foregroundColor(.yellow)
+                            .padding(.vertical, 4)
+                        
+                        if let img = post.imageURL, let url = URL(string: img) {
+                            AsyncImage(url: url) { img in
+                                img.resizable().scaledToFit()
+                            } placeholder: {
+                                ProgressView()
                             }
-                            Button(action: { deletePost(post) }) {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.red)
-                            }
+                            .frame(maxHeight: 200)
+                            .cornerRadius(10)
                         }
-                    }
-                    .padding(.top, 4)
-
-                    if !post.comments.isEmpty {
-                        ForEach(post.comments) { c in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(c.text)
-                                    .font(.caption)
-                                    .foregroundColor(.white)
-                                Text(Date(timeIntervalSince1970: c.timestamp), style: .time)
-                                    .font(.caption2)
+                        
+                        Text(post.dateFormatted)
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                        
+                        HStack(spacing: 20) {
+                            Button(action: { toggleLike(for: post.id) }) {
+                                Image(systemName: "hand.thumbsup")
+                                    .foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
+                            }
+                            
+                            Button(action: { commentTargetPost = post }) {
+                                Image(systemName: "bubble.right")
                                     .foregroundColor(.gray)
                             }
-                            .padding(.vertical, 2)
+                            
+                            Button(action: { sharePost(post) }) {
+                                Image(systemName: "square.and.arrow.up")
+                                    .foregroundColor(.gray)
+                            }
+                            
+                            if post.userId == Auth.auth().currentUser?.uid {
+                                Button(action: {
+                                    newPostText = post.text
+                                    editingPostId = post.id
+                                }) {
+                                    Image(systemName: "pencil")
+                                        .foregroundColor(.yellow)
+                                }
+                                Button(action: { deletePost(post) }) {
+                                    Image(systemName: "trash")
+                                        .foregroundColor(.red)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                        
+                        if !post.comments.isEmpty {
+                            ForEach(post.comments) { c in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(c.text)
+                                        .font(.caption)
+                                        .foregroundColor(.white)
+                                    Text(Date(timeIntervalSince1970: c.timestamp), style: .time)
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                }
+                                .padding(.vertical, 2)
+                            }
                         }
                     }
                 }
             }
-        }
-
+        
         combinedFeed = (users + rss).sorted(by: { $0.timestamp > $1.timestamp })
     }
 }
-
-
-

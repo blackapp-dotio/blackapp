@@ -1,7 +1,6 @@
 import SwiftUI
 import GoogleSignInSwift
 import FirebaseAuth
-import FirebaseMessaging
 
 struct LoginView: View {
     @EnvironmentObject var authVM: AuthViewModel
@@ -65,10 +64,7 @@ struct LoginView: View {
                             if let error = error {
                                 errorMessage = error.localizedDescription
                             } else {
-                                print("✅ Signed up, scheduling FCM sync...")
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    FCMTokenManager.syncFCMTokenToFirestore()
-                                }
+                                print("✅ Signed up successfully.")
                             }
                         }
                     } else {
@@ -83,10 +79,7 @@ struct LoginView: View {
                             if let error = error {
                                 errorMessage = error.localizedDescription
                             } else {
-                                print("✅ Signed in, scheduling FCM sync...")
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    FCMTokenManager.syncFCMTokenToFirestore()
-                                }
+                                print("✅ Signed in successfully.")
                             }
                         }
                     }

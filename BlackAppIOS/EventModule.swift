@@ -880,58 +880,71 @@ struct EditEventView: View {
 
 
 
-            // MARK: - RSSCardView
-            struct RSSCardView: View {
-                let article: RSSArticle
-                @Binding var selectedURL: URL?
-                @Binding var showWebView: Bool
-                
-                var body: some View {
-                    VStack(alignment: .leading) {
-                        if let imageURL = article.imageURL {
-                            AsyncImage(url: imageURL) { phase in
-                                switch phase {
-                                case .empty:
-                                    ProgressView()
-                                        .frame(height: 200)
-                                case .success(let image):
-                                    image
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(height: 200)
-                                        .clipped()
-                                        .cornerRadius(10)
-                                case .failure:
-                                    Rectangle()
-                                        .fill(Color.gray.opacity(0.3))
-                                        .frame(height: 200)
-                                        .cornerRadius(10)
-                                @unknown default:
-                                    EmptyView()
-                                }
-                            }
-                        }
-                        
-                        Text(article.title)
-                            .font(.headline)
-                            .padding(.top, 5)
-                        
-                        Text(article.description)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.05))
-                    .cornerRadius(10)
-                    
+// MARK: - RSSCardView
+struct RSSCardView: View {
+    let article: RSSArticle
+    @Binding var selectedURL: URL?
+    @Binding var showWebView: Bool
 
-                        }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let imageURL = article.imageURL {
+                AsyncImage(url: imageURL) { phase in
+                    switch phase {
+                    case .empty:
+                        ProgressView()
+                            .frame(height: 200)
+                            .frame(maxWidth: .infinity)
+                            .background(Color.gray.opacity(0.1))
+                            .cornerRadius(12)
+
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                            .frame(height: 200)
+                            .frame(maxWidth: .infinity)
+                            .clipped()
+                            .cornerRadius(12)
+
+                    case .failure:
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.gray.opacity(0.3))
+                            .frame(height: 200)
+
+                    @unknown default:
+                        EmptyView()
                     }
-            
-            
-import SwiftUI
-import Firebase
+                }
+            }
+
+            Text(article.title)
+                .font(.headline)
+                .foregroundColor(.white)
+
+            Text(article.description)
+                .font(.subheadline)
+                .foregroundColor(.gray)
+                .lineLimit(2)
+
+            Button(action: {
+                if let url = URL(string: article.link) {
+                    selectedURL = url
+                    showWebView = true
+                }
+            }) {
+                Text("Read More")
+                    .font(.caption)
+                    .foregroundColor(.blue)
+            }
+
+        }
+        .padding()
+        .background(Color.black.opacity(0.7))
+        .cornerRadius(16)
+        .shadow(radius: 3)
+    }
+}
 
 // MARK: - EventDetailView
 import SwiftUI

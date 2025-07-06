@@ -5,6 +5,7 @@ import FirebaseStorage
 import FirebaseDatabase
 import FeedKit
 import WebKit
+
 // MARK: - EventFeedView
 struct EventFeedView: View {
     @State private var platformEvents: [EventModel] = []
@@ -12,7 +13,7 @@ struct EventFeedView: View {
     @State private var selectedURL: URL? = nil
     @State private var showWebView = false
     @State private var isLoading = true
-    
+
     let rssFeedURLs = [
         "https://rss.app/feeds/nsmT2WdQXSlshmcy.xml",
         "https://rss.app/feeds/XqrrnyuiP2E5gvZY.xml",
@@ -20,7 +21,7 @@ struct EventFeedView: View {
         "https://rss.app/feeds/pv5YufdSsNN6ROH5.xml",
         "https://rss.app/feeds/keM7mXLp4OlutaGg.xml"
     ]
-    
+
     var body: some View {
         NavigationView {
             VStack {
@@ -30,15 +31,32 @@ struct EventFeedView: View {
                 } else {
                     List {
                         Section(header: Text("BlackApp Events")) {
-                            ForEach(platformEvents) { event in
-                                EventCardView(event: event)
-
+                            if platformEvents.isEmpty {
+                                Text("No upcoming events.")
+                                    .foregroundColor(.gray)
+                                    .italic()
+                                    .padding(.vertical)
+                            } else {
+                                ForEach(platformEvents) { event in
+                                    EventCardView(event: event)
+                                        .listRowSeparator(.hidden)
+                                        .listRowBackground(Color.clear)
+                                }
                             }
                         }
-                        
+
                         Section(header: Text("External Events")) {
-                            ForEach(rssArticles) { article in
-                                RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
+                            if rssArticles.isEmpty {
+                                Text("No external events available.")
+                                    .foregroundColor(.gray)
+                                    .italic()
+                                    .padding(.vertical)
+                            } else {
+                                ForEach(rssArticles) { article in
+                                    RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
+                                        .listRowSeparator(.hidden)
+                                        .listRowBackground(Color.clear)
+                                }
                             }
                         }
                     }
@@ -46,7 +64,7 @@ struct EventFeedView: View {
                 }
             }
             .navigationTitle("Events")
-            .background(Color.black)
+            .background(Color.black.edgesIgnoringSafeArea(.all))
             .onAppear {
                 fetchPlatformEvents()
                 fetchFeedsInChunks()
@@ -59,24 +77,23 @@ struct EventFeedView: View {
         }
         .preferredColorScheme(.dark)
     }
-    
+
     func fetchPlatformEvents() {
         let ref = Database.database().reference().child("events")
         ref.observeSingleEvent(of: .value) { snapshot in
             var events: [EventModel] = []
             let now = Date()
-            
+
             for case let child as DataSnapshot in snapshot.children {
                 if let event = EventModel.from(snapshot: child), event.date > now {
                     events.append(event)
                 }
             }
-            
+
             self.platformEvents = events.sorted { $0.date > $1.date }
         }
     }
-    
-    
+
     func fetchFeedsInChunks(chunkSize: Int = 2) {
         Task {
             let chunks = rssFeedURLs.chunked(into: chunkSize)
@@ -99,17 +116,17 @@ struct EventFeedView: View {
             }
         }
     }
-    
+
     func fetchFeed(urlString: String) async -> [RSSArticle] {
         guard let url = URL(string: urlString) else { return [] }
-        
+
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 let parser = FeedParser(URL: url)
                 let result = parser.parse()
-                
+
                 var articles: [RSSArticle] = []
-                
+
                 switch result {
                 case .success(let feed):
                     let items = feed.rssFeed?.items ?? []
@@ -118,58 +135,57 @@ struct EventFeedView: View {
                               let link = $0.link,
                               let description = $0.description?.strippedHTML(),
                               let pubDate = $0.pubDate else { return nil }
-                        
+
                         let imageURL = extractImageURL(from: $0)
                         return RSSArticle(title: title, link: link, description: description, pubDate: pubDate, imageURL: imageURL)
                     }
                 case .failure(let error):
                     print("❌ Failed to parse feed: \(error)")
                 }
-                
+
                 continuation.resume(returning: articles)
             }
         }
     }
-    
+
     func extractImageURL(from item: RSSFeedItem) -> URL? {
         if let mediaURL = item.media?.mediaContents?.first?.attributes?.url {
             return URL(string: mediaURL)
         }
-        
+
         if let desc = item.description,
            let imgTagRange = desc.range(of: "<img[^>]+src=\"([^\"]+)\"", options: .regularExpression),
            let match = desc[imgTagRange].range(of: "src=\"([^\"]+)\"", options: .regularExpression),
            let urlRange = desc[match].range(of: #"(?<=src=\")[^\"]+"#, options: .regularExpression) {
             return URL(string: String(desc[match][urlRange]))
         }
-        
+
         return nil
     }
 }
 
-import SwiftUI
-
+// MARK: - EventCardView
 struct EventCardView: View {
     let event: EventModel
     @State private var showCheckoutConfirmation = false
 
     var body: some View {
-        VStack(alignment: .leading) {
+        VStack(alignment: .leading, spacing: 8) {
             EventImageView(imagePath: event.imagePath)
                 .frame(height: 200)
                 .clipped()
-                .cornerRadius(10)
+                .cornerRadius(12)
 
             Text(event.title)
                 .font(.headline)
-                .padding(.top, 5)
+                .padding(.top, 4)
 
             Text(event.description)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .lineLimit(2)
-            
-            HStack {
+
+            HStack(spacing: 4) {
                 Image(systemName: "mappin.and.ellipse")
                     .foregroundColor(.gray)
                 Text(event.location)
@@ -203,6 +219,8 @@ struct EventCardView: View {
             .padding(.top, 8)
         }
         .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
         .sheet(isPresented: $showCheckoutConfirmation) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
                 openCheckout(ticketQty: ticketQty, tableQty: tableQty)
@@ -238,5 +256,3 @@ struct EventCardView: View {
         }
     }
 }
-
-

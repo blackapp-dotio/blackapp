@@ -29,24 +29,25 @@ import Foundation
     
     
     // Chat Bubble Shape
-    struct WaterDropShape: Shape {
-        var isSender: Bool
-        
-        func path(in rect: CGRect) -> Path {
-            var path = Path(roundedRect: rect, cornerRadius: 20)
-            let tailSize: CGFloat = 10
-            
-            if isSender {
-                path.move(to: CGPoint(x: rect.maxX, y: rect.maxY - 20))
-                path.addLine(to: CGPoint(x: rect.maxX + tailSize, y: rect.maxY - 10))
-                path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-            } else {
-                path.move(to: CGPoint(x: rect.minX, y: rect.maxY - 20))
-                path.addLine(to: CGPoint(x: rect.minX - tailSize, y: rect.maxY - 10))
-                path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-            }
-            
-            return path
+struct WaterDropShape: Shape {
+    var isSender: Bool
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path(roundedRect: rect, cornerRadius: 20)
+        let tailSize: CGFloat = 10
+
+        if isSender {
+            path.move(to: CGPoint(x: rect.maxX, y: rect.maxY - 20))
+            path.addLine(to: CGPoint(x: rect.maxX + tailSize, y: rect.maxY - 10))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        } else {
+            path.move(to: CGPoint(x: rect.minX, y: rect.maxY - 20))
+            path.addLine(to: CGPoint(x: rect.minX - tailSize, y: rect.maxY - 10))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
         }
+
+        return path
     }
+}
+
     

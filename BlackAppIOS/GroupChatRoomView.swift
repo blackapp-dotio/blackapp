@@ -6,7 +6,8 @@ import Firebase
 import FirebaseAuth
 import FirebaseFirestore
 import FirebaseStorage
-     
+import OneSignalFramework
+
 struct GroupChatRoomView: View {
     var group: GroupChat
     
@@ -175,8 +176,22 @@ struct GroupChatRoomView: View {
                 .background(Color.black)
             }
         }
+        Button(action: {
+            sendMessage()
+        }) {
+            Image(systemName: "paperplane.fill")
+                .foregroundColor(.white)
+                .padding()
+                .background(Color.blue)
+                .clipShape(Circle())
+        }
+        .disabled(messageText.trimmingCharacters(in: .whitespaces).isEmpty)
+        
+        
     }
     
+    // MARK: - Logic
+
     func loadMessages() {
         Firestore.firestore().collection("groupChats").document(group.id).collection("messages")
             .order(by: "timestamp")
@@ -200,7 +215,7 @@ struct GroupChatRoomView: View {
                 }
             }
     }
-    
+
     func sendMessage() {
         guard !messageText.trimmingCharacters(in: .whitespaces).isEmpty,
               let uid = Auth.auth().currentUser?.uid else { return }
@@ -209,6 +224,7 @@ struct GroupChatRoomView: View {
             "text": messageText,
             "senderId": uid,
             "senderName": Auth.auth().currentUser?.displayName ?? "Someone",
+            "groupId": group.id,
             "type": "text",
             "timestamp": Timestamp(),
             "likes": [],
@@ -220,54 +236,54 @@ struct GroupChatRoomView: View {
         messageText = ""
     }
     
-    
+    func sendMediaMessage(url: String, type: String) {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+
+        let data: [String: Any] = [
+            "type": type,
+            "mediaURL": url,
+            "senderId": uid,
+            "senderName": Auth.auth().currentUser?.displayName ?? "Someone",
+            "groupId": group.id,
+            "timestamp": Timestamp(),
+            "likes": [],
+            "comments": [],
+            "reposts": []
+        ]
+
+        Firestore.firestore().collection("groupChats").document(group.id).collection("messages").addDocument(data: data)
+    }
+
+
+
     func toggleLike(_ msg: ChatMessage) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         guard let docId = msg.documentId else { return }
         let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
-        
+
         let updatedLikes: [String]
         if msg.likes.contains(uid) {
             updatedLikes = msg.likes.filter { $0 != uid }
         } else {
             updatedLikes = msg.likes + [uid]
         }
-        
+
         ref.updateData(["likes": updatedLikes])
     }
-    
+
     func postComment(to msg: ChatMessage) {
         guard let uid = Auth.auth().currentUser?.uid, let docId = msg.documentId else { return }
         let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
-        
+
         let comment = ["userId": uid, "text": commentText]
         ref.updateData(["comments": FieldValue.arrayUnion([comment])])
         commentText = ""
         commentTarget = nil
     }
-    
+
     func repostMessage(_ msg: ChatMessage) {
         guard let uid = Auth.auth().currentUser?.uid, let docId = msg.documentId else { return }
         let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
         ref.updateData(["reposts": FieldValue.arrayUnion([uid])])
     }
-    
-    func sendMediaMessage(url: String, type: String) {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        
-        let data: [String: Any] = [
-            "type": type,
-            "mediaURL": url,
-            "senderId": uid,
-            "senderName": Auth.auth().currentUser?.displayName ?? "Someone",
-            "timestamp": Timestamp(),
-            "likes": [],
-            "comments": [],
-            "reposts": []
-        ]
-        
-        let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages")
-        ref.addDocument(data: data)
-    }
 }
-
