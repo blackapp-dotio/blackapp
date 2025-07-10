@@ -145,7 +145,7 @@ struct DirectChatRoomView: View {
                         edited: data["edited"] as? Bool ?? false,
                         likes: data["likes"] as? [String] ?? [],
                         comments: data["comments"] as? [[String: String]] ?? [],
-                        reposts: data["reposts"] as? [String] ?? []
+                        reposts: data["reposts"] as? [String] ?? [], senderName: senderId == uid ? "" : self.recipient.name
                     )
                 }
 
@@ -256,7 +256,7 @@ struct MessageBubble: View {
                     .background(
                         ZStack {
                             (message.isSender ? Color.brown : Color.purple)
-                                                    .opacity(0.3)
+                                                    .opacity(0.8)
                                                 Color.clear
                                                     .background(.ultraThinMaterial)
                         }

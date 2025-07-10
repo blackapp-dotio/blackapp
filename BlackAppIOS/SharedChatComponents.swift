@@ -341,7 +341,7 @@ struct DirectChatListView: View {
         func fetchGroups() {
             guard let currentUid = Auth.auth().currentUser?.uid else { return }
 
-            Firestore.firestore().collection("groups")
+            Firestore.firestore().collection("groupChats") // <-- FIXED HERE
                 .whereField("members", arrayContains: currentUid)
                 .getDocuments { snapshot, error in
                     if let error = error {
@@ -353,6 +353,7 @@ struct DirectChatListView: View {
                 }
         }
 
+
         func handleIncomingDeepLink() {
             if let matchedGroup = groups.first(where: { notificationRouter.selectedGroupId == $0.id }) {
                 selectedGroup = matchedGroup
@@ -362,41 +363,43 @@ struct DirectChatListView: View {
     }
 
     // MARK: - GroupMessageCard
-    
+
     struct GroupMessageCard: View {
         let message: ChatMessage
         var onLike: () -> Void
         var onComment: () -> Void
         var onRepost: () -> Void
-        
+
         var body: some View {
             VStack(alignment: .leading, spacing: 8) {
-                if message.type == "text" {
-                    Text(message.text ?? "")
-                        .foregroundColor(.white)
-                } else if message.type == "image", let urlString = message.mediaURL, let url = URL(string: urlString) {
-                    AsyncImage(url: url) { image in
-                        image
-                            .resizable()
-                            .scaledToFit()
-                    } placeholder: {
-                        ProgressView()
+                // Media & Text Content
+                Group {
+                    if message.type == "text" {
+                        Text(message.text ?? "")
+                            .foregroundColor(.white)
+                    } else if message.type == "image", let urlString = message.mediaURL, let url = URL(string: urlString) {
+                        AsyncImage(url: url) { image in
+                            image
+                                .resizable()
+                                .scaledToFit()
+                        } placeholder: {
+                            ProgressView()
+                        }
+                        .frame(maxWidth: 250, maxHeight: 250)
+                        .cornerRadius(10)
+                    } else if message.type == "audio", let url = URL(string: message.mediaURL ?? "") {
+                        AudioPlayerView(audioURL: url)
+                    } else if message.type == "video", let url = URL(string: message.mediaURL ?? "") {
+                        VideoPlayerView(videoURL: url)
+                            .frame(height: 200)
+                    } else if message.type == "announcement" {
+                        Text("📢 " + (message.text ?? ""))
+                            .fontWeight(.bold)
+                            .foregroundColor(.yellow)
                     }
-                    .frame(maxWidth: 250, maxHeight: 250)
-                    .cornerRadius(10)
-                } else if message.type == "audio", let url = URL(string: message.mediaURL ?? "") {
-                    AudioPlayerView(audioURL: url)
-                } else if message.type == "video", let url = URL(string: message.mediaURL ?? "") {
-                    VideoPlayerView(videoURL: url)
-                        .frame(height: 200)
                 }
-                
-                if message.type == "announcement" {
-                    Text("📢 " + (message.text ?? ""))
-                        .fontWeight(.bold)
-                        .foregroundColor(.yellow)
-                }
-                
+
+                // Interactions Row
                 HStack(spacing: 20) {
                     Button(action: onLike) {
                         Label("\(message.likes.count)", systemImage: "heart")
@@ -418,9 +421,7 @@ struct DirectChatListView: View {
             .cornerRadius(12)
         }
     }
-    
 
-    
     // MARK: - MessageBubble & TeardropShape
 
     struct MessageBubble: View {
@@ -857,16 +858,18 @@ struct GroupChatListView: View {
     func fetchGroups() {
         guard let currentUid = Auth.auth().currentUser?.uid else { return }
 
-        Firestore.firestore().collection("groups").whereField("members", arrayContains: currentUid)
+        Firestore.firestore().collection("groups")
+            .whereField("members", arrayContains: currentUid)
             .getDocuments { snapshot, error in
                 if let error = error {
                     print("❌ Error fetching groups: \(error.localizedDescription)")
                     return
                 }
 
-                groups = snapshot?.documents.compactMap { GroupChat.from($0) } ?? []
+                self.groups = snapshot?.documents.compactMap { GroupChat.from($0) } ?? []
             }
     }
+
 
     func listenForUnreadGroupMessages() {
         guard let currentUid = Auth.auth().currentUser?.uid else { return }
@@ -928,18 +931,4 @@ struct GroupMessageCard: View {
 }
 
 
-// MARK: - ManageGroupView.swift
-struct ManageGroupView: View {
-    let group: GroupChat
 
-    var body: some View {
-        VStack {
-            Text("Manage \(group.name)")
-                .font(.title)
-                .foregroundColor(.white)
-            // Add group management tools here
-        }
-        .padding()
-        .background(Color.black)
-    }
-}

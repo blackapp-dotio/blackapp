@@ -78,35 +78,51 @@ struct CreateGroupView: View {
        }
    }
    
-   func createGroup() {
-       guard let currentUserId = Auth.auth().currentUser?.uid else {
-           print("❌ No authenticated user.")
-           return
-       }
-       
-       isCreating = true
-       let groupId = UUID().uuidString
-       
-       let groupData: [String: Any] = [
-           "name": groupName,
-           "description": groupDescription,
-           "members": [currentUserId],
-           "adminIds": [Auth.auth().currentUser?.uid ?? ""],
-           "ownerId": currentUserId,
-           "coverImageURL": coverImageURL ?? ""
-       ]
-       
-       Firestore.firestore().collection("groups").document(groupId).setData(groupData) { error in
-           isCreating = false
-           if let error = error {
-               print("❌ Failed to create group: \(error.localizedDescription)")
-           } else {
-               print("✅ Group created with ID: \(groupId)")
-               dismiss()
-           }
-       }
-   }
-   
+    func createGroup() {
+        guard let currentUserId = Auth.auth().currentUser?.uid else {
+            print("❌ No authenticated user.")
+            return
+        }
+
+        isCreating = true
+        let groupId = UUID().uuidString
+
+        let groupData: [String: Any] = [
+            "name": groupName,
+            "description": groupDescription,
+            "members": [currentUserId], // ✅ Original fetch logic needs this
+            "adminIds": [currentUserId],
+            "ownerId": currentUserId,
+            "coverImageURL": coverImageURL ?? "",
+            "createdAt": FieldValue.serverTimestamp()
+        ]
+
+        let db = Firestore.firestore()
+
+        // Save to original "groups" collection
+        db.collection("groups").document(groupId).setData(groupData) { error in
+            if let error = error {
+                print("❌ Failed to create group: \(error.localizedDescription)")
+                isCreating = false
+                return
+            }
+
+            // ✅ Also add to members subcollection for OneSignal support
+            db.collection("groups").document(groupId).collection("members").document(currentUserId).setData([
+                "joinedAt": FieldValue.serverTimestamp(),
+                "role": "admin"
+            ]) { error in
+                isCreating = false
+                if let error = error {
+                    print("⚠️ Group created but failed to add to members subcollection: \(error.localizedDescription)")
+                } else {
+                    print("✅ Group created with member subcollection.")
+                }
+                dismiss()
+            }
+        }
+    }
+
    func uploadCoverImage(_ image: UIImage) {
        guard let imageData = image.jpegData(compressionQuality: 0.8) else { return }
        let filename = UUID().uuidString + ".jpg"

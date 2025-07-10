@@ -1,7 +1,5 @@
-// MARK: - GroupChatRoomView
-
-import PhotosUI
 import SwiftUI
+import PhotosUI
 import Firebase
 import FirebaseAuth
 import FirebaseFirestore
@@ -10,8 +8,7 @@ import OneSignalFramework
 
 struct GroupChatRoomView: View {
     var group: GroupChat
-    
-    
+
     @State private var messageText = ""
     @State private var messages: [ChatMessage] = []
     @State private var commentTarget: ChatMessage? = nil
@@ -19,129 +16,22 @@ struct GroupChatRoomView: View {
     @State private var showManageSheet = false
     @State private var currentUserId: String = ""
     @State private var selectedMediaItem: PhotosPickerItem? = nil
-    
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if let coverURL = group.coverImageURL, let imageURL = URL(string: coverURL) {
-                    AsyncImage(url: imageURL) { image in
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .frame(height: 160)
-                            .clipped()
-                    } placeholder: {
-                        Color.gray.frame(height: 160)
-                    }
-                } else {
-                    // Provide a fallback for when there's no cover image
-                    Color.gray.frame(height: 160)
-                }
-                
-                // 🟡 Insert the rest of your view content here.
-                // For example:
-                Text("Group Chat Content Here...")
-                .foregroundColor(.white)                    }
-            
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(spacing: 16) {
-                        if let desc = group.description, !desc.isEmpty {
-                            Text(desc)
-                                .font(.subheadline)
-                                .foregroundColor(.gray)
-                                .padding(.bottom, 5)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal)
-                        }
-                        
-                        ForEach(messages) { message in
-                            GroupMessageCard(
-                                message: message,
-                                onLike: { toggleLike(message) },
-                                onComment: { commentTarget = message },
-                                onRepost: { repostMessage(message) }
-                            )
-                        }
-                    }
-                    .padding()
-                }
-            }
-            
-            Divider()
-            
-            HStack(spacing: 12) {
-                TextField("Write something...", text: $messageText)
-                    .padding(10)
-                    .background(Color.gray.opacity(0.2))
-                    .cornerRadius(10)
-                    .foregroundColor(.white)
-                
-                PhotosPicker(
-                    selection: $selectedMediaItem,
-                    matching: .any(of: [.images, .videos]),
-                    photoLibrary: .shared()
-                ) {
-                    Image(systemName: "paperclip.circle.fill")
-                        .foregroundColor(.gray)
-                        .font(.title2)
-                }
-                .onChange(of: selectedMediaItem) { newItem in
-                    if let newItem = newItem {
-                        Task {
-                            if let data = try? await newItem.loadTransferable(type: Data.self),
-                               let fileExtension = newItem.supportedContentTypes.first?.preferredFilenameExtension {
-                                let filename = UUID().uuidString + ".\(fileExtension)"
-                                let ref = Storage.storage().reference().child("chat_media/\(filename)")
-                                
-                                ref.putData(data, metadata: nil) { _, error in
-                                    if let error = error {
-                                        print("❌ Upload failed: \(error.localizedDescription)")
-                                        return
-                                    }
-                                    
-                                    ref.downloadURL { url, _ in
-                                        guard let url = url else { return }
-                                        
-                                        let type: String
-                                        if newItem.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
-                                            type = "video"
-                                        } else if newItem.supportedContentTypes.contains(where: { $0.conforms(to: .image) }) {
-                                            type = "image"
-                                        } else {
-                                            type = "unsupported"
-                                        }
-                                        
-                                        if type != "unsupported" {
-                                            sendMediaMessage(url: url.absoluteString, type: type)
-                                        } else {
-                                            print("❌ Unsupported media type selected.")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    
-                    
-                    Button(action: sendMessage) {
-                        Image(systemName: "paperplane.fill")
-                            .foregroundColor(.blue)
-                            .padding(10)
-                    }
-                }
-                .padding(.horizontal)
-                .padding(.bottom)
+                headerView
+                messageScrollView
+                messageInputBar
             }
             .navigationTitle(group.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    if group.adminIds.contains(currentUserId) {
-                        Button(action: {
+                if group.adminIds.contains(currentUserId) {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
                             showManageSheet = true
-                        }) {
+                        } label: {
                             Image(systemName: "gearshape.fill")
                         }
                     }
@@ -150,56 +40,113 @@ struct GroupChatRoomView: View {
             .sheet(isPresented: $showManageSheet) {
                 ManageGroupView(group: group)
             }
-            .background(Color.black.ignoresSafeArea())
+            .sheet(item: $commentTarget) { msg in
+                commentSheet(for: msg)
+            }
             .onAppear {
                 if let uid = Auth.auth().currentUser?.uid {
                     currentUserId = uid
                 }
                 loadMessages()
             }
-            .sheet(item: $commentTarget) { msg in
-                VStack {
-                    Text("Comment on Post")
-                        .font(.headline)
-                        .padding(.top)
-                    TextField("Your comment...", text: $commentText)
-                        .padding()
-                        .background(Color.gray.opacity(0.2))
-                        .cornerRadius(10)
-                    Button("Post") {
-                        postComment(to: msg)
-                    }
-                    .padding()
-                    Spacer()
+            .background(Color.black.ignoresSafeArea())
+        }
+    }
+
+    private var headerView: some View {
+        Group {
+            if let coverURL = group.coverImageURL, let imageURL = URL(string: coverURL) {
+                AsyncImage(url: imageURL) { image in
+                    image.resizable()
+                         .scaledToFill()
+                         .frame(height: 160)
+                         .clipped()
+                } placeholder: {
+                    Color.gray.frame(height: 160)
                 }
-                .padding()
-                .background(Color.black)
+            } else {
+                Color.gray.frame(height: 160)
             }
         }
-        Button(action: {
-            sendMessage()
-        }) {
-            Image(systemName: "paperplane.fill")
-                .foregroundColor(.white)
-                .padding()
-                .background(Color.blue)
-                .clipShape(Circle())
-        }
-        .disabled(messageText.trimmingCharacters(in: .whitespaces).isEmpty)
-        
-        
     }
-    
+
+    private var messageScrollView: some View {
+        ScrollViewReader { _ in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let desc = group.description, !desc.isEmpty {
+                        Text(desc)
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+                            .padding(.horizontal)
+                    }
+
+                    ForEach(messages) { msg in
+                        MessageCardView(
+                            message: msg,
+                            isSender: msg.isSender,
+                            toggleLike: { toggleLike(message: msg) },
+                            commentAction: { commentTarget = msg },
+                            repostAction: { repostMessage(msg) }
+                        )
+                        .padding(.horizontal)
+                    }
+                }
+                .padding(.vertical)
+            }
+        }
+    }
+
+    private var messageInputBar: some View {
+        HStack {
+            TextField("Type a message...", text: $messageText)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+            Button("Send") {
+                sendMessage()
+            }
+        }
+        .padding()
+    }
+
+    private func commentSheet(for msg: ChatMessage) -> some View {
+        VStack {
+            Text("Comment on Post")
+                .font(.headline)
+                .padding(.top)
+            TextField("Your comment...", text: $commentText)
+                .padding()
+                .background(Color.gray.opacity(0.2))
+                .cornerRadius(10)
+            Button("Post") {
+                postComment(messageId: msg.id, commentText: commentText)
+                commentText = ""
+                commentTarget = nil
+            }
+            .padding()
+            Spacer()
+        }
+        .padding()
+        .background(Color.black)
+    }
+
     // MARK: - Logic
 
-    func loadMessages() {
-        Firestore.firestore().collection("groupChats").document(group.id).collection("messages")
+    private func initials(from name: String) -> String {
+        let comps = name.split(separator: " ")
+        let first = comps.first?.prefix(1) ?? ""
+        let second = comps.dropFirst().first?.prefix(1) ?? ""
+        return (first + second).uppercased()
+    }
+
+    private func loadMessages() {
+        Firestore.firestore().collection("groups").document(group.id).collection("messages")
             .order(by: "timestamp")
             .addSnapshotListener { snapshot, _ in
                 guard let documents = snapshot?.documents else { return }
                 messages = documents.map { doc in
                     let data = doc.data()
                     let senderId = data["senderId"] as? String ?? ""
+                    let senderName = data["senderName"] as? String ?? "Someone"
                     return ChatMessage(
                         id: doc.documentID,
                         text: data["text"] as? String,
@@ -210,17 +157,22 @@ struct GroupChatRoomView: View {
                         edited: data["edited"] as? Bool ?? false,
                         likes: data["likes"] as? [String] ?? [],
                         comments: data["comments"] as? [[String: String]] ?? [],
-                        reposts: data["reposts"] as? [String] ?? []
+                        reposts: data["reposts"] as? [String] ?? [],
+                        senderName: senderName
                     )
                 }
             }
     }
 
-    func sendMessage() {
+    private func sendMessage() {
         guard !messageText.trimmingCharacters(in: .whitespaces).isEmpty,
               let uid = Auth.auth().currentUser?.uid else { return }
-        
+
+        let db = Firestore.firestore()
+        let messageRef = db.collection("groups").document(group.id).collection("messages").document()
+
         let data: [String: Any] = [
+            "id": messageRef.documentID,
             "text": messageText,
             "senderId": uid,
             "senderName": Auth.auth().currentUser?.displayName ?? "Someone",
@@ -231,15 +183,19 @@ struct GroupChatRoomView: View {
             "comments": [],
             "reposts": []
         ]
-        
-        Firestore.firestore().collection("groupChats").document(group.id).collection("messages").addDocument(data: data)
+
+        messageRef.setData(data)
         messageText = ""
     }
-    
-    func sendMediaMessage(url: String, type: String) {
+
+    private func sendMediaMessage(url: String, type: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
 
+        let db = Firestore.firestore()
+        let messageRef = db.collection("groups").document(group.id).collection("messages").document()
+
         let data: [String: Any] = [
+            "id": messageRef.documentID,
             "type": type,
             "mediaURL": url,
             "senderId": uid,
@@ -251,39 +207,63 @@ struct GroupChatRoomView: View {
             "reposts": []
         ]
 
-        Firestore.firestore().collection("groupChats").document(group.id).collection("messages").addDocument(data: data)
+        messageRef.setData(data)
     }
 
+    private func toggleLike(message: ChatMessage) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Firestore.firestore()
+            .collection("groups")
+            .document(group.id)
+            .collection("messages")
+            .document(message.id)
 
-
-    func toggleLike(_ msg: ChatMessage) {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        guard let docId = msg.documentId else { return }
-        let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
-
-        let updatedLikes: [String]
-        if msg.likes.contains(uid) {
-            updatedLikes = msg.likes.filter { $0 != uid }
-        } else {
-            updatedLikes = msg.likes + [uid]
+        ref.getDocument { document, _ in
+            guard let doc = document, doc.exists else { return }
+            var likes = doc.data()?["likes"] as? [String] ?? []
+            if likes.contains(userId) {
+                likes.removeAll { $0 == userId }
+            } else {
+                likes.append(userId)
+            }
+            ref.updateData(["likes": likes])
         }
-
-        ref.updateData(["likes": updatedLikes])
     }
 
-    func postComment(to msg: ChatMessage) {
-        guard let uid = Auth.auth().currentUser?.uid, let docId = msg.documentId else { return }
-        let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
+    private func postComment(messageId: String, commentText: String) {
+        guard let currentUserId = Auth.auth().currentUser?.uid else { return }
 
-        let comment = ["userId": uid, "text": commentText]
-        ref.updateData(["comments": FieldValue.arrayUnion([comment])])
-        commentText = ""
-        commentTarget = nil
+        let commentData: [String: Any] = [
+            "userId": currentUserId,
+            "text": commentText,
+            "timestamp": Timestamp()
+        ]
+
+        Firestore.firestore()
+            .collection("groups")
+            .document(group.id)
+            .collection("messages")
+            .document(messageId)
+            .collection("comments")
+            .addDocument(data: commentData)
     }
 
-    func repostMessage(_ msg: ChatMessage) {
-        guard let uid = Auth.auth().currentUser?.uid, let docId = msg.documentId else { return }
-        let ref = Firestore.firestore().collection("groupChats").document(group.id).collection("messages").document(docId)
-        ref.updateData(["reposts": FieldValue.arrayUnion([uid])])
+    private func repostMessage(_ message: ChatMessage) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        let ref = Firestore.firestore()
+            .collection("groups")
+            .document(group.id)
+            .collection("messages")
+            .document(message.id)
+
+        ref.getDocument { document, _ in
+            guard let doc = document, doc.exists else { return }
+            var reposts = doc.data()?["reposts"] as? [String] ?? []
+            if !reposts.contains(userId) {
+                reposts.append(userId)
+                ref.updateData(["reposts": reposts])
+            }
+        }
     }
 }

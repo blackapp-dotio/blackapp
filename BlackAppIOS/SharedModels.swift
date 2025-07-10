@@ -14,6 +14,7 @@ import Foundation
         var likes: [String]
         var comments: [[String: String]]
         var reposts: [String]
+        var senderName: String
     }
     
     
@@ -50,4 +51,3 @@ struct WaterDropShape: Shape {
     }
 }
 
-    

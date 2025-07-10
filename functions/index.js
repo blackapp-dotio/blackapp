@@ -160,56 +160,62 @@ exports.sendNewMessageNotification = functions.firestore
     }
   });
 
-
 exports.sendNewGroupMessageNotification = functions.firestore
-  .document("groupChats/{chatId}/messages/{messageId}")
+  .document("groups/{groupId}/messages/{messageId}")
   .onCreate(async (snap, context) => {
     logStamp("📡 OneSignal: Group message trigger");
 
     const data = snap.data();
     const { senderId, text = "New group message" } = data;
-    const chatId = context.params.chatId;
+    const groupId = context.params.groupId;
 
-    // 🧠 Fetch sender name from Realtime DB
+    console.log(`📨 New message in group: ${groupId}, sender: ${senderId}, text: ${text}`);
+
+    // Fetch sender name from Firestore
     let senderName = "Someone";
     try {
-      const nameSnap = await admin.database().ref(`users/${senderId}/name`).once("value");
-      if (nameSnap.exists()) {
-        senderName = nameSnap.val();
-      }
+      const senderSnap = await admin.firestore().collection("users").doc(senderId).get();
+      if (senderSnap.exists) senderName = senderSnap.data().name || "Someone";
     } catch (err) {
       console.warn(`⚠️ Could not fetch sender name for ${senderId}`, err);
     }
 
-    // 🔍 Get group members from Firestore
-    const groupSnap = await admin.firestore().collection("groupChats").doc(chatId).get();
-    const members = groupSnap.exists ? groupSnap.data().members || [] : [];
+    // Fetch group members from subcollection
+    let memberIds = [];
+    try {
+      const membersSnap = await admin.firestore().collection(`groups/${groupId}/members`).get();
+      memberIds = membersSnap.docs.map(doc => doc.id);
+      console.log(`👥 Fetched ${memberIds.length} member(s)`);
+    } catch (err) {
+      console.error(`🔥 Failed to fetch group members for ${groupId}`, err);
+      return;
+    }
 
-    for (const userId of members) {
+    for (const userId of memberIds) {
       if (userId === senderId) continue;
 
-      const tokenSnap = await admin.database().ref(`users/${userId}/oneSignalId`).once("value");
-      const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
-
-      if (!oneSignalId) {
-        console.warn(`⛔ No OneSignal ID for group member ${userId}`);
-        continue;
-      }
-
-      const payload = {
-        app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
-        include_player_ids: [oneSignalId],
-        headings: { en: `New group message from ${senderName}` },
-        contents: { en: text.substring(0, 100) },
-        data: {
-          chatId,
-          senderId,
-          senderName,
-          type: "group"
-        }
-      };
-
       try {
+        const tokenSnap = await admin.database().ref(`users/${userId}/onesignalUserId`).once("value");
+        const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
+
+        if (!oneSignalId) {
+          console.warn(`⛔ No OneSignal ID for member ${userId}`);
+          continue;
+        }
+
+        const payload = {
+          app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
+          include_player_ids: [oneSignalId],
+          headings: { en: `New message from ${senderName}` },
+          contents: { en: text.substring(0, 100) },
+          data: {
+            groupId,
+            senderId,
+            senderName,
+            type: "group"
+          }
+        };
+
         const response = await fetch("https://onesignal.com/api/v1/notifications", {
           method: "POST",
           headers: {
@@ -220,12 +226,152 @@ exports.sendNewGroupMessageNotification = functions.firestore
         });
 
         const result = await response.json();
-        console.log(`📤 Group notification sent to ${userId}:`, result);
+        console.log(`📤 Notification sent to ${userId}:`, result);
+
       } catch (err) {
-        console.error(`🔥 Failed to send group notification to ${userId}:`, err);
+        console.error(`🔥 Failed to notify ${userId}:`, err);
       }
     }
   });
+
+exports.sendGroupMessageLikeNotification = functions.firestore
+  .document("groups/{groupId}/messages/{messageId}")
+  .onUpdate(async (change, context) => {
+    logStamp("📡 OneSignal: Group like trigger");
+
+    const before = change.before.data();
+    const after = change.after.data();
+
+    const beforeLikes = before.likes || [];
+    const afterLikes = after.likes || [];
+    const newLikes = afterLikes.filter(uid => !beforeLikes.includes(uid));
+    if (newLikes.length === 0) return;
+
+    const senderId = newLikes[0];
+    const { groupId, messageId } = context.params;
+
+    console.log(`❤️ Message ${messageId} liked by ${senderId} in group ${groupId}`);
+
+    let memberIds = [];
+    try {
+      const membersSnap = await admin.firestore().collection(`groups/${groupId}/members`).get();
+      memberIds = membersSnap.docs.map(doc => doc.id);
+      console.log(`👥 Found ${memberIds.length} group members`);
+    } catch (err) {
+      console.error(`🔥 Failed to fetch group members for ${groupId}`, err);
+      return;
+    }
+
+    for (const userId of memberIds) {
+      if (userId === senderId) continue;
+
+      try {
+        const tokenSnap = await admin.database().ref(`users/${userId}/onesignalUserId`).once("value");
+        const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
+
+        if (!oneSignalId) {
+          console.warn(`⛔ No OneSignal ID for like notification user ${userId}`);
+          continue;
+        }
+
+        const payload = {
+          app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
+          include_player_ids: [oneSignalId],
+          headings: { en: "❤️ A message was liked!" },
+          contents: { en: "Tap to view the liked message." },
+          data: {
+            groupId,
+            messageId,
+            type: "group_like"
+          }
+        };
+
+        const response = await fetch("https://onesignal.com/api/v1/notifications", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Basic os_v2_app_ne3gxoznq5cldeq4h7jmxkhp7ruw3us5chieq44pjsibxepuhuu6g5whoglp4np5whffwb72r6ybupdxcevuso2oilvzdldcf4jajsq"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+        console.log(`📤 Like notification sent to ${userId}:`, result);
+
+      } catch (err) {
+        console.error(`🔥 Failed to send like notification to ${userId}:`, err);
+      }
+    }
+  });
+
+
+exports.sendGroupMessageCommentNotification = functions.firestore
+  .document("groups/{groupId}/messages/{messageId}/comments/{commentId}")
+  .onCreate(async (snap, context) => {
+    logStamp("📡 OneSignal: Group comment trigger");
+
+    const { groupId, messageId } = context.params;
+    const comment = snap.data();
+    const senderId = comment.userId;
+    const commentText = comment.text || "New comment";
+
+    console.log(`💬 New comment on message ${messageId} in group ${groupId} by ${senderId}`);
+
+    let memberIds = [];
+    try {
+      const membersSnap = await admin.firestore().collection(`groups/${groupId}/members`).get();
+      memberIds = membersSnap.docs.map(doc => doc.id);
+      console.log(`👥 Loaded ${memberIds.length} group members`);
+    } catch (err) {
+      console.error(`🔥 Failed to fetch group members for ${groupId}`, err);
+      return;
+    }
+
+    for (const userId of memberIds) {
+      if (userId === senderId) continue;
+
+      try {
+        const tokenSnap = await admin.database().ref(`users/${userId}/onesignalUserId`).once("value");
+        const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
+
+        if (!oneSignalId) {
+          console.warn(`⛔ No OneSignal ID for comment notify user ${userId}`);
+          continue;
+        }
+
+        const payload = {
+          app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
+          include_player_ids: [oneSignalId],
+          headings: { en: "💬 New Comment in Group Chat" },
+          contents: { en: commentText.substring(0, 100) },
+          data: {
+            groupId,
+            messageId,
+            type: "group_comment"
+          }
+        };
+
+        const response = await fetch("https://onesignal.com/api/v1/notifications", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Basic os_v2_app_ne3gxoznq5cldeq4h7jmxkhp7ruw3us5chieq44pjsibxepuhuu6g5whoglp4np5whffwb72r6ybupdxcevuso2oilvzdldcf4jajsq"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+        console.log(`📤 Comment notification sent to ${userId}:`, result);
+
+      } catch (err) {
+        console.error(`🔥 Failed to send comment notification to ${userId}:`, err);
+      }
+    }
+  });
+
+
+
+
 exports.sendEventReminderNotification = functions.database
   .ref("purchases/{userId}/{purchaseId}")
   .onCreate(async (snap, context) => {
@@ -274,117 +420,3 @@ exports.sendEventReminderNotification = functions.database
     }
   });
 
-exports.sendGroupMessageCommentNotification = functions.firestore
-  .document("groupChats/{chatId}/messages/{messageId}/comments/{commentId}")
-  .onCreate(async (snap, context) => {
-    logStamp("📡 OneSignal: Group comment trigger");
-
-    const { chatId, messageId } = context.params;
-    const comment = snap.data();
-    const senderId = comment.userId;
-    const commentText = comment.text || "New comment";
-
-    // Fetch group members
-    const groupSnap = await admin.firestore().collection("groupChats").doc(chatId).get();
-    const members = groupSnap.exists ? groupSnap.data().members || [] : [];
-
-    for (const userId of members) {
-      if (userId === senderId) continue;
-
-      const tokenSnap = await admin.database().ref(`users/${userId}/onesignalUserId`).once("value");
-      const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
-      if (!oneSignalId) {
-        console.warn(`⛔ No OneSignal ID for comment notify user ${userId}`);
-        continue;
-      }
-
-      const payload = {
-        app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
-        include_player_ids: [oneSignalId],
-        headings: { en: "💬 New Comment in Group Chat" },
-        contents: { en: commentText.substring(0, 100) },
-        data: {
-          chatId,
-          messageId,
-          type: "group_comment"
-        }
-      };
-
-      try {
-        const response = await fetch("https://onesignal.com/api/v1/notifications", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: "Basic os_v2_app_ne3gxoznq5cldeq4h7jmxkhp7ruw3us5chieq44pjsibxepuhuu6g5whoglp4np5whffwb72r6ybupdxcevuso2oilvzdldcf4jajsq"
-          },
-          body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-        console.log(`📤 Comment notification sent to ${userId}:`, result);
-      } catch (err) {
-        console.error(`🔥 Failed to send comment notification to ${userId}:`, err);
-      }
-    }
-  });
-
-exports.sendGroupMessageLikeNotification = functions.firestore
-  .document("groupChats/{chatId}/messages/{messageId}")
-  .onUpdate(async (change, context) => {
-    logStamp("📡 OneSignal: Group like trigger");
-
-    const before = change.before.data();
-    const after = change.after.data();
-
-    const beforeLikes = before.likes || [];
-    const afterLikes = after.likes || [];
-    const newLikes = afterLikes.filter(uid => !beforeLikes.includes(uid));
-
-    if (newLikes.length === 0) return;
-
-    const senderId = newLikes[0];
-    const { chatId, messageId } = context.params;
-
-    // Fetch group members
-    const groupSnap = await admin.firestore().collection("groupChats").doc(chatId).get();
-    const members = groupSnap.exists ? groupSnap.data().members || [] : [];
-
-    for (const userId of members) {
-      if (userId === senderId) continue;
-
-      const tokenSnap = await admin.database().ref(`users/${userId}/onesignalUserId`).once("value");
-      const oneSignalId = tokenSnap.exists() ? tokenSnap.val() : null;
-      if (!oneSignalId) {
-        console.warn(`⛔ No OneSignal ID for like notify user ${userId}`);
-        continue;
-      }
-
-      const payload = {
-        app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
-        include_player_ids: [oneSignalId],
-        headings: { en: "❤️ Someone liked a group message" },
-        contents: { en: "Tap to see what they liked!" },
-        data: {
-          chatId,
-          messageId,
-          type: "group_like"
-        }
-      };
-
-      try {
-        const response = await fetch("https://onesignal.com/api/v1/notifications", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: "Basic os_v2_app_ne3gxoznq5cldeq4h7jmxkhp7ruw3us5chieq44pjsibxepuhuu6g5whoglp4np5whffwb72r6ybupdxcevuso2oilvzdldcf4jajsq"
-          },
-          body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-        console.log(`📤 Like notification sent to ${userId}:`, result);
-      } catch (err) {
-        console.error(`🔥 Failed to send like notification to ${userId}:`, err);
-      }
-    }
-  });

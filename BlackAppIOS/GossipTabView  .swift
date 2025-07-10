@@ -485,7 +485,10 @@ struct GossipTabView: View {
     // MARK: - Combine and Render Posts
     
     func mergeContent() {
-        let rss = rssArticles.map { article in
+        let filteredRSS = rssArticles.filter { article in
+            guard let tag = selectedTagFilter?.lowercased() else { return true }
+            return article.title.lowercased().contains(tag) || article.description.lowercased().contains(tag)
+        }.map { article in
             AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.title) {
                 Button(action: {
                     selectedURL = URL(string: article.link)
@@ -493,15 +496,14 @@ struct GossipTabView: View {
                 }) {
                     RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
                 }
-                .buttonStyle(PlainButtonStyle()) // So it doesn’t show tap effects
+                .buttonStyle(PlainButtonStyle())
             }
         }
         
-        
-        let users = userPosts
+        let filteredUserPosts = userPosts
             .filter { post in
-                guard let tag = selectedTagFilter else { return true }
-                return post.text.lowercased().contains(tag.lowercased())
+                guard let tag = selectedTagFilter?.lowercased() else { return true }
+                return post.text.lowercased().contains(tag)
             }
             .map { post in
                 let profile = userProfiles[post.userId]
@@ -600,6 +602,6 @@ struct GossipTabView: View {
                 }
             }
         
-        combinedFeed = (users + rss).sorted(by: { $0.timestamp > $1.timestamp })
+        combinedFeed = (filteredUserPosts + filteredRSS).sorted(by: { $0.timestamp > $1.timestamp })
     }
 }
