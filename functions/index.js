@@ -33,37 +33,59 @@ exports.generateClientToken = functions.https.onRequest((req, res) => {
 
 exports.createTransaction = functions.https.onRequest((req, res) => {
   cors(req, res, async () => {
-    const { amount, paymentMethodNonce, userId, eventId, eventName, type, quantity } = req.body;
+    const {
+      paymentMethodNonce,
+      userId,
+      eventId,
+      eventName,
+      ticketQty = 0,
+      ticketPrice = 0,
+      tableQty = 0,
+      tablePrice = 0,
+      platformFee = 0
+    } = req.body;
 
-    if (!amount || !paymentMethodNonce || !userId || !eventId || !eventName || !type || !quantity) {
-      return res.status(400).send({ error: "Missing required transaction fields" });
+    // Parse numbers safely
+    const ticketQtyNum = parseInt(ticketQty);
+    const tableQtyNum = parseInt(tableQty);
+    const ticketPriceNum = parseFloat(ticketPrice);
+    const tablePriceNum = parseFloat(tablePrice);
+    const platformFeeNum = parseFloat(platformFee);
+
+    // Basic validation
+    if (!paymentMethodNonce || !userId || !eventId || !eventName) {
+      return res.status(400).send({ error: "Missing required fields" });
     }
 
-    const baseAmount = parseFloat(amount);
-    const total = (baseAmount * 1.02).toFixed(2);
-    const platformFee = (total - baseAmount).toFixed(2);
+    const ticketTotal = ticketQtyNum * ticketPriceNum;
+    const tableTotal = tableQtyNum * tablePriceNum;
+    const baseAmount = +(ticketTotal + tableTotal).toFixed(2);
+    const expectedTotal = +(baseAmount + platformFeeNum).toFixed(2);
 
     try {
       const result = await gateway.transaction.sale({
-        amount: total,
+        amount: expectedTotal.toString(),
         paymentMethodNonce,
         options: { submitForSettlement: true }
       });
 
       if (!result.success) throw new Error(result.message);
 
-      const ref = admin.database().ref(`purchases/${userId}`).push();
       const timestamp = Date.now();
+      const purchaseRef = admin.database().ref(`purchases/${userId}`).push();
 
-      await ref.set({
-        id: ref.key,
+      await purchaseRef.set({
+        id: purchaseRef.key,
+        userId,
         eventId,
         eventName,
-        type,
-        quantity,
-        amount: total,
-        baseAmount: baseAmount.toFixed(2),
-        platformFee,
+        ticketQty: ticketQtyNum,
+        ticketPrice: ticketPriceNum,
+        tableQty: tableQtyNum,
+        tablePrice: tablePriceNum,
+        baseAmount,
+        platformFee: platformFeeNum,
+        totalAmount: expectedTotal,
         timestamp
       });
 
@@ -74,6 +96,93 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
     }
   });
 });
+
+exports.scheduleEventReminders = functions.pubsub
+  .schedule("every 1 hours")
+  .onRun(async () => {
+    const now = Date.now();
+    const in24Hours = now + 24 * 60 * 60 * 1000;
+
+    const snapshot = await admin.database().ref("purchases").once("value");
+
+    snapshot.forEach(userSnap => {
+      userSnap.forEach(purchaseSnap => {
+        const data = purchaseSnap.val();
+        const { eventTime, eventName = "Event", eventId, userId } = data;
+
+        if (!eventTime || !userId) return;
+
+        const diff = eventTime - now;
+        const is24hrWindow = diff > 0 && diff < 60 * 60 * 1000;
+
+        if (is24hrWindow) {
+          admin
+            .database()
+            .ref(`users/${userId}/onesignalUserId`)
+            .once("value")
+            .then(tokenSnap => {
+              const oneSignalId = tokenSnap.val();
+              if (!oneSignalId) return;
+
+              const payload = {
+                app_id: "69366bbb-2d87-44b1-921c-3fd2cba8effc",
+                include_player_ids: [oneSignalId],
+                headings: { en: "🎉 Event Reminder" },
+                contents: { en: `Your event "${eventName}" is in 24 hours.` },
+                data: { type: "event_reminder", eventId, eventName }
+              };
+
+              return fetch("https://onesignal.com/api/v1/notifications", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: "Basic os_v2_app_ne3gxoznq5cldeq4h7jmxkhp7ruw3us5chieq44pjsibxepuhuu6g5whoglp4np5whffwb72r6ybupdxcevuso2oilvzdldcf4jajsq"
+                },
+                body: JSON.stringify(payload)
+              });
+            });
+        }
+      });
+    });
+
+    return null;
+  });
+
+
+exports.getPlatformRevenue = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      const snapshot = await admin.database().ref("purchases").once("value");
+
+      let totalRevenue = 0;
+      let platformEarnings = 0;
+      let totalEvents = new Set();
+      let ticketsSold = 0;
+
+      snapshot.forEach(userSnap => {
+        userSnap.forEach(purchaseSnap => {
+          const data = purchaseSnap.val();
+          totalEvents.add(data.eventId);
+          platformEarnings += parseFloat(data.platformFee || 0);
+          totalRevenue += parseFloat(data.totalAmount || 0);
+          ticketsSold += parseInt(data.ticketQty || 0);
+        });
+      });
+
+      res.status(200).send({
+        platformEarnings: platformEarnings.toFixed(2),
+        totalRevenue: totalRevenue.toFixed(2),
+        totalEvents: totalEvents.size,
+        ticketsSold
+      });
+    } catch (err) {
+      console.error("❌ Revenue summary failed:", err);
+      res.status(500).send({ error: err.message });
+    }
+  });
+});
+
+
 
 exports.getCheckoutURL = functions.https.onRequest((req, res) => {
   cors(req, res, () => {

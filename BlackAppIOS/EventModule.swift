@@ -947,16 +947,15 @@ struct RSSCardView: View {
 }
 
 // MARK: - EventDetailView
+
 import SwiftUI
 import Firebase
 
 struct EventDetailView: View {
     let event: EventModel
-    @State private var showWebView = false
+    @State private var showWebViewModal = false
     @State private var selectedURL: URL?
     @State private var showCheckoutConfirmation = false
-    @State private var selectedTicketQuantity = 0
-    @State private var selectedTableQuantity = 0
 
     var body: some View {
         ScrollView {
@@ -1006,53 +1005,46 @@ struct EventDetailView: View {
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showWebView) {
+        .sheet(isPresented: $showWebViewModal) {
             if let url = selectedURL {
                 NavigationView {
                     WebView(url: url)
                         .navigationBarTitle("Secure Checkout", displayMode: .inline)
                         .navigationBarItems(trailing: Button("Close") {
-                            showWebView = false
+                            showWebViewModal = false
                         })
                 }
             }
         }
         .sheet(isPresented: $showCheckoutConfirmation) {
-            CheckoutConfirmationView(
-                event: event,
-                onConfirm: { ticketQty, tableQty in
-                    openCheckout(ticketQty: ticketQty, tableQty: tableQty)
+            CheckoutConfirmationView(event: event) { ticketQty, tableQty in
+                let baseTotal = Double(ticketQty) * event.ticketPrice + Double(tableQty) * event.tablePrice
+                let totalWithFee = baseTotal * 1.02
+
+                let urlString = """
+                https://blackappios.web.app/checkout?\
+                eventId=\(event.id)\
+                &eventName=\(event.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")\
+                &userId=\(Auth.auth().currentUser?.uid ?? "anonymous")\
+                &ticketQty=\(ticketQty)\
+                &ticketPrice=\(event.ticketPrice)\
+                &tableQty=\(tableQty)\
+                &tablePrice=\(event.tablePrice)\
+                &baseTotal=\(String(format: "%.2f", baseTotal))\
+                &totalWithFee=\(String(format: "%.2f", totalWithFee))\
+                &payoutMethod=\(event.payoutMethod)\
+                &payoutDetails=\(event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
+                """
+
+                print("🟢 Final Checkout URL → \(urlString)")
+
+                if let url = URL(string: urlString) {
+                    selectedURL = url
+                    showWebViewModal = true
+                } else {
+                    print("❌ Failed to create checkout URL")
                 }
-            )
-        }
-    }
-
-    private func openCheckout(ticketQty: Int, tableQty: Int) {
-        let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
-        let payoutDetails = event.payoutDetails.isEmpty ? "N/A" : event.payoutDetails
-
-        let ticketTotal = Double(ticketQty) * event.ticketPrice
-        let tableTotal = Double(tableQty) * event.tablePrice
-        let grossTotal = (ticketTotal + tableTotal)
-        let totalWithFee = grossTotal * 1.02
-
-        var components = URLComponents()
-        components.scheme = "https"
-        components.host = "blackappios.web.app"
-        components.path = "/checkout"
-        components.queryItems = [
-            URLQueryItem(name: "eventId", value: event.id),
-            URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
-            URLQueryItem(name: "tableQty", value: "\(tableQty)"),
-            URLQueryItem(name: "baseTotal", value: String(format: "%.2f", grossTotal)),
-            URLQueryItem(name: "totalWithFee", value: String(format: "%.2f", totalWithFee)),
-            URLQueryItem(name: "payoutMethod", value: payoutMethod),
-            URLQueryItem(name: "payoutDetails", value: payoutDetails)
-        ]
-
-        if let url = components.url {
-            selectedURL = url
-            showWebView = true
+            }
         }
     }
 
