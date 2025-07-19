@@ -229,6 +229,11 @@ struct EventCardView: View {
     }
 
     private func openCheckout(ticketQty: Int, tableQty: Int) {
+        guard let userId = Auth.auth().currentUser?.uid else {
+            print("❌ No user logged in")
+            return
+        }
+
         let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
         let payoutDetails = event.payoutDetails.isEmpty ? "N/A" : event.payoutDetails
 
@@ -243,16 +248,24 @@ struct EventCardView: View {
         components.path = "/checkout"
         components.queryItems = [
             URLQueryItem(name: "eventId", value: event.id),
+            URLQueryItem(name: "eventName", value: event.title),
+            URLQueryItem(name: "eventTime", value: "\(Int(event.date.timeIntervalSince1970))"),
+            URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
+            URLQueryItem(name: "ticketPrice", value: "\(event.ticketPrice)"),
             URLQueryItem(name: "tableQty", value: "\(tableQty)"),
+            URLQueryItem(name: "tablePrice", value: "\(event.tablePrice)"),
             URLQueryItem(name: "baseTotal", value: String(format: "%.2f", grossTotal)),
             URLQueryItem(name: "totalWithFee", value: String(format: "%.2f", totalWithFee)),
             URLQueryItem(name: "payoutMethod", value: payoutMethod),
-            URLQueryItem(name: "payoutDetails", value: payoutDetails)
+            URLQueryItem(name: "payoutDetails", value: payoutDetails),
+            URLQueryItem(name: "eventImagePath", value: event.imagePath)
         ]
 
         if let url = components.url {
+            print("🔗 Checkout URL:", url.absoluteString)
             UIApplication.shared.open(url)
         }
     }
+
 }

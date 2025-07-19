@@ -1,4 +1,3 @@
-// MARK: - EventModel
 import SwiftUI
 import Firebase
 import FirebaseAuth
@@ -6,7 +5,6 @@ import FirebaseStorage
 import FirebaseDatabase
 import FeedKit
 import WebKit
-// import SharedModels // if it’s inside a module
 
 struct EventModel: Identifiable {
     var id: String
@@ -33,13 +31,19 @@ struct EventModel: Identifiable {
             return nil
         }
 
-        let payoutMethod = value["payoutMethod"] as? String ?? ""
-        let payoutDetails = value["payoutDetails"] as? String ?? ""
-        let ticketPrice = value["ticketPrice"] as? Double ?? 0.0
-        let ticketQuantity = value["ticketQuantity"] as? Int ?? 0
-        let tablePrice = value["tablePrice"] as? Double ?? 0.0
-        let tableQuantity = value["tableQuantity"] as? Int ?? 0
-        let location = value["location"] as? String ?? ""
+        func toDouble(_ val: Any?) -> Double {
+            if let d = val as? Double { return d }
+            if let i = val as? Int { return Double(i) }
+            if let s = val as? String, let d = Double(s) { return d }
+            return 0.0
+        }
+
+        func toInt(_ val: Any?) -> Int {
+            if let i = val as? Int { return i }
+            if let s = val as? String, let i = Int(s) { return i }
+            if let d = val as? Double { return Int(d) }
+            return 0
+        }
 
         return EventModel(
             id: snapshot.key,
@@ -47,16 +51,17 @@ struct EventModel: Identifiable {
             description: description,
             imagePath: imagePath,
             date: Date(timeIntervalSince1970: timestamp),
-            payoutMethod: payoutMethod,
-            payoutDetails: payoutDetails,
-            ticketPrice: ticketPrice,
-            ticketQuantity: ticketQuantity,
-            tablePrice: tablePrice,
-            tableQuantity: tableQuantity,
+            payoutMethod: value["payoutMethod"] as? String ?? "",
+            payoutDetails: value["payoutDetails"] as? String ?? "",
+            ticketPrice: toDouble(value["ticketPrice"]),
+            ticketQuantity: toInt(value["ticketQuantity"]),
+            tablePrice: toDouble(value["tablePrice"]),
+            tableQuantity: toInt(value["tableQuantity"]),
             userId: userId,
-            location: location
+            location: value["location"] as? String ?? ""
         )
     }
+
 }
 
 // MARK: - MyEventsView
@@ -353,13 +358,18 @@ struct EventStatsView: View {
                         .padding(.top, 4)
                 } else {
                     ForEach(checkIns) { purchase in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("User ID: \(purchase.userId.prefix(8))...")
-                            Text("Type: \(purchase.type.capitalized) | Qty: \(purchase.quantity)")
-                                .font(.subheadline)
-                                .foregroundColor(.gray)
-                            Divider()
+                        HStack(alignment: .top, spacing: 12) {
+                            UserAvatarView(userId: purchase.userId)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                UserNameView(userId: purchase.userId)
+
+                                Text("Type: \(purchase.type.capitalized) | Qty: \(purchase.quantity)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.gray)
+                            }
                         }
+                        Divider()
                     }
                 }
             }
@@ -415,6 +425,82 @@ struct EventStatsView: View {
         }
     }
 }
+
+// MARK: - UserNameView
+
+struct UserNameView: View {
+    let userId: String
+    @State private var name: String = ""
+
+    var body: some View {
+        Text(name.isEmpty ? "User: \(userId.prefix(8))..." : "User: \(name)")
+            .font(.subheadline)
+            .foregroundColor(.primary)
+            .onAppear { fetchName() }
+    }
+
+    private func fetchName() {
+        let ref = Database.database().reference().child("users").child(userId).child("name")
+        ref.observeSingleEvent(of: .value) { snapshot in
+            if let value = snapshot.value as? String {
+                self.name = value
+            }
+        }
+    }
+}
+
+// MARK: - UserAvatarView
+
+struct UserAvatarView: View {
+    let userId: String
+    @State private var imageURL: String? = nil
+    @State private var initials: String = "?"
+
+    var body: some View {
+        Group {
+            if let url = imageURL, let imageURL = URL(string: url) {
+                AsyncImage(url: imageURL) { phase in
+                    if let img = phase.image {
+                        img.resizable()
+                    } else {
+                        placeholder
+                    }
+                }
+            } else {
+                placeholder
+            }
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(Circle())
+        .onAppear {
+            loadProfileImage()
+        }
+    }
+
+    private var placeholder: some View {
+        Circle()
+            .fill(Color.gray.opacity(0.3))
+            .overlay(
+                Text(initials)
+                    .foregroundColor(.black)
+                    .font(.caption)
+            )
+    }
+
+    private func loadProfileImage() {
+        let ref = Database.database().reference().child("users").child(userId)
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            if let dict = snapshot.value as? [String: Any] {
+                self.imageURL = dict["profileImageURL"] as? String
+                if let name = dict["name"] as? String {
+                    self.initials = name.split(separator: " ").compactMap { $0.first }.prefix(2).map { String($0) }.joined().uppercased()
+                }
+            }
+        }
+    }
+}
+
 
 
 // MARK: - EventTabView
@@ -1018,8 +1104,16 @@ struct EventDetailView: View {
         }
         .sheet(isPresented: $showCheckoutConfirmation) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
+
+                // 🔍 Add these debug logs
+                print("🎫 ticketQty = \(ticketQty), ticketPrice = \(event.ticketPrice)")
+                print("🪑 tableQty = \(tableQty), tablePrice = \(event.tablePrice)")
+                print("🎫 Selected ticketQty: \(ticketQty), ticketPrice: \(event.ticketPrice)")
+                print("🪑 Selected tableQty: \(tableQty), tablePrice: \(event.tablePrice)")
+                print("📦 Raw EventModel dump: \(event)")
                 let baseTotal = Double(ticketQty) * event.ticketPrice + Double(tableQty) * event.tablePrice
                 let totalWithFee = baseTotal * 1.02
+                print("🧮 baseTotal = \(baseTotal), totalWithFee = \(totalWithFee)")
 
                 let urlString = """
                 https://blackappios.web.app/checkout?\
@@ -1046,6 +1140,7 @@ struct EventDetailView: View {
                 }
             }
         }
+
     }
 
     private func formattedDate(_ date: Date) -> String {

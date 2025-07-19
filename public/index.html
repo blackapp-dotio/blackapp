@@ -1,208 +1,229 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BlackApp Checkout</title>
-  <script src="https://js.braintreegateway.com/web/dropin/1.33.6/js/dropin.min.js"></script>
+  <script src="https://js.braintreegateway.com/web/dropin/1.42.0/js/dropin.min.js"></script>
   <style>
     body {
-      margin: 0;
-      padding: 2rem;
-      background: linear-gradient(135deg, #0f0f0f, #1a1a1a);
-      color: #e0e0e0;
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: flex-start;
-      min-height: 100vh;
-      font-size: 1.2rem;
-      line-height: 1.6;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen;
+      background: #0a0a0a;
+      color: white;
+      padding: 20px;
+      max-width: 500px;
+      margin: auto;
     }
-
-    h1 {
-      font-size: 2.5rem;
-      margin-bottom: 10px;
-      color: #00ffcc;
-      text-shadow: 0 0 5px #00ffcc;
-    }
-
-    #summary-box {
-      background: #262626;
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 0 15px rgba(0, 255, 204, 0.15);
-      margin: 20px 0;
-      max-width: 420px;
-      width: 100%;
-    }
-
-    #summary-details {
-      white-space: pre-wrap;
-      text-align: left;
-      font-size: 1.1rem;
-    }
-
-    #dropin-container, #cashapp-container {
-      background: #1f1f1f;
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 0 15px rgba(0, 255, 204, 0.2);
-      max-width: 400px;
-      width: 100%;
-      margin-top: 20px;
-    }
-
-    button, select, input[type="text"] {
-      background: #00ffcc;
-      border: none;
-      padding: 14px 20px;
-      font-size: 1.1rem;
-      font-weight: bold;
-      color: #000;
-      border-radius: 30px;
-      margin-top: 20px;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      width: 100%;
-    }
-
-    button:hover {
-      background: #00e6b2;
-      transform: scale(1.03);
-    }
-
-    button:disabled {
-      background: #555;
-      color: #999;
-      cursor: not-allowed;
-    }
-
-    select, input[type="text"] {
-      background: #1f1f1f;
-      color: #e0e0e0;
-      border: 2px solid #00ffcc;
-      border-radius: 12px;
+    h1, h2 { color: #00ffcc; }
+    .summary { margin-bottom: 20px; }
+    #dropin-container { margin-top: 20px; }
+    button {
+      background-color: #00ffcc;
+      color: black;
       padding: 10px;
-      margin-top: 10px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+      margin-top: 20px;
       width: 100%;
     }
-
-    .hidden { display: none; }
+    select, input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      margin-top: 10px;
+      margin-bottom: 20px;
+      font-size: 16px;
+      border-radius: 6px;
+      border: none;
+    }
   </style>
 </head>
 <body>
-  <h1>BlackApp Payment</h1>
-
-  <div id="summary-box">
-    <div id="summary-details">Loading summary...</div>
-    <label for="payment-method">Choose Payment Method:</label>
-    <select id="payment-method">
-      <option value="braintree">Credit/Debit Card</option>
-      <option value="cashapp">Cash App</option>
-    </select>
+  <h1>Confirm Your Order</h1>
+  <div class="summary">
+    <p><strong>Event:</strong> <span id="eventName"></span></p>
+    <p><strong>Tickets:</strong> <span id="ticketSummary"></span></p>
+    <p><strong>Tables:</strong> <span id="tableSummary"></span></p>
+    <p><strong>Subtotal:</strong> $<span id="baseTotal"></span></p>
+    <p><strong>Platform Fee (2%):</strong> $<span id="fee"></span></p>
+    <p><strong>Total to Pay:</strong> $<span id="total"></span></p>
   </div>
 
-  <div id="dropin-container" class="hidden"></div>
-  <div id="cashapp-container" class="hidden">
-    <input type="text" id="cashtag-input" placeholder="Enter your $Cashtag (e.g. $john123)" />
-    <button id="cashapp-pay-button">Pay via Cash App</button>
+  <label for="paymentMethod">Choose Payment Method:</label>
+  <select id="paymentMethod">
+    <option value="card">Credit/Debit Card</option>
+    <option value="cashapp">Cash App</option>
+  </select>
+
+  <div id="cashapp-section" style="display:none">
+    <label for="cashtag">Enter your $Cashtag:</label>
+    <input type="text" id="cashtag" placeholder="$username" />
+    <button onclick="redirectToCashApp()">Pay with Cash App</button>
   </div>
 
-  <button id="submit-button" class="hidden">Pay Now</button>
+  <div id="dropin-container"></div>
+  <button id="submit-button" style="display:none">Pay Now</button>
 
   <script>
-    const params = new URLSearchParams(window.location.search);
+    const query = new URLSearchParams(window.location.search);
+    const userId = query.get("userId") || "unknown";
+    const eventId = query.get("eventId") || "unknown";
+    const eventName = decodeURIComponent(query.get("eventName") || "Event");
+    const eventImagePath = decodeURIComponent(query.get("eventImagePath") || "");
+    const eventTime = query.get("eventTime") || "";
+    const ticketQty = Number(query.get("ticketQty") || 0);
+    const ticketPrice = Number(query.get("ticketPrice") || 0);
+    const tableQty = Number(query.get("tableQty") || 0);
+    const tablePrice = Number(query.get("tablePrice") || 0);
+    const baseTotal = parseFloat(query.get("baseTotal") || "0");
+    const totalWithFee = parseFloat(query.get("totalWithFee") || "0");
+    const payoutMethod = query.get("payoutMethod") || "";
+    const payoutDetails = decodeURIComponent(query.get("payoutDetails") || "");
 
-    const ticketQty = parseInt(params.get("ticketQty") || "0");
-    const ticketPrice = parseFloat(params.get("ticketPrice") || "0");
-    const tableQty = parseInt(params.get("tableQty") || "0");
-    const tablePrice = parseFloat(params.get("tablePrice") || "0");
-    const eventName = decodeURIComponent(params.get("eventName") || "Event");
-    const baseTotal = parseFloat(params.get("baseTotal") || "0");
-    const totalWithFee = parseFloat(params.get("totalWithFee") || "0");
+    // Fill page UI
+    document.getElementById("eventName").textContent = eventName;
+    document.getElementById("ticketSummary").textContent = `${ticketQty} x $${ticketPrice} = $${(ticketQty * ticketPrice).toFixed(2)}`;
+    document.getElementById("tableSummary").textContent = `${tableQty} x $${tablePrice} = $${(tableQty * tablePrice).toFixed(2)}`;
+    document.getElementById("baseTotal").textContent = baseTotal.toFixed(2);
+    document.getElementById("fee").textContent = (totalWithFee - baseTotal).toFixed(2);
+    document.getElementById("total").textContent = totalWithFee.toFixed(2);
 
-    const ticketTotal = ticketQty * ticketPrice;
-    const tableTotal = tableQty * tablePrice;
-    const fee = totalWithFee - baseTotal;
-
-    const summaryLines = [];
-    summaryLines.push(`🪩 Event: ${eventName}`);
-    if (ticketQty > 0) summaryLines.push(`🎫 Tickets: ${ticketQty} x $${ticketPrice} = $${ticketTotal.toFixed(2)}`);
-    if (tableQty > 0) summaryLines.push(`🪑 Tables: ${tableQty} x $${tablePrice} = $${tableTotal.toFixed(2)}`);
-    summaryLines.push(`💼 Platform Fee (2%): $${fee.toFixed(2)}`);
-    summaryLines.push(`
-🔒 Total to Pay: $${totalWithFee.toFixed(2)}`);
-    document.getElementById("summary-details").textContent = summaryLines.join("\n");
-
+    // Payment method toggle
+    const methodSelector = document.getElementById("paymentMethod");
     const dropinContainer = document.getElementById("dropin-container");
-    const cashappContainer = document.getElementById("cashapp-container");
-    const methodSelect = document.getElementById("payment-method");
     const submitBtn = document.getElementById("submit-button");
-    const cashappBtn = document.getElementById("cashapp-pay-button");
-    const cashtagInput = document.getElementById("cashtag-input");
+    const cashappSection = document.getElementById("cashapp-section");
 
-    methodSelect.addEventListener("change", (e) => {
-      const method = e.target.value;
-      dropinContainer.classList.add("hidden");
-      cashappContainer.classList.add("hidden");
-      submitBtn.classList.add("hidden");
-
-      if (method === "braintree") {
-        dropinContainer.classList.remove("hidden");
-        submitBtn.classList.remove("hidden");
-      } else if (method === "cashapp") {
-        cashappContainer.classList.remove("hidden");
+    methodSelector.addEventListener("change", () => {
+      if (methodSelector.value === "card") {
+        dropinContainer.style.display = "block";
+        submitBtn.style.display = "inline-block";
+        cashappSection.style.display = "none";
+        console.log("💳 Switched to Card Payment");
+      } else {
+        dropinContainer.style.display = "none";
+        submitBtn.style.display = "none";
+        cashappSection.style.display = "block";
+        console.log("💵 Switched to Cash App Payment");
       }
     });
 
-    // Braintree Drop-in init
+    // Cash App Logic
+    function redirectToCashApp() {
+      const cashtag = document.getElementById("cashtag").value.replace("$", "");
+      const amount = totalWithFee.toFixed(2);
+
+      if (!cashtag) return alert("❌ Please enter a valid $Cashtag.");
+
+      const body = {
+        userId, eventId, eventName, eventImagePath,
+        eventTime, ticketQty, ticketPrice, tableQty, tablePrice,
+        baseTotal, totalWithFee,
+        payoutMethod, payoutDetails,
+        platformFee: (totalWithFee - baseTotal),
+        timestamp: Date.now(),
+        paymentMethod: "cashapp"
+      };
+
+      console.log("📤 Logging Cash App purchase:", body);
+
+      fetch("https://us-central1-blackappios.cloudfunctions.net/logManualPurchase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      })
+      .then(res => res.json())
+      .then(result => {
+        console.log("✅ Cash App log response:", result);
+        const url = `cashapp://send?amount=${amount}&recipient=${cashtag}`;
+        console.log("🔁 Redirecting to:", url);
+        window.location.href = url;
+      })
+      .catch(err => {
+        console.error("❌ Logging Cash App purchase failed:", err);
+        alert("Failed to log purchase.");
+      });
+    }
+
+    // Braintree Drop-in Logic
     fetch("https://us-central1-blackappios.cloudfunctions.net/generateClientToken")
       .then(res => res.json())
       .then(data => {
+        console.log("🔑 Received Braintree client token");
+        const amountToSend = parseFloat(totalWithFee) || 0.01;
+
         braintree.dropin.create({
           authorization: data.clientToken,
           container: "#dropin-container",
-          theme: "dark"
+          vaultManager: false,
+          card: {
+            cardholderName: { required: true },
+            overrides: {
+              fields: {
+                postalCode: { placeholder: "12345" },
+                cvv: { placeholder: "123" }
+              }
+            }
+          },
+          paypal: {
+            flow: "checkout",
+            amount: amountToSend,
+            currency: "USD"
+          }
         }, (err, dropinInstance) => {
-          if (err) return console.error("❌ Braintree Init Error:", err);
+          if (err) {
+            console.error("❌ Braintree Init Error:", err);
+            return;
+          }
 
+          console.log("✅ Braintree Drop-in Ready");
           submitBtn.disabled = false;
+          submitBtn.style.display = "inline-block";
+
           submitBtn.addEventListener("click", () => {
             dropinInstance.requestPaymentMethod((err, payload) => {
               if (err) return console.error("❌ Payment Method Error:", err);
+
+              const postData = {
+                amount: amountToSend.toFixed(2),
+                paymentMethodNonce: payload.nonce,
+                userId, eventId, eventName, eventImagePath, eventTime,
+                ticketQty, ticketPrice, tableQty, tablePrice,
+                baseTotal, totalWithFee, payoutMethod, payoutDetails,
+                platformFee: (totalWithFee - baseTotal)
+              };
+
+              console.log("📤 Submitting card payment:", postData);
+
               fetch("https://us-central1-blackappios.cloudfunctions.net/createTransaction", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  amount: totalWithFee,
-                  paymentMethodNonce: payload.nonce
-                })
-              }).then(res => res.json())
+                body: JSON.stringify(postData)
+              })
+              .then(res => res.json())
               .then(result => {
+                console.log("📦 Transaction result:", result);
                 if (result.success) {
                   alert("✅ Payment successful!");
                   window.location.href = "blackappios://payment-success";
                 } else {
                   alert("❌ Payment failed: " + (result.error || "Unknown error"));
                 }
+              })
+              .catch(err => {
+                console.error("❌ Payment request failed:", err);
+                alert("Failed to complete payment.");
               });
             });
           });
         });
+      })
+      .catch(err => {
+        console.error("❌ Failed to fetch Braintree token:", err);
+        alert("Could not initialize payment system.");
       });
-
-    // Cash App deep link
-    cashappBtn.addEventListener("click", () => {
-      const tag = cashtagInput.value.trim().replace(/^\$/, "");
-      if (!tag) return alert("Please enter your $Cashtag");
-      const link = `https://cash.app/$${tag}/${totalWithFee.toFixed(2)}`;
-      window.open(link, "_blank");
-    });
-
-    // Trigger initial display
-    methodSelect.dispatchEvent(new Event("change"));
   </script>
 </body>
 </html>
+

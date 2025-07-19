@@ -38,38 +38,64 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
       userId,
       eventId,
       eventName,
+      eventImagePath = "",
       ticketQty = 0,
       ticketPrice = 0,
       tableQty = 0,
       tablePrice = 0,
-      platformFee = 0
+      platformFee = 0,
+      totalWithFee = 0, // Use this as the payment amount
+      eventTime // Optional: for reminders and display
     } = req.body;
 
-    // Parse numbers safely
-    const ticketQtyNum = parseInt(ticketQty);
-    const tableQtyNum = parseInt(tableQty);
-    const ticketPriceNum = parseFloat(ticketPrice);
-    const tablePriceNum = parseFloat(tablePrice);
-    const platformFeeNum = parseFloat(platformFee);
+    // Log full incoming payload for debugging
+    console.log("📥 Incoming request body:", req.body);
 
-    // Basic validation
-    if (!paymentMethodNonce || !userId || !eventId || !eventName) {
-      return res.status(400).send({ error: "Missing required fields" });
+    // Parse all numeric fields
+    const ticketQtyNum = parseInt(ticketQty) || 0;
+    const tableQtyNum = parseInt(tableQty) || 0;
+    const ticketPriceNum = parseFloat(ticketPrice) || 0;
+    const tablePriceNum = parseFloat(tablePrice) || 0;
+    let platformFeeNum = parseFloat(platformFee) || 0;
+    let amountToCharge = parseFloat(totalWithFee);
+
+    // Fallback to manual total calculation if frontend amount is broken
+    const fallbackBase = ticketQtyNum * ticketPriceNum + tableQtyNum * tablePriceNum;
+    const fallbackFee = +(fallbackBase * 0.02).toFixed(2);
+    const fallbackTotal = +(fallbackBase + fallbackFee).toFixed(2);
+
+    if (isNaN(amountToCharge) || amountToCharge <= 0) {
+      console.warn("⚠️ Invalid totalWithFee from frontend. Falling back to server-calculated total.");
+      amountToCharge = fallbackTotal;
     }
 
-    const ticketTotal = ticketQtyNum * ticketPriceNum;
-    const tableTotal = tableQtyNum * tablePriceNum;
-    const baseAmount = +(ticketTotal + tableTotal).toFixed(2);
-    const expectedTotal = +(baseAmount + platformFeeNum).toFixed(2);
+    // Validate essential fields
+    if (!paymentMethodNonce || !userId || !eventId || !eventName) {
+      return res.status(400).send({ error: "❌ Missing required fields" });
+    }
+
+    // Determine quantity and type for compatibility with PurchaseModel
+    const totalQty = ticketQtyNum + tableQtyNum;
+    let type = "ticket";
+    if (ticketQtyNum > 0 && tableQtyNum > 0) {
+      type = "mixed";
+    } else if (tableQtyNum > 0 && ticketQtyNum === 0) {
+      type = "table";
+    }
+
+    // Log totals
+    console.log("🧮 Totals => Base:", fallbackBase.toFixed(2), "Fee:", fallbackFee.toFixed(2), "Charged:", amountToCharge.toFixed(2));
 
     try {
       const result = await gateway.transaction.sale({
-        amount: expectedTotal.toString(),
+        amount: amountToCharge.toFixed(2),
         paymentMethodNonce,
         options: { submitForSettlement: true }
       });
 
-      if (!result.success) throw new Error(result.message);
+      if (!result.success) {
+        throw new Error(result.message || "Transaction unsuccessful");
+      }
 
       const timestamp = Date.now();
       const purchaseRef = admin.database().ref(`purchases/${userId}`).push();
@@ -78,21 +104,28 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
         id: purchaseRef.key,
         userId,
         eventId,
-        eventName,
+        eventTitle: eventName,
+        eventImagePath,
+        quantity: totalQty,
+        type,
         ticketQty: ticketQtyNum,
         ticketPrice: ticketPriceNum,
         tableQty: tableQtyNum,
         tablePrice: tablePriceNum,
-        baseAmount,
-        platformFee: platformFeeNum,
-        totalAmount: expectedTotal,
-        timestamp
+        baseAmount: fallbackBase,
+        platformFee: fallbackFee,
+        totalAmount: amountToCharge,
+        timestamp,
+        eventTime: eventTime ? parseInt(eventTime) : null,
+        paymentMethod: "card"
       });
 
+      console.log("✅ Transaction successful:", result.transaction.id);
       res.status(200).send({ success: true, transactionId: result.transaction.id });
+
     } catch (error) {
       console.error("❌ Transaction failed:", error);
-      res.status(500).send({ error: error.message });
+      res.status(500).send({ error: error.message || "Unknown server error" });
     }
   });
 });
@@ -528,4 +561,83 @@ exports.sendEventReminderNotification = functions.database
       console.error(`🔥 Event reminder failed for ${userId}:`, err);
     }
   });
+
+exports.logManualPurchase = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    const {
+      userId,
+      eventId,
+      eventName,
+      eventImagePath = "",
+      ticketQty = 0,
+      ticketPrice = 0,
+      tableQty = 0,
+      tablePrice = 0,
+      baseTotal = 0,
+      totalWithFee = 0,
+      payoutMethod = "",
+      payoutDetails = "",
+      platformFee = 0,
+      timestamp = Date.now(),
+      paymentMethod = "manual",
+      eventTime
+    } = req.body;
+
+    // Validate required fields
+    if (!userId || !eventId || !eventName) {
+      return res.status(400).send({ error: "❌ Missing required fields" });
+    }
+
+    // Parse all numbers
+    const ticketQtyNum = parseInt(ticketQty) || 0;
+    const tableQtyNum = parseInt(tableQty) || 0;
+    const ticketPriceNum = parseFloat(ticketPrice) || 0;
+    const tablePriceNum = parseFloat(tablePrice) || 0;
+    const baseAmountNum = parseFloat(baseTotal) || 0;
+    const totalAmountNum = parseFloat(totalWithFee) || 0;
+    const platformFeeNum = parseFloat(platformFee) || 0;
+    const eventTimeNum = eventTime ? parseInt(eventTime) : null;
+
+    // Determine unified quantity and type
+    const totalQty = ticketQtyNum + tableQtyNum;
+    let type = "ticket";
+    if (ticketQtyNum > 0 && tableQtyNum > 0) {
+      type = "mixed";
+    } else if (tableQtyNum > 0 && ticketQtyNum === 0) {
+      type = "table";
+    }
+
+    try {
+      const purchaseRef = admin.database().ref(`purchases/${userId}`).push();
+
+      await purchaseRef.set({
+        id: purchaseRef.key,
+        userId,
+        eventId,
+        eventTitle: eventName,
+        eventImagePath,
+        quantity: totalQty,
+        type,
+        ticketQty: ticketQtyNum,
+        ticketPrice: ticketPriceNum,
+        tableQty: tableQtyNum,
+        tablePrice: tablePriceNum,
+        baseAmount: baseAmountNum,
+        platformFee: platformFeeNum,
+        totalAmount: totalAmountNum,
+        payoutMethod,
+        payoutDetails,
+        paymentMethod,
+        timestamp,
+        eventTime: eventTimeNum
+      });
+
+      console.log("✅ Logged manual purchase for:", userId, "→", eventName);
+      res.status(200).send({ success: true });
+    } catch (error) {
+      console.error("❌ Failed to log manual purchase:", error);
+      res.status(500).send({ error: error.message });
+    }
+  });
+});
 
