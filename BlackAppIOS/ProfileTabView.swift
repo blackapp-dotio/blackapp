@@ -1,4 +1,4 @@
-// ProfileTabView.swift — Full working version with admin portal, toolbar, brand creation, and platform logos
+// ProfileTabView.swift — Fully integrated with social platform sync
 
 import SwiftUI
 import Firebase
@@ -6,6 +6,8 @@ import FirebaseAuth
 import FirebaseDatabase
 import FirebaseStorage
 import SDWebImageSwiftUI
+
+// No SyncedAccount definition here to avoid redeclaration conflict
 
 struct ProfileTabView: View {
     @EnvironmentObject var authVM: AuthViewModel
@@ -17,6 +19,18 @@ struct ProfileTabView: View {
     @State private var brands: [BrandModel] = []
     @State private var isAdmin = false
     @State private var isEditingProfile = false
+
+    @State private var syncedAccounts: [SyncedAccount] = [
+        SyncedAccount(platform: "Instagram", handle: nil),
+        SyncedAccount(platform: "Twitter", handle: nil),
+        SyncedAccount(platform: "Facebook", handle: nil),
+        SyncedAccount(platform: "TikTok", handle: nil),
+        SyncedAccount(platform: "YouTube", handle: nil)
+    ]
+
+    @State private var selectedPlatform: String? = nil
+    @State private var handleInput: String = ""
+    @State private var showInputPrompt = false
 
     var body: some View {
         NavigationView {
@@ -36,7 +50,9 @@ struct ProfileTabView: View {
                     }
                     .padding(.bottom, 80)
                 }
-                .onTapGesture { hideKeyboard() }
+                .onTapGesture {
+                    hideKeyboard()
+                }
             }
             .background(Color.black.ignoresSafeArea())
             .toolbar {
@@ -56,9 +72,39 @@ struct ProfileTabView: View {
             fetchProfile()
             fetchBrands()
             checkIfAdmin()
+            loadSyncedAccounts()
         }
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(selectedImage: $profileImage)
+        }
+        .sheet(isPresented: $showInputPrompt) {
+            VStack(spacing: 20) {
+                Text("Enter your \(selectedPlatform ?? "") handle")
+                    .font(.title3)
+                    .padding(.top)
+
+                TextField("@yourHandle", text: $handleInput)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .padding(.horizontal)
+
+                Button("Save") {
+                    if let selected = selectedPlatform,
+                       let index = syncedAccounts.firstIndex(where: { $0.platform == selected }) {
+                        syncedAccounts[index].handle = handleInput
+                        saveHandleToFirebase(platform: selected, handle: handleInput)
+                    }
+                    showInputPrompt = false
+                }
+                .padding()
+                .buttonStyle(.borderedProminent)
+
+                Button("Cancel") {
+                    showInputPrompt = false
+                }
+                .foregroundColor(.red)
+                .padding(.bottom)
+            }
+            .presentationDetents([.medium])
         }
     }
 
@@ -106,7 +152,9 @@ struct ProfileTabView: View {
 
                 Button("Save") {
                     saveProfile()
-                    withAnimation { isEditingProfile = false }
+                    withAnimation {
+                        isEditingProfile = false
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(.bottom)
@@ -123,7 +171,9 @@ struct ProfileTabView: View {
                     .padding(.horizontal)
 
                 Button("Edit Profile") {
-                    withAnimation { isEditingProfile = true }
+                    withAnimation {
+                        isEditingProfile = true
+                    }
                 }
                 .buttonStyle(.bordered)
                 .padding(.top, 8)
@@ -131,7 +181,6 @@ struct ProfileTabView: View {
         }
         .padding(.top)
         .frame(maxWidth: .infinity)
-        .animation(.easeInOut, value: isEditingProfile) // 👈 Smooth transitions!
     }
 
     private var createBrandSection: some View {
@@ -186,28 +235,56 @@ struct ProfileTabView: View {
                 .foregroundColor(.white)
 
             HStack(spacing: 24) {
-                Image(systemName: "f.cursive")
-                Image(systemName: "x.squareroot")
-                Image(systemName: "camera.circle")
-                Image(systemName: "music.note")
-                Image(systemName: "play.rectangle.fill")
+                ForEach(0..<syncedAccounts.count, id: \.self) { index in
+                    let account = syncedAccounts[index]
+                    Button(action: {
+                        selectedPlatform = account.platform
+                        handleInput = account.handle ?? ""
+                        showInputPrompt = true
+                    }) {
+                        Image(systemName: account.iconName)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 30, height: 30)
+                            .foregroundColor(account.isLinked ? .green : .gray)
+                            .padding(10)
+                            .background(Circle().fill(Color.black.opacity(0.2)))
+                    }
+                }
             }
-            .font(.title2)
-            .foregroundColor(.white)
         }
         .padding(.horizontal)
     }
 
     private var userWallSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Your Wall")
-                .font(.headline)
-                .foregroundColor(.white)
-            Text("Coming soon: synced social posts from your connected accounts")
-                .font(.caption)
-                .foregroundColor(.gray)
+            UserWallView(userId: Auth.auth().currentUser?.uid ?? ""
+)
         }
         .padding(.horizontal)
+    }
+
+
+    private func saveHandleToFirebase(platform: String, handle: String) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("users/\(userId)/syncedPlatforms/\(platform)")
+        ref.setValue(["linked": true, "handle": handle])
+    }
+
+    private func loadSyncedAccounts() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("users/\(userId)/syncedPlatforms")
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            for case let child as DataSnapshot in snapshot.children {
+                let platform = child.key
+                if let dict = child.value as? [String: Any],
+                   let handle = dict["handle"] as? String,
+                   let index = syncedAccounts.firstIndex(where: { $0.platform == platform }) {
+                    syncedAccounts[index].handle = handle
+                }
+            }
+        }
     }
 
     private func saveProfile() {
@@ -215,7 +292,6 @@ struct ProfileTabView: View {
         let ref = Database.database().reference().child("users").child(uid)
 
         if profileImage == nil {
-            // Same as previous fix to preserve profileImageURL
             ref.observeSingleEvent(of: .value) { snapshot in
                 var data: [String: Any] = ["name": name, "bio": bio]
 
@@ -228,38 +304,26 @@ struct ProfileTabView: View {
             }
         } else {
             if let image = profileImage, let imageData = image.jpegData(compressionQuality: 0.8) {
-                print("✅ Image data size: \(imageData.count) bytes")
                 let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
                 storageRef.putData(imageData) { metadata, error in
                     if let error = error {
                         print("❌ Upload failed: \(error.localizedDescription)")
                         return
                     }
-                    print("✅ Upload success, metadata: \(String(describing: metadata))")
                     storageRef.downloadURL { url, error in
-                        if let error = error {
-                            print("❌ Failed to get download URL: \(error.localizedDescription)")
-                            return
-                        }
                         if let url = url {
-                            print("✅ Got download URL: \(url.absoluteString)")
                             let data: [String: Any] = [
                                 "name": name,
                                 "bio": bio,
                                 "profileImageURL": url.absoluteString
                             ]
                             ref.setValue(data)
-                        } else {
-                            print("❌ Download URL is nil")
                         }
                     }
                 }
-            } else {
-                print("❌ Failed to create image data.")
             }
         }
     }
-
 
     private func fetchProfile() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
@@ -291,7 +355,7 @@ struct ProfileTabView: View {
 
     private func checkIfAdmin() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        if uid == "XszTTDbebpcYjiqYqgQPAlxWEs82" { // Hardcoded for now
+        if uid == "XszTTDbebpcYjiqYqgQPAlxWEs82" {
             self.isAdmin = true
         }
     }
@@ -323,7 +387,4 @@ private func signOutSection(authVM: AuthViewModel) -> some View {
     .padding(.horizontal)
     .padding(.bottom, 40)
 }
-
-
-
 

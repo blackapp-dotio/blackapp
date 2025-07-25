@@ -18,7 +18,7 @@ extension Array {
     }
 }
 
-extension String {
+/*extension String {
     func strippedHTML() -> String {
         guard let data = self.data(using: .utf8) else { return self }
         let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
@@ -28,7 +28,7 @@ extension String {
         let attributedString = try? NSAttributedString(data: data, options: options, documentAttributes: nil)
         return attributedString?.string ?? self
     }
-}
+}*/
 
 // SharedTypes.swift
 import Foundation

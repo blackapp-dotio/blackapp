@@ -13,6 +13,7 @@
 			<string></string>
 			<key>CFBundleURLSchemes</key>
 			<array>
+				<string>blackappios</string>
 				<string>com.googleusercontent.apps.228561181689-nsgktb9doqtnsmnv2i0bdskaj2v6ke9r</string>
 			</array>
 		</dict>

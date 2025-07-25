@@ -1032,16 +1032,18 @@ struct RSSCardView: View {
     }
 }
 
-// MARK: - EventDetailView
-
 import SwiftUI
 import Firebase
+import FirebaseAuth
 
 struct EventDetailView: View {
     let event: EventModel
     @State private var showWebViewModal = false
     @State private var selectedURL: URL?
     @State private var showCheckoutConfirmation = false
+    @State private var isSaved = false
+    @State private var showShareSheet = false
+    @State private var showCopiedAlert = false
 
     var body: some View {
         ScrollView {
@@ -1086,11 +1088,32 @@ struct EventDetailView: View {
                         .cornerRadius(10)
                     }
                 }
+
+                HStack {
+                    Button(action: {
+                        showShareSheet = true
+                    }) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                            .padding(8)
+                            .background(Color.gray.opacity(0.2))
+                            .cornerRadius(8)
+                    }
+
+                    Button(action: toggleSaveEvent) {
+                        Label(isSaved ? "Saved" : "Remind Me", systemImage: isSaved ? "bookmark.fill" : "bookmark")
+                            .padding(8)
+                            .background(Color.gray.opacity(0.2))
+                            .cornerRadius(8)
+                    }
+                }
             }
             .padding()
         }
         .background(Color.black.edgesIgnoringSafeArea(.all))
         .preferredColorScheme(.dark)
+        .onAppear {
+            checkIfSaved()
+        }
         .sheet(isPresented: $showWebViewModal) {
             if let url = selectedURL {
                 NavigationView {
@@ -1104,33 +1127,25 @@ struct EventDetailView: View {
         }
         .sheet(isPresented: $showCheckoutConfirmation) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
-
-                // 🔍 Add these debug logs
-                print("🎫 ticketQty = \(ticketQty), ticketPrice = \(event.ticketPrice)")
-                print("🪑 tableQty = \(tableQty), tablePrice = \(event.tablePrice)")
-                print("🎫 Selected ticketQty: \(ticketQty), ticketPrice: \(event.ticketPrice)")
-                print("🪑 Selected tableQty: \(tableQty), tablePrice: \(event.tablePrice)")
-                print("📦 Raw EventModel dump: \(event)")
                 let baseTotal = Double(ticketQty) * event.ticketPrice + Double(tableQty) * event.tablePrice
                 let totalWithFee = baseTotal * 1.02
-                print("🧮 baseTotal = \(baseTotal), totalWithFee = \(totalWithFee)")
 
                 let urlString = """
-                https://blackappios.web.app/checkout?\
-                eventId=\(event.id)\
-                &eventName=\(event.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")\
-                &userId=\(Auth.auth().currentUser?.uid ?? "anonymous")\
-                &ticketQty=\(ticketQty)\
-                &ticketPrice=\(event.ticketPrice)\
-                &tableQty=\(tableQty)\
-                &tablePrice=\(event.tablePrice)\
-                &baseTotal=\(String(format: "%.2f", baseTotal))\
-                &totalWithFee=\(String(format: "%.2f", totalWithFee))\
-                &payoutMethod=\(event.payoutMethod)\
-                &payoutDetails=\(event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
+                https://blackappios.web.app/index.html?\
+                eventId=\(event.id)&\
+                eventName=\(event.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&\
+                eventTime=\(Int(event.date.timeIntervalSince1970))&\
+                userId=\(Auth.auth().currentUser?.uid ?? "anonymous")&\
+                ticketQty=\(ticketQty)&\
+                ticketPrice=\(event.ticketPrice)&\
+                tableQty=\(tableQty)&\
+                tablePrice=\(event.tablePrice)&\
+                baseTotal=\(String(format: "%.2f", baseTotal))&\
+                totalWithFee=\(String(format: "%.2f", totalWithFee))&\
+                payoutMethod=\(event.payoutMethod)&\
+                payoutDetails=\(event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&\
+                eventImagePath=\(event.imagePath)
                 """
-
-                print("🟢 Final Checkout URL → \(urlString)")
 
                 if let url = URL(string: urlString) {
                     selectedURL = url
@@ -1140,7 +1155,26 @@ struct EventDetailView: View {
                 }
             }
         }
-
+        .sheet(isPresented: $showShareSheet) {
+            ShareModalView(eventId: event.id, eventTitle: event.title, showCopiedAlert: $showCopiedAlert)
+        }
+        .overlay(
+            VStack {
+                if showCopiedAlert {
+                    Text("Link copied to clipboard!")
+                        .font(.subheadline)
+                        .foregroundColor(.white)
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                        .background(Color.black.opacity(0.8))
+                        .cornerRadius(10)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .zIndex(1)
+                        .padding(.top, 40)
+                }
+                Spacer()
+            }
+        )
     }
 
     private func formattedDate(_ date: Date) -> String {
@@ -1148,5 +1182,110 @@ struct EventDetailView: View {
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+
+    private func toggleSaveEvent() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
+
+        if isSaved {
+            ref.removeValue()
+            isSaved = false
+        } else {
+            let values: [String: Any] = [
+                "eventId": event.id,
+                "title": event.title,
+                "timestamp": Date().timeIntervalSince1970
+            ]
+            ref.setValue(values)
+            isSaved = true
+        }
+    }
+
+    private func checkIfSaved() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            self.isSaved = snapshot.exists()
+        }
+    }
+}
+
+struct ShareModalView: View {
+    let eventId: String
+    let eventTitle: String
+    @Binding var showCopiedAlert: Bool
+
+    var hostedURL: String {
+        return "https://blackappios.web.app/event.html?eventId=\(eventId)"
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Share this Event")
+                .font(.headline)
+                .padding(.top)
+
+            HStack(spacing: 20) {
+                ShareIconButton(systemImage: "f.square") {
+                    shareTo(url: "https://www.facebook.com/sharer/sharer.php?u=\(hostedURL)")
+                }
+                ShareIconButton(systemImage: "camera") {
+                    shareTo(url: "https://www.instagram.com/?url=\(hostedURL)")
+                }
+                ShareIconButton(systemImage: "message.fill") {
+                    shareTo(url: "https://api.whatsapp.com/send?text=\(eventTitle) \(hostedURL)")
+                }
+                ShareIconButton(systemImage: "bird") {
+                    shareTo(url: "https://twitter.com/intent/tweet?text=\(eventTitle)&url=\(hostedURL)")
+                }
+            }
+
+            Button(action: {
+                UIPasteboard.general.string = hostedURL
+                showCopiedAlert = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    showCopiedAlert = false
+                }
+            }) {
+                HStack {
+                    Image(systemName: "doc.on.doc")
+                    Text("Copy Link")
+                }
+                .foregroundColor(.blue)
+                .padding()
+                .background(Color.white)
+                .cornerRadius(10)
+            }
+
+            Spacer()
+        }
+        .padding()
+        .background(Color.black)
+        .presentationDetents([.medium])
+    }
+
+    private func shareTo(url: String) {
+        if let shareURL = URL(string: url) {
+            UIApplication.shared.open(shareURL)
+        }
+    }
+}
+
+struct ShareIconButton: View {
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 30, height: 30)
+                .padding(10)
+                .background(Color.white.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
     }
 }

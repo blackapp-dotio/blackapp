@@ -6,10 +6,13 @@ import FirebaseAuth
 
 struct MainTabView: View {
     @ObservedObject var router = NotificationRouter.shared
+    @State private var showEventDetailFromLink = false
+    @State private var selectedEventId: String?
+    @State private var selectedEvent: EventModel?
 
     var body: some View {
         ZStack {
-            // 🔁 Navigate to chat when a push is tapped
+            // Navigate to direct chat if tapped
             NavigationLink(
                 destination: router.selectedChatUser.map { DirectChatRoomView(recipient: $0) },
                 isActive: Binding(
@@ -23,7 +26,7 @@ struct MainTabView: View {
             }
             .hidden()
 
-            // 🧭 Tab view
+            // Main tab view
             TabView {
                 GossipTabView()
                     .tabItem { Label("Gossip", systemImage: "quote.bubble") }
@@ -67,6 +70,21 @@ struct MainTabView: View {
                     }
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: .openEventFromDeepLink)) { notif in
+                if let eventId = notif.userInfo?["eventId"] as? String {
+                    fetchEventModel(eventId: eventId) { model in
+                        if let model = model {
+                            selectedEvent = model
+                            showEventDetailFromLink = true
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showEventDetailFromLink) {
+                if let event = selectedEvent {
+                    EventDetailView(event: event)
+                }
+            }
         }
     }
 
@@ -101,7 +119,7 @@ struct MainTabView: View {
         }
     }
 
-    // MARK: - Lookup User Profile
+    // MARK: - Fetch Chat User Profile
 
     func fetchUserProfile(uid: String, completion: @escaping (ChatUserProfile?) -> Void) {
         let ref = Firestore.firestore().collection("users").document(uid)
@@ -115,5 +133,18 @@ struct MainTabView: View {
                 completion(nil)
             }
         }
+    }
+
+    // MARK: - Fetch Event Model
+
+    func fetchEventModel(eventId: String, completion: @escaping (EventModel?) -> Void) {
+        let ref = Database.database().reference().child("events").child(eventId)
+        func fetchEventModel(eventId: String, completion: @escaping (EventModel?) -> Void) {
+            let ref = Database.database().reference().child("events").child(eventId)
+            ref.observeSingleEvent(of: .value, with: { snapshot in
+                completion(EventModel.from(snapshot: snapshot))
+            })
+        }
+
     }
 }

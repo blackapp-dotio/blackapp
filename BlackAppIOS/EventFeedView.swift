@@ -164,10 +164,16 @@ struct EventFeedView: View {
     }
 }
 
-// MARK: - EventCardView
+import SwiftUI
+import Firebase
+
 struct EventCardView: View {
     let event: EventModel
-    @State private var showCheckoutConfirmation = false
+
+    @State private var showCheckout = false
+    @State private var showShare = false
+    @State private var isSaved = false
+    @State private var showCopiedAlert = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -205,26 +211,76 @@ struct EventCardView: View {
             }
             .foregroundColor(.white)
 
+            HStack {
+                Button(action: {
+                    isSaved.toggle()
+                    saveEventToFirebase(event: event, isSaved: isSaved)
+                }) {
+                    Image(systemName: isSaved ? "bookmark.fill" : "bookmark")
+                        .foregroundColor(isSaved ? .yellow : .white)
+                }
+
+                Spacer()
+
+                Button(action: {
+                    showShare = true
+                }) {
+                    Image(systemName: "square.and.arrow.up")
+                        .foregroundColor(.white)
+                }
+            }
+            .font(.caption)
+            .padding(.top, 4)
+
             Button(action: {
-                showCheckoutConfirmation = true
+                showCheckout = true
             }) {
                 Text("Buy Tickets / Tables")
-                    .font(.subheadline)
                     .foregroundColor(.white)
                     .padding()
                     .frame(maxWidth: .infinity)
                     .background(Color.blue)
-                    .cornerRadius(8)
+                    .cornerRadius(10)
             }
             .padding(.top, 8)
         }
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(12)
-        .sheet(isPresented: $showCheckoutConfirmation) {
+        .onAppear(perform: checkIfSaved)
+        .sheet(isPresented: $showCheckout) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
                 openCheckout(ticketQty: ticketQty, tableQty: tableQty)
             }
+        }
+        .sheet(isPresented: $showShare) {
+            ShareModal(eventId: event.id, showCopiedAlert: $showCopiedAlert)
+        }
+        .alert(isPresented: $showCopiedAlert) {
+            Alert(title: Text("Link Copied"), message: Text("Event link copied to clipboard."), dismissButton: .default(Text("OK")))
+        }
+    }
+
+    private func checkIfSaved() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
+        ref.observeSingleEvent(of: .value) { snapshot in
+            self.isSaved = snapshot.exists()
+        }
+    }
+
+    private func saveEventToFirebase(event: EventModel, isSaved: Bool) {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
+
+        if isSaved {
+            let payload: [String: Any] = [
+                "eventId": event.id,
+                "timestamp": Date().timeIntervalSince1970
+            ]
+            ref.setValue(payload)
+        } else {
+            ref.removeValue()
         }
     }
 
@@ -235,7 +291,7 @@ struct EventCardView: View {
         }
 
         let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
-        let payoutDetails = event.payoutDetails.isEmpty ? "N/A" : event.payoutDetails
+        let payoutDetails = event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "N/A"
 
         let ticketTotal = Double(ticketQty) * event.ticketPrice
         let tableTotal = Double(tableQty) * event.tablePrice
@@ -248,7 +304,7 @@ struct EventCardView: View {
         components.path = "/checkout"
         components.queryItems = [
             URLQueryItem(name: "eventId", value: event.id),
-            URLQueryItem(name: "eventName", value: event.title),
+            URLQueryItem(name: "eventName", value: event.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""),
             URLQueryItem(name: "eventTime", value: "\(Int(event.date.timeIntervalSince1970))"),
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
@@ -265,7 +321,86 @@ struct EventCardView: View {
         if let url = components.url {
             print("🔗 Checkout URL:", url.absoluteString)
             UIApplication.shared.open(url)
+        } else {
+            print("❌ Failed to create checkout URL")
         }
     }
+}
 
+// MARK: - Share Modal
+
+struct ShareModal: View {
+    let eventId: String
+    @Binding var showCopiedAlert: Bool
+    @Environment(\.presentationMode) var presentationMode
+
+    var eventURL: String {
+        "https://blackappios.web.app/event.html?eventId=\(eventId)"
+    }
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Text("Share This Event")
+                .font(.title2)
+                .bold()
+
+            Button(action: {
+                UIPasteboard.general.string = eventURL
+                showCopiedAlert = true
+                presentationMode.wrappedValue.dismiss()
+            }) {
+                Label("Copy Link", systemImage: "doc.on.doc")
+                    .foregroundColor(.blue)
+            }
+
+            HStack(spacing: 30) {
+                // Twitter
+                Button(action: {
+                    if let url = URL(string: "https://twitter.com/intent/tweet?text=Check out this event! \(eventURL)") {
+                        UIApplication.shared.open(url)
+                    }
+                }) {
+                    Image(systemName: "bird.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.blue)
+                }
+
+                // WhatsApp
+                Button(action: {
+                    if let url = URL(string: "https://wa.me/?text=Check out this event! \(eventURL)") {
+                        UIApplication.shared.open(url)
+                    }
+                }) {
+                    Image(systemName: "message.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.green)
+                }
+
+                // Facebook
+                Button(action: {
+                    if let url = URL(string: "https://www.facebook.com/sharer/sharer.php?u=\(eventURL)") {
+                        UIApplication.shared.open(url)
+                    }
+                }) {
+                    Image(systemName: "f.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.blue)
+                }
+
+                // Instagram (Note: Opens profile link, can't deep share natively)
+                Button(action: {
+                    if let url = URL(string: "https://www.instagram.com/") {
+                        UIApplication.shared.open(url)
+                    }
+                }) {
+                    Image(systemName: "camera.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundColor(.pink)
+                }
+            }
+
+            Spacer()
+        }
+        .padding()
+    }
 }
