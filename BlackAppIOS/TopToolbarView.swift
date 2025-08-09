@@ -5,15 +5,31 @@ struct TopToolbarView: View {
     var onSearchTap: () -> Void
     var adminButton: AnyView? = nil
 
+    @State private var showSupportModal = false
+
     var body: some View {
         ZStack {
             HStack {
+                // Search button (left)
                 Button(action: onSearchTap) {
                     Image(systemName: "magnifyingglass")
                         .foregroundColor(.white)
                         .font(.title2)
                 }
+
                 Spacer()
+
+                // Support button (right)
+                Button(action: {
+                    showSupportModal = true
+                }) {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundColor(.white)
+                        .font(.title2)
+                        .padding(.trailing, 4)
+                }
+
+                // Admin button if available
                 if let adminButton = adminButton {
                     adminButton
                         .frame(width: 40, height: 40)
@@ -23,6 +39,7 @@ struct TopToolbarView: View {
             }
             .padding(.horizontal)
 
+            // Center logo
             Button(action: onLogoTap) {
                 Image("blackapp_logo")
                     .resizable()
@@ -31,5 +48,8 @@ struct TopToolbarView: View {
         }
         .frame(height: 50)
         .background(Color.black)
+        .sheet(isPresented: $showSupportModal) {
+            SupportModalView()
+        }
     }
 }

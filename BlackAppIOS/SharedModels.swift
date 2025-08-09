@@ -50,4 +50,20 @@ struct WaterDropShape: Shape {
         return path
     }
 }
-
+// MARK: - Support Message Model
+struct SupportMessage: Identifiable {
+    let id: String
+        let userId: String
+        let text: String
+        let timestamp: TimeInterval
+        let name: String
+        let email: String
+        var status: String? = nil
+    
+    var formattedTimestamp: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+}

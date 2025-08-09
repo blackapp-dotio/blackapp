@@ -97,7 +97,8 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
         throw new Error(result.message || "Transaction unsuccessful");
       }
 
-      const timestamp = Date.now();
+      // ✅ Use seconds-based timestamp
+      const timestamp = Math.floor(Date.now() / 1000);
       const purchaseRef = admin.database().ref(`purchases/${userId}`).push();
 
       await purchaseRef.set({
@@ -129,6 +130,7 @@ exports.createTransaction = functions.https.onRequest((req, res) => {
     }
   });
 });
+
 
 exports.scheduleEventReminders = functions.pubsub
   .schedule("every 1 hours")
@@ -195,10 +197,37 @@ exports.getPlatformRevenue = functions.https.onRequest((req, res) => {
       snapshot.forEach(userSnap => {
         userSnap.forEach(purchaseSnap => {
           const data = purchaseSnap.val();
-          totalEvents.add(data.eventId);
-          platformEarnings += parseFloat(data.platformFee || 0);
-          totalRevenue += parseFloat(data.totalAmount || 0);
-          ticketsSold += parseInt(data.ticketQty || 0);
+
+          const userId = data.userId;
+          const eventId = data.eventId;
+          const total = parseFloat(data.totalAmount) || 0;
+          const fee = parseFloat(data.platformFee) || 0;
+          const qty = parseInt(data.ticketQty) || 0;
+
+          // 🛑 Skip if essential data is missing or malformed
+          if (!userId || !eventId || isNaN(total) || total <= 0) {
+            console.warn("❌ Skipping invalid purchase:", {
+              userId,
+              eventId,
+              total,
+              fee,
+              qty
+            });
+            return;
+          }
+
+          console.log("✅ Purchase:", {
+            userId,
+            eventId,
+            total,
+            fee,
+            qty
+          });
+
+          totalEvents.add(eventId);
+          platformEarnings += fee;
+          totalRevenue += total;
+          ticketsSold += qty;
         });
       });
 
@@ -214,8 +243,6 @@ exports.getPlatformRevenue = functions.https.onRequest((req, res) => {
     }
   });
 });
-
-
 
 exports.getCheckoutURL = functions.https.onRequest((req, res) => {
   cors(req, res, () => {

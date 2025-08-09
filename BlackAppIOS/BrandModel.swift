@@ -1,30 +1,49 @@
-struct BrandModel: Identifiable {
+import Foundation
+
+struct BrandModel: Identifiable, Codable {
     var id: String
     var name: String
-    var ownerId: String
+    var description: String?
     var logoURL: String?
+    var ownerId: String
     var approved: Bool
-    var description: String?// ✅ NEW
-    var suspended: Bool // ✅ Add this line
-    
-    static func from(dict: [String: Any], id: String) -> BrandModel? {
-        guard let name = dict["name"] as? String,
-              let ownerId = dict["ownerId"] as? String else {
-            return nil
-        }
+    var suspended: Bool
+    var configuredTools: [String] = []  // ✅ Field for enabled tools
 
-        let logoURL = dict["logoURL"] as? String
-        let approved = dict["approved"] as? Bool ?? false
-        let description = dict["description"] as? String  // ✅ NEW
-        let suspended = dict["suspended"] as? Bool ?? false // ✅ Safely unwrap
+    static func from(dict: [String: Any], id: String) -> BrandModel? {
+        var tools: [String] = []
+
+        if let toolsEnabled = dict["toolsEnabled"] as? [String: Any] {
+            for (key, value) in toolsEnabled {
+                if let isEnabled = value as? Bool, isEnabled {
+                    tools.append(key)
+                }
+            }
+        }
 
         return BrandModel(
             id: id,
-            name: name,
-            ownerId: ownerId,
-            logoURL: logoURL,
-            approved: approved,
-            description: description,  // ✅ NEW
-            suspended: suspended        )
+            name: dict["name"] as? String ?? "",
+            description: dict["description"] as? String,
+            logoURL: dict["logoURL"] as? String,
+            ownerId: dict["ownerId"] as? String ?? "",
+            approved: dict["approved"] as? Bool ?? false,
+            suspended: dict["suspended"] as? Bool ?? false,
+            configuredTools: tools
+        )
+    }
+
+    func toDict() -> [String: Any] {
+        let dict: [String: Any] = [
+            "name": name,
+            "description": description ?? "",
+            "logoURL": logoURL ?? "",
+            "ownerId": ownerId,
+            "approved": approved,
+            "suspended": suspended,
+            "configuredTools": configuredTools  // ✅ Save tools to Firebase
+        ]
+        print("📤 Saving BrandModel to Firebase: \(dict)")
+        return dict
     }
 }

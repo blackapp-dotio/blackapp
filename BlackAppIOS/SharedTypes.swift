@@ -1,14 +1,18 @@
 import Foundation
 import FirebaseDatabase
 
-struct RSSArticle: Identifiable {
+
+struct RSSArticle: Identifiable, Codable {
     let id = UUID()
     let title: String
     let link: String
     let description: String
     let pubDate: Date
-    let imageURL: URL?
+    let imageURL: URL? // ← Make this optional
+    let videoURL: URL? // ✅ Add this line
 }
+
+
 
 extension Array {
     func chunked(into size: Int) -> [[Element]] {
@@ -69,4 +73,26 @@ struct PurchaseModel: Identifiable {
             timestamp: timestamp
         )
     }
+}
+import SwiftUI
+import UIKit
+
+/// Global, reusable share sheet for the whole app.
+/// Use: .sheet(isPresented: $showShare) { ActivityView(activityItems: [...]) }
+public struct ActivityView: UIViewControllerRepresentable {
+    public let activityItems: [Any]
+    public var applicationActivities: [UIActivity]? = nil
+
+    public init(activityItems: [Any], applicationActivities: [UIActivity]? = nil) {
+        self.activityItems = activityItems
+        self.applicationActivities = applicationActivities
+    }
+
+    public func makeUIViewController(context: Context) -> UIActivityViewController {
+        // Filter out optionals just in case you pass nil URLs etc.
+        let items = activityItems.compactMap { $0 }
+        return UIActivityViewController(activityItems: items, applicationActivities: applicationActivities)
+    }
+
+    public func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

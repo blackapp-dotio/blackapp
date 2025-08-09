@@ -16,9 +16,18 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 
         // OneSignal setup (SDK 3.x+)
         OneSignal.initialize("69366bbb-2d87-44b1-921c-3fd2cba8effc", withLaunchOptions: launchOptions)
-        OneSignal.Notifications.requestPermission({ accepted in
-            print("🔔 OneSignal permission accepted: \(accepted)")
-        }, fallbackToSettings: true)
+
+        // 🔁 Re-prompt for push notification permissions if not yet granted
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            if settings.authorizationStatus != .authorized {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    OneSignal.Notifications.requestPermission({ accepted in
+                        print("🔁 Re-prompted push permission: \(accepted)")
+                    }, fallbackToSettings: true)
+                }
+            }
+        }
+
 
         // Deep link + OneSignal handler
         NotificationCenter.default.addObserver(forName: Notification.Name("ONESIGNAL_NOTIFICATION_OPENED"),

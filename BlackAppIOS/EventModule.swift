@@ -6,6 +6,8 @@ import FirebaseDatabase
 import FeedKit
 import WebKit
 
+// MARK: - EventModel
+
 struct EventModel: Identifiable {
     var id: String
     var title: String
@@ -20,6 +22,9 @@ struct EventModel: Identifiable {
     var tableQuantity: Int
     var userId: String
     var location: String
+    var ticketsSold: Int
+    var tablesSold: Int
+    var isFree: Bool
 
     static func from(snapshot: DataSnapshot) -> EventModel? {
         guard let value = snapshot.value as? [String: Any],
@@ -58,10 +63,12 @@ struct EventModel: Identifiable {
             tablePrice: toDouble(value["tablePrice"]),
             tableQuantity: toInt(value["tableQuantity"]),
             userId: userId,
-            location: value["location"] as? String ?? ""
+            location: value["location"] as? String ?? "",
+            ticketsSold: toInt(value["ticketsSold"]),
+            tablesSold: toInt(value["tablesSold"]),
+            isFree: value["isFree"] as? Bool ?? false
         )
     }
-
 }
 
 // MARK: - MyEventsView
@@ -620,8 +627,6 @@ struct EventImageView: View {
         }.resume()
     }
 }
-
-
 // MARK: - CreateEventView
 import SwiftUI
 import Firebase
@@ -632,8 +637,8 @@ struct CreateEventView: View {
     @State private var title = ""
     @State private var description = ""
     @State private var selectedDate = Date()
-    @State private var payoutMethod = "PayPal"
-    @State private var payoutDetails = ""
+    @State private var payoutMethod = "PayPal"   // fixed
+    @State private var payoutDetails = ""        // PayPal email only
     @State private var ticketPrice: Double = 0.0
     @State private var ticketQuantity: Int = 0
     @State private var tablePrice: Double = 0.0
@@ -643,8 +648,7 @@ struct CreateEventView: View {
     @State private var showImagePicker = false
     @State private var location = ""
 
-    let payoutOptions = ["PayPal", "CashApp"]
-    
+   
     var body: some View {
         NavigationView {
             Form {
@@ -668,16 +672,16 @@ struct CreateEventView: View {
                 }
                 
                 Section(header: Text("Payout Information")) {
-                    Picker("Payout Method", selection: $payoutMethod) {
-                        ForEach(payoutOptions, id: \.self) { method in
-                            Text(method)
-                        }
+                    HStack {
+                        Text("Payout Method")
+                        Spacer()
+                        Text("PayPal").foregroundColor(.secondary)
                     }
-                    .pickerStyle(SegmentedPickerStyle())
-                    
-                    TextField(payoutMethod == "PayPal" ? "Enter PayPal Email" : "Enter Cash App Tag", text: $payoutDetails)
+                    TextField("Enter PayPal email", text: $payoutDetails)
                         .keyboardType(.emailAddress)
                         .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
                 }
 
 
@@ -729,7 +733,17 @@ struct CreateEventView: View {
                 func createEvent() {
                     guard let userId = Auth.auth().currentUser?.uid else { return }
                     guard !title.isEmpty, !description.isEmpty, selectedImage != nil else { return }
+
+                    // simple PayPal email validation (very light)
+                    let email = payoutDetails.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let validEmail = email.contains("@") && email.contains(".")
+                    guard validEmail else {
+                        print("❌ Invalid PayPal email")
+                        return
+                    }
+
                     isUploading = true
+
                     
                     if let image = selectedImage {
                         uploadEventImage(image) { imagePath in
@@ -974,33 +988,31 @@ struct RSSCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let imageURL = article.imageURL {
-                AsyncImage(url: imageURL) { phase in
-                    switch phase {
-                    case .empty:
-                        ProgressView()
-                            .frame(height: 200)
-                            .frame(maxWidth: .infinity)
-                            .background(Color.gray.opacity(0.1))
-                            .cornerRadius(12)
+            AsyncImage(url: article.imageURL) { phase in
+                switch phase {
+                case .empty:
+                    ProgressView()
+                        .frame(height: 200)
+                        .frame(maxWidth: .infinity)
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(12)
 
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .frame(height: 200)
-                            .frame(maxWidth: .infinity)
-                            .clipped()
-                            .cornerRadius(12)
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(height: 200)
+                        .frame(maxWidth: .infinity)
+                        .clipped()
+                        .cornerRadius(12)
 
-                    case .failure:
-                        RoundedRectangle(cornerRadius: 12)
-                            .fill(Color.gray.opacity(0.3))
-                            .frame(height: 200)
+                case .failure:
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: 200)
 
-                    @unknown default:
-                        EmptyView()
-                    }
+                @unknown default:
+                    EmptyView()
                 }
             }
 
@@ -1023,7 +1035,6 @@ struct RSSCardView: View {
                     .font(.caption)
                     .foregroundColor(.blue)
             }
-
         }
         .padding()
         .background(Color.black.opacity(0.7))
@@ -1031,6 +1042,7 @@ struct RSSCardView: View {
         .shadow(radius: 3)
     }
 }
+
 
 import SwiftUI
 import Firebase

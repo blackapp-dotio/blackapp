@@ -28,19 +28,11 @@
       margin-top: 20px;
       width: 100%;
     }
-    select, input[type="text"] {
-      width: 100%;
-      padding: 8px;
-      margin-top: 10px;
-      margin-bottom: 20px;
-      font-size: 16px;
-      border-radius: 6px;
-      border: none;
-    }
   </style>
 </head>
 <body>
   <h1>Confirm Your Order</h1>
+
   <div class="summary">
     <p><strong>Event:</strong> <span id="eventName"></span></p>
     <p><strong>Tickets:</strong> <span id="ticketSummary"></span></p>
@@ -50,22 +42,14 @@
     <p><strong>Total to Pay:</strong> $<span id="total"></span></p>
   </div>
 
-  <label for="paymentMethod">Choose Payment Method:</label>
-  <select id="paymentMethod">
-    <option value="card">Credit/Debit Card</option>
-    <option value="cashapp">Cash App</option>
-  </select>
-
-  <div id="cashapp-section" style="display:none">
-    <label for="cashtag">Enter your $Cashtag:</label>
-    <input type="text" id="cashtag" placeholder="$username" />
-    <button onclick="redirectToCashApp()">Pay with Cash App</button>
-  </div>
-
+  <!-- Only Braintree Drop-in (cards + PayPal) -->
   <div id="dropin-container"></div>
   <button id="submit-button" style="display:none">Pay Now</button>
 
   <script>
+    // --------------------------
+    // Parse query params
+    // --------------------------
     const query = new URLSearchParams(window.location.search);
     const userId = query.get("userId") || "unknown";
     const eventId = query.get("eventId") || "unknown";
@@ -78,75 +62,28 @@
     const tablePrice = Number(query.get("tablePrice") || 0);
     const baseTotal = parseFloat(query.get("baseTotal") || "0");
     const totalWithFee = parseFloat(query.get("totalWithFee") || "0");
-    const payoutMethod = query.get("payoutMethod") || "";
+
+    // These may still be present from event settings; harmless to forward to backend
+    const payoutMethod = query.get("payoutMethod") || "PayPal";
     const payoutDetails = decodeURIComponent(query.get("payoutDetails") || "");
 
-    // Fill page UI
+    // --------------------------
+    // Fill UI
+    // --------------------------
     document.getElementById("eventName").textContent = eventName;
-    document.getElementById("ticketSummary").textContent = `${ticketQty} x $${ticketPrice} = $${(ticketQty * ticketPrice).toFixed(2)}`;
-    document.getElementById("tableSummary").textContent = `${tableQty} x $${tablePrice} = $${(tableQty * tablePrice).toFixed(2)}`;
+    document.getElementById("ticketSummary").textContent =
+      `${ticketQty} x $${ticketPrice} = $${(ticketQty * ticketPrice).toFixed(2)}`;
+    document.getElementById("tableSummary").textContent =
+      `${tableQty} x $${tablePrice} = $${(tableQty * tablePrice).toFixed(2)}`;
     document.getElementById("baseTotal").textContent = baseTotal.toFixed(2);
     document.getElementById("fee").textContent = (totalWithFee - baseTotal).toFixed(2);
     document.getElementById("total").textContent = totalWithFee.toFixed(2);
 
-    // Payment method toggle
-    const methodSelector = document.getElementById("paymentMethod");
-    const dropinContainer = document.getElementById("dropin-container");
+    // --------------------------
+    // Braintree Drop-in (Cards + PayPal)
+    // --------------------------
     const submitBtn = document.getElementById("submit-button");
-    const cashappSection = document.getElementById("cashapp-section");
 
-    methodSelector.addEventListener("change", () => {
-      if (methodSelector.value === "card") {
-        dropinContainer.style.display = "block";
-        submitBtn.style.display = "inline-block";
-        cashappSection.style.display = "none";
-        console.log("💳 Switched to Card Payment");
-      } else {
-        dropinContainer.style.display = "none";
-        submitBtn.style.display = "none";
-        cashappSection.style.display = "block";
-        console.log("💵 Switched to Cash App Payment");
-      }
-    });
-
-    // Cash App Logic
-    function redirectToCashApp() {
-      const cashtag = document.getElementById("cashtag").value.replace("$", "");
-      const amount = totalWithFee.toFixed(2);
-
-      if (!cashtag) return alert("❌ Please enter a valid $Cashtag.");
-
-      const body = {
-        userId, eventId, eventName, eventImagePath,
-        eventTime, ticketQty, ticketPrice, tableQty, tablePrice,
-        baseTotal, totalWithFee,
-        payoutMethod, payoutDetails,
-        platformFee: (totalWithFee - baseTotal),
-        timestamp: Date.now(),
-        paymentMethod: "cashapp"
-      };
-
-      console.log("📤 Logging Cash App purchase:", body);
-
-      fetch("https://us-central1-blackappios.cloudfunctions.net/logManualPurchase", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      })
-      .then(res => res.json())
-      .then(result => {
-        console.log("✅ Cash App log response:", result);
-        const url = `cashapp://send?amount=${amount}&recipient=${cashtag}`;
-        console.log("🔁 Redirecting to:", url);
-        window.location.href = url;
-      })
-      .catch(err => {
-        console.error("❌ Logging Cash App purchase failed:", err);
-        alert("Failed to log purchase.");
-      });
-    }
-
-    // Braintree Drop-in Logic
     fetch("https://us-central1-blackappios.cloudfunctions.net/generateClientToken")
       .then(res => res.json())
       .then(data => {
@@ -156,7 +93,12 @@
         braintree.dropin.create({
           authorization: data.clientToken,
           container: "#dropin-container",
-          vaultManager: false,
+          // Let Drop-in show Card and PayPal options automatically
+          paypal: {
+            flow: "checkout",
+            amount: amountToSend,
+            currency: "USD"
+          },
           card: {
             cardholderName: { required: true },
             overrides: {
@@ -165,15 +107,11 @@
                 cvv: { placeholder: "123" }
               }
             }
-          },
-          paypal: {
-            flow: "checkout",
-            amount: amountToSend,
-            currency: "USD"
           }
         }, (err, dropinInstance) => {
           if (err) {
             console.error("❌ Braintree Init Error:", err);
+            alert("Could not initialize payment system.");
             return;
           }
 
@@ -183,18 +121,23 @@
 
           submitBtn.addEventListener("click", () => {
             dropinInstance.requestPaymentMethod((err, payload) => {
-              if (err) return console.error("❌ Payment Method Error:", err);
+              if (err) {
+                console.error("❌ Payment Method Error:", err);
+                alert("Please select a payment method.");
+                return;
+              }
 
               const postData = {
                 amount: amountToSend.toFixed(2),
                 paymentMethodNonce: payload.nonce,
                 userId, eventId, eventName, eventImagePath, eventTime,
                 ticketQty, ticketPrice, tableQty, tablePrice,
-                baseTotal, totalWithFee, payoutMethod, payoutDetails,
+                baseTotal, totalWithFee,
+                payoutMethod, payoutDetails, // forwarded for your records
                 platformFee: (totalWithFee - baseTotal)
               };
 
-              console.log("📤 Submitting card payment:", postData);
+              console.log("📤 Submitting payment:", postData);
 
               fetch("https://us-central1-blackappios.cloudfunctions.net/createTransaction", {
                 method: "POST",

@@ -12,42 +12,7 @@ struct ExploreTabView: View {
                 LazyVStack(spacing: 20) {
                     ForEach(approvedBrands) { brand in
                         NavigationLink(destination: BrandStorefrontView(brand: brand)) {
-                            HStack(spacing: 12) {
-                                if let logoURL = brand.logoURL, let url = URL(string: logoURL) {
-                                    WebImage(url: url)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 60, height: 60)
-                                        .clipShape(Circle())
-                                        .shadow(radius: 3)
-                                } else {
-                                    Image(systemName: "building.2.crop.circle.fill")
-                                        .resizable()
-                                        .frame(width: 60, height: 60)
-                                        .foregroundColor(.gray)
-                                }
-
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(brand.name)
-                                        .font(.headline)
-                                        .foregroundColor(.white)
-
-                                    if let desc = brand.description, !desc.isEmpty {
-                                        Text(desc)
-                                            .font(.subheadline)
-                                            .foregroundColor(.gray)
-                                            .lineLimit(2)
-                                    } else {
-                                        Text("No description available.")
-                                            .font(.subheadline)
-                                            .foregroundColor(.gray)
-                                            .italic()
-                                    }
-                                }
-
-                                Spacer()
-                            }
-                            .padding(.horizontal)
+                            BrandCardView(brand: brand)
                         }
                     }
                 }
@@ -74,5 +39,48 @@ struct ExploreTabView: View {
 
             self.approvedBrands = loadedBrands
         }
+    }
+}
+
+struct BrandCardView: View {
+    let brand: BrandModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let logoURL = brand.logoURL, let url = URL(string: logoURL) {
+                WebImage(url: url)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 60, height: 60)
+                    .clipShape(Circle())
+                    .shadow(radius: 3)
+            } else {
+                Image(systemName: "building.2.crop.circle.fill")
+                    .resizable()
+                    .frame(width: 60, height: 60)
+                    .foregroundColor(.gray)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(brand.name)
+                    .font(.headline)
+                    .foregroundColor(.white)
+
+                if let desc = brand.description, !desc.isEmpty {
+                    Text(desc)
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                        .lineLimit(2)
+                } else {
+                    Text("No description available.")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                        .italic()
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal)
     }
 }

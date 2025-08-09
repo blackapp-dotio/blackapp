@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "blackappios"
-  }
+  },
+  "targets": {
+    "blackappios": {
+      "hosting": {
+        "BlackAppWeb": [
+          "blackapp-web"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }

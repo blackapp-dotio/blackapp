@@ -148,3 +148,10 @@ struct MainTabView: View {
 
     }
 }
+/*// MARK: - EventTabView (entry point for Events Tab)
+
+struct EventTabView: View {
+    var body: some View {
+        EventFeedView() // or whatever your main event view is
+    }
+}*/
