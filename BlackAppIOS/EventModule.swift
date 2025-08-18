@@ -509,46 +509,138 @@ struct UserAvatarView: View {
 }
 
 
+import SwiftUI
+import FirebaseAuth
+import FirebaseDatabase
 
 // MARK: - EventTabView
 struct EventTabView: View {
     @State private var selectedTab = 0
     @State private var showCreate = false
 
+    // Promoter Dashboard state
+    @State private var isPromoterUser = false
+    @State private var showPromoterSheet = false
+
+    // Nightlife entry (glowing button) state
+    @State private var showNightlife = false
+
     var body: some View {
-        VStack {
+        VStack(spacing: 12) {
+            // Existing segmented control
             Picker("View", selection: $selectedTab) {
                 Text("All Events").tag(0)
                 Text("My Events").tag(1)
             }
             .pickerStyle(SegmentedPickerStyle())
-            .padding()
+            .padding(.horizontal)
+            .padding(.top, 8)
 
+            // Existing content
             if selectedTab == 0 {
                 EventFeedView()
             } else {
                 MyEventsView()
             }
 
-            Button(action: {
-                showCreate = true
-            }) {
+            // NEW: Nightlife entry with a gentle animated glow
+            GlowingNightlifeButton {
+                showNightlife = true
+            }
+            .padding(.horizontal)
+
+            // Promoter-only entry (unchanged behavior)
+            if isPromoterUser {
+                Button {
+                    showPromoterSheet = true
+                } label: {
+                    HStack {
+                        Image(systemName: "star.fill")
+                        Text("Promoter Dashboard")
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(10)
+                }
+                .padding(.horizontal)
+                .sheet(isPresented: $showPromoterSheet) {
+                    PromoterDashboardView()
+                }
+            }
+
+            // Existing "Create Event" button
+            Button(action: { showCreate = true }) {
                 HStack {
                     Image(systemName: "plus.circle.fill")
                     Text("Create Event")
                 }
                 .padding()
+                .frame(maxWidth: .infinity)
                 .background(Color.blue)
                 .foregroundColor(.white)
                 .cornerRadius(10)
             }
+            .padding(.horizontal)
+            .padding(.bottom, 12)
             .sheet(isPresented: $showCreate) {
                 CreateEventView()
             }
-            .padding()
+        }
+        .onAppear(perform: refreshPromoterFlag)
+        // Nightlife presented as a sheet so we don’t depend on a NavigationStack here
+        .sheet(isPresented: $showNightlife) {
+            // ⬇️ This view is defined in your Nightlife module
+            NightlifeHomeView()
+        }
+    }
+
+    // MARK: - Promoter check (RTDB: /promoters/{uid})
+    private func refreshPromoterFlag() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            isPromoterUser = false
+            return
+        }
+        let ref = Database.database().reference().child("promoters").child(uid)
+        ref.observeSingleEvent(of: .value) { snap in
+            // Visible only if the promoter profile exists
+            self.isPromoterUser = snap.exists()
         }
     }
 }
+
+// MARK: - Glowing Nightlife Button
+private struct GlowingNightlifeButton: View {
+    @State private var glow = false
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.headline)
+                Text("Nightlife")
+                    .font(.headline).bold()
+            }
+            .padding()
+            .frame(maxWidth: .infinity)
+            .foregroundColor(.white)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.purple.opacity(0.88))
+            )
+            .shadow(color: Color.purple.opacity(glow ? 0.9 : 0.4), radius: glow ? 20 : 8)
+            .scaleEffect(glow ? 1.03 : 1.0)
+            .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: glow)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+            )
+        }
+        .onAppear { glow = true }
+    }
+}
+
 
 
 import SwiftUI

@@ -12,7 +12,7 @@ struct BrandBookingsFeedView: View {
         ScrollView {
             VStack(spacing: 20) {
                 ForEach(sessions) { session in
-                    BookingCard(session: session)
+                    BookingCard(session: session, brandOwnerId: brand.ownerId)
                         .padding(.horizontal)
                 }
 
@@ -41,7 +41,11 @@ struct BrandBookingsFeedView: View {
 
     func fetchBookingSessions() {
         print("📅 Fetching bookings for brand ID: \(brand.id)")
-        let ref = Database.database().reference().child("brands").child(brand.id).child("bookings")
+        let ref = Database.database().reference()
+            .child("brands")
+            .child(brand.id)
+            .child("bookings")
+
         ref.observeSingleEvent(of: .value) { snapshot in
             var temp: [BookingSession] = []
 
@@ -78,18 +82,25 @@ struct BookingSession: Identifiable {
             return nil
         }
 
-        return BookingSession(id: id, title: title, description: description, price: price, durationMinutes: duration, timestamp: timestamp)
+        return BookingSession(
+            id: id,
+            title: title,
+            description: description,
+            price: price,
+            durationMinutes: duration,
+            timestamp: timestamp
+        )
     }
 
-    var formattedDuration: String {
-        "\(durationMinutes) min"
-    }
+    var formattedDuration: String { "\(durationMinutes) min" }
 }
 
 // MARK: - Booking Card View
 
 struct BookingCard: View {
     let session: BookingSession
+    let brandOwnerId: String
+
     @State private var isSaved = false
     @State private var showShareSheet = false
 
@@ -132,9 +143,7 @@ struct BookingCard: View {
 
             HStack {
                 Spacer()
-                Button(action: {
-                    // TODO: Hook into booking flow
-                }) {
+                Button(action: bookNow) {
                     Text("Book Now")
                         .foregroundColor(.black)
                         .padding(.vertical, 8)
@@ -148,17 +157,36 @@ struct BookingCard: View {
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .shadow(radius: 6)
-        .onAppear {
-            checkSavedStatus()
-        }
+        .onAppear { checkSavedStatus() }
         .sheet(isPresented: $showShareSheet) {
             ShareSheet(activityItems: [shareMessage()])
         }
     }
 
-    func toggleSave() {
+    private func bookNow() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            print("❌ User not logged in")
+            return
+        }
+
+        // Route to hosted checkout with platform fee logic handled by PurchaseManager
+        PurchaseManager.shared.startCheckout(
+            buyerId: uid,
+            sellerId: brandOwnerId,
+            basePrice: session.price,
+            itemType: "booking",
+            itemId: session.id,
+            itemTitle: session.title,
+            itemImageURL: "" // add a thumbnail URL if you have one
+        )
+    }
+
+    private func toggleSave() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        let ref = Database.database().reference().child("savedBookings").child(uid).child(session.id)
+        let ref = Database.database().reference()
+            .child("savedBookings")
+            .child(uid)
+            .child(session.id)
 
         if isSaved {
             ref.removeValue()
@@ -169,29 +197,32 @@ struct BookingCard: View {
         }
     }
 
-    func checkSavedStatus() {
+    private func checkSavedStatus() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        let ref = Database.database().reference().child("savedBookings").child(uid).child(session.id)
+        let ref = Database.database().reference()
+            .child("savedBookings")
+            .child(uid)
+            .child(session.id)
 
         ref.observeSingleEvent(of: .value) { snapshot in
             isSaved = snapshot.exists()
         }
     }
 
-    func shareMessage() -> String {
-        return "📅 Check out this session: \(session.title) — \(session.formattedDuration) for $\(session.price)\nNow available for booking on BlackApp!"
+    private func shareMessage() -> String {
+        "📅 Check out this session: \(session.title) — \(session.formattedDuration) for $\(session.price)\nNow available for booking on BlackApp!"
     }
 }
 
 // MARK: - Share Sheet
-import SwiftUI
+
 import UIKit
 
 struct ShareSheet: UIViewControllerRepresentable {
     var activityItems: [Any]
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        return UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}

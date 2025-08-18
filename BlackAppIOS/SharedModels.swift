@@ -67,3 +67,4 @@ struct SupportMessage: Identifiable {
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
     }
 }
+
