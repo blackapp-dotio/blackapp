@@ -1,17 +1,13 @@
 import SwiftUI
+import UIKit
 import Firebase
 import FirebaseAuth
 import FirebaseStorage
 import FirebaseDatabase
-import FeedKit
-import WebKit
 
-// MARK: - EventFeedView
+// MARK: - EventFeedView (Internal events only)
 struct EventFeedView: View {
     @State private var platformEvents: [EventModel] = []
-    @State private var rssArticles: [RSSArticle] = []
-    @State private var selectedURL: URL? = nil
-    @State private var showWebView = false
     @State private var isLoading = true
 
     // Filters
@@ -24,28 +20,6 @@ struct EventFeedView: View {
     @State private var tableMinPrice: Double? = nil
     @State private var tableMaxPrice: Double? = nil
     @State private var showFilters = false
-
-    // === MERGED RSS LIST (web + iOS), de-duped ===
-    private let rssFeedURLs: [String] = {
-        let web = [
-            "https://rss.app/feeds/nsmT2WdQXSlshmcy.xml",
-            "https://rss.app/feeds/XqrrnyuiP2E5gvZY.xml",
-            "https://rss.app/feeds/uCjXryL38K1J4e29.xml",
-            "https://rss.app/feeds/pv5YufdSsNN6ROH5.xml",
-            "https://rss.app/feeds/keM7mXLp4OlutaGg.xml",
-            "https://rss.app/feeds/KwsTlmbvwXiY4YX6.xml",
-            "https://rss.app/feeds/fQ6cY8V57Sk5ayox.xml"
-        ]
-        let ios = [
-            "https://allevents.in/charlotte/afrobeats?format=rss",
-            "https://allevents.in/washington/afrobeats?format=rss",
-            "https://www.eventbrite.com/d/nc--charlotte/african-events/rss/",
-            "https://allevents.in/atlanta/afrobeats?format=rss",
-            "https://allevents.in/new%20york/afrobeats?format=rss",
-            "https://allevents.in/miami/afrobeats?format=rss"
-        ]
-        return Array(Set(web + ios))
-    }()
 
     var body: some View {
         NavigationView {
@@ -122,23 +96,6 @@ struct EventFeedView: View {
                                 }
                             }
                         }
-
-                        // --- External events (RSS) ---
-                        Section(header: Text("External Events")) {
-                            let external = filteredExternalArticles()
-                            if external.isEmpty {
-                                Text("No external events available.")
-                                    .foregroundColor(.gray)
-                                    .italic()
-                                    .padding(.vertical)
-                            } else {
-                                ForEach(external) { article in
-                                    RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
-                                        .listRowSeparator(.hidden)
-                                        .listRowBackground(Color.clear)
-                                }
-                            }
-                        }
                     }
                     .listStyle(.plain)
                 }
@@ -148,24 +105,15 @@ struct EventFeedView: View {
             .onAppear {
                 isLoading = true
                 fetchPlatformEvents()
-                fetchFeedsInChunks()
-            }
-            .sheet(isPresented: $showWebView) {
-                if let url = selectedURL {
-                    WebView(url: url).edgesIgnoringSafeArea(.all)
-                }
             }
         }
         .preferredColorScheme(.dark)
     }
 }
 
-// MARK: - DATA (Platform + RSS)
+// MARK: - DATA (Platform only)
 extension EventFeedView {
-
-    // Replace with your actual DB fetch if needed.
     func fetchPlatformEvents() {
-        // Example fetch keeping only future events:
         let ref = Database.database().reference().child("events")
         ref.observeSingleEvent(of: .value) { snapshot in
             var events: [EventModel] = []
@@ -176,79 +124,13 @@ extension EventFeedView {
                 }
             }
             platformEvents = events.sorted { $0.date > $1.date }
-        }
-    }
-
-    // Chunked RSS fetch (mirrors your working web logic)
-    func fetchFeedsInChunks(chunkSize: Int = 3) {
-        Task {
-            var all: [RSSArticle] = []
-
-            for chunk in chunkedArray(rssFeedURLs, size: chunkSize) {
-                var chunkArticles: [RSSArticle] = []
-                await withTaskGroup(of: [RSSArticle].self) { group in
-                    for url in chunk {
-                        group.addTask { await fetchFeed(urlString: url) }
-                    }
-                    for await items in group { chunkArticles.append(contentsOf: items) }
-                }
-                all.append(contentsOf: chunkArticles)
-            }
-
-            // De-dupe (title+link) and sort by publish date desc
-            let unique = dedupe(all) { "\($0.title.lowercased())|\($0.link)" }
-            let sorted = unique.sorted { $0.pubDate > $1.pubDate }
-
-            await MainActor.run {
-                rssArticles = sorted
-                isLoading = false
-            }
-        }
-    }
-
-    func fetchFeed(urlString: String) async -> [RSSArticle] {
-        guard let url = URL(string: urlString) else { return [] }
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let result = try FeedParser(data: data).parse()
-            guard case .success(let feed) = result, let items = feed.rssFeed?.items else { return [] }
-
-            var events: [RSSArticle] = []
-            for item in items {
-                guard
-                    let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines),
-                    let link = item.link
-                else { continue }
-
-                let pubDate = item.pubDate ?? Date.distantPast
-                let plain = extractPlainText(from: item.description ?? "")
-
-                // Prefer media:content / enclosure, else first <img> in description
-                let enc = item.enclosure?.attributes?.url
-                let mediaURL = enc ?? firstMediaURL(from: item.media?.mediaContents)
-                let imageURL = mediaURL.flatMap(URL.init) ??
-                               extractImageURL(from: item.description ?? "").flatMap(URL.init)
-
-                events.append(RSSArticle(
-                    title: title,
-                    link: link,
-                    description: plain,
-                    pubDate: pubDate,
-                    imageURL: imageURL,
-                    videoURL: nil
-                ))
-            }
-            return events
-        } catch {
-            print("❌ RSS fetch error (\(urlString)): \(error.localizedDescription)")
-            return []
+            isLoading = false
         }
     }
 }
 
-// MARK: - FILTERING
+// MARK: - FILTERING (applies to internal events)
 extension EventFeedView {
-    // Apply your platform filters (upcoming/today/weekend/location/price)
     func filteredEvents() -> [EventModel] {
         var out = platformEvents
 
@@ -266,106 +148,15 @@ extension EventFeedView {
 
         if !locationQuery.trimmingCharacters(in: .whitespaces).isEmpty {
             let q = locationQuery.lowercased()
-            // NOTE: EventModel uses `title`, not `name`
             out = out.filter { $0.location.lowercased().contains(q) || $0.title.lowercased().contains(q) }
         }
 
-        // Optional price filters (adapt to your fields)
         if let min = ticketMinPrice { out = out.filter { $0.ticketPrice >= min } }
         if let max = ticketMaxPrice { out = out.filter { $0.ticketPrice <= max } }
         if let tmin = tableMinPrice { out = out.filter { $0.tablePrice >= tmin } }
         if let tmax = tableMaxPrice { out = out.filter { $0.tablePrice <= tmax } }
 
         return out.sorted { $0.date < $1.date }
-    }
-
-    // Filter external RSS in a similar spirit (by text + date)
-    func filteredExternalArticles() -> [RSSArticle] {
-        var arr = rssArticles
-
-        if !locationQuery.trimmingCharacters(in: .whitespaces).isEmpty {
-            let q = locationQuery.lowercased()
-            arr = arr.filter {
-                $0.title.lowercased().contains(q) || $0.description.lowercased().contains(q)
-            }
-        }
-
-        let cal = Calendar.current
-        if showOnlyUpcoming {
-            arr = arr.filter { $0.pubDate >= Date() || cal.isDateInToday($0.pubDate) }
-        }
-        if filterToday {
-            arr = arr.filter { cal.isDateInToday($0.pubDate) }
-        }
-        if filterWeekend {
-            arr = arr.filter { cal.isDateInWeekend($0.pubDate) }
-        }
-
-        return arr
-    }
-}
-
-// MARK: - Helpers (HTML, media, chunking, dedupe)
-extension EventFeedView {
-    func extractImageURL(from html: String) -> String? {
-        guard let regex = try? NSRegularExpression(
-            pattern: "<img[^>]+src=[\"']([^\"']+)[\"']",
-            options: .caseInsensitive
-        ) else { return nil }
-        let ns = html as NSString
-        let range = NSRange(location: 0, length: ns.length)
-        guard let match = regex.firstMatch(in: html, options: [], range: range),
-              match.numberOfRanges > 1
-        else { return nil }
-        return ns.substring(with: match.range(at: 1))
-    }
-
-    func extractPlainText(from html: String) -> String {
-        guard let data = html.data(using: .utf8) else {
-            return html.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
-            .documentType: NSAttributedString.DocumentType.html,
-            .characterEncoding: String.Encoding.utf8.rawValue
-        ]
-        if let attributed = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-            return attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            return html.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-    }
-
-    func firstMediaURL(from contents: [MediaContent]?) -> String? {
-        guard let contents else { return nil }
-        for c in contents {
-            if let u = c.attributes?.url { return u }
-        }
-        return nil
-    }
-
-    func chunkedArray<T>(_ array: [T], size: Int) -> [[T]] {
-        guard size > 0 else { return [array] }
-        var res: [[T]] = []
-        var idx = 0
-        while idx < array.count {
-            let end = min(idx + size, array.count)
-            res.append(Array(array[idx..<end]))
-            idx = end
-        }
-        return res
-    }
-
-    func dedupe<T>(_ array: [T], key: (T) -> String) -> [T] {
-        var seen = Set<String>()
-        var out: [T] = []
-        for el in array {
-            let k = key(el)
-            if !seen.contains(k) {
-                out.append(el)
-                seen.insert(k)
-            }
-        }
-        return out
     }
 }
 
@@ -377,28 +168,54 @@ struct EventCardView: View {
     let event: EventModel
 
     @State private var showCheckout = false
-    @State private var showShare = false
     @State private var isSaved = false
-    @State private var showCopiedAlert = false
+    @State private var showShareOptions = false   // stays, but dialog moved to container
 
-    var ticketsRemaining: Int {
-        max(event.ticketQuantity - (event.ticketsSold), 0)
-    }
-
-    var tablesRemaining: Int {
-        max(event.tableQuantity - (event.tablesSold), 0)
-    }
+    // Compact formatters
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .none; return f
+    }()
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .none; f.timeStyle = .short; return f
+    }()
+    private var dateText: String { Self.dateFormatter.string(from: event.date) }
+    private var timeText: String { Self.timeFormatter.string(from: event.date) }
+    var ticketsRemaining: Int { max(event.ticketQuantity - (event.ticketsSold), 0) }
+    var tablesRemaining: Int { max(event.tableQuantity - (event.tablesSold), 0) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            EventImageView(imagePath: event.imagePath)
-                .frame(height: 200)
-                .clipped()
-                .cornerRadius(12)
+            // Flyer with date/time overlay
+            ZStack(alignment: .bottomLeading) {
+                EventImageView(imagePath: event.imagePath)
+                    .frame(height: 200)
+                    .clipped()
+
+                LinearGradient(colors: [Color.clear, Color.black.opacity(0.72)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: 72)
+                    .frame(maxWidth: .infinity, alignment: .bottom)
+
+                HStack(spacing: 12) {
+                    Label(dateText, systemImage: "calendar")
+                    Label(timeText, systemImage: "clock")
+                }
+                .font(.caption)
+                .foregroundColor(.white)
+                .padding(8)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
 
             Text(event.title)
                 .font(.headline)
                 .padding(.top, 4)
+
+            HStack(spacing: 12) {
+                Label(dateText, systemImage: "calendar")
+                Label(timeText, systemImage: "clock")
+            }
+            .font(.subheadline)
+            .foregroundColor(.white.opacity(0.9))
 
             Text(event.description)
                 .font(.subheadline)
@@ -406,14 +223,11 @@ struct EventCardView: View {
                 .lineLimit(2)
 
             HStack(spacing: 4) {
-                Image(systemName: "mappin.and.ellipse")
-                    .foregroundColor(.gray)
-                Text(event.location)
-                    .font(.subheadline)
-                    .foregroundColor(.gray)
+                Image(systemName: "mappin.and.ellipse").foregroundColor(.gray)
+                Text(event.location).font(.subheadline).foregroundColor(.gray)
             }
 
-            // MARK: - Ticket & Table Prices
+            // Prices
             HStack(spacing: 16) {
                 if event.ticketPrice > 0 {
                     Label("$\(String(format: "%.2f", event.ticketPrice)) Tickets", systemImage: "ticket")
@@ -426,14 +240,13 @@ struct EventCardView: View {
             }
             .foregroundColor(.white)
 
-            // MARK: - Remaining Count with Color Indicators
+            // Remaining counts
             HStack(spacing: 16) {
                 if event.ticketQuantity > 0 {
                     Label("\(ticketsRemaining) tickets left", systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundColor(ticketsRemaining <= 5 ? .red : (ticketsRemaining <= 10 ? .yellow : .white))
                 }
-
                 if event.tableQuantity > 0 {
                     Label("\(tablesRemaining) tables left", systemImage: "person.3.sequence.fill")
                         .font(.caption)
@@ -441,7 +254,7 @@ struct EventCardView: View {
                 }
             }
 
-            // MARK: - Save & Share
+            // Save & Share (buttons are now 'borderless' so taps don't bubble to row)
             HStack {
                 Button(action: {
                     isSaved.toggle()
@@ -450,18 +263,19 @@ struct EventCardView: View {
                     Image(systemName: isSaved ? "bookmark.fill" : "bookmark")
                         .foregroundColor(isSaved ? .yellow : .white)
                 }
+                .buttonStyle(.borderless)
 
                 Spacer()
 
-                Button(action: { showShare = true }) {
-                    Image(systemName: "square.and.arrow.up")
-                        .foregroundColor(.white)
+                Button(action: { showShareOptions = true }) {
+                    Image(systemName: "square.and.arrow.up").foregroundColor(.white)
                 }
+                .buttonStyle(.borderless)
             }
             .font(.caption)
             .padding(.top, 4)
 
-            // MARK: - Checkout Button
+            // Checkout (also borderless so the row never hijacks it)
             Button(action: { showCheckout = true }) {
                 Text("Buy Tickets / Tables")
                     .foregroundColor(.white)
@@ -470,25 +284,30 @@ struct EventCardView: View {
                     .background(Color.blue)
                     .cornerRadius(10)
             }
+            .buttonStyle(.borderless)
             .padding(.top, 8)
         }
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(12)
+        .contentShape(Rectangle())                 // keep taps well-scoped
         .onAppear(perform: checkIfSaved)
         .sheet(isPresented: $showCheckout) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
                 openCheckout(ticketQty: ticketQty, tableQty: tableQty)
             }
         }
-        .sheet(isPresented: $showShare) {
-            ShareModal(eventId: event.id, showCopiedAlert: $showCopiedAlert)
-        }
-        .alert(isPresented: $showCopiedAlert) {
-            Alert(title: Text("Link Copied"), message: Text("Event link copied to clipboard."), dismissButton: .default(Text("OK")))
+        // ⬇️ Moved here: ONLY shows when showShareOptions is set by the Share button
+        .confirmationDialog("Share Event",
+                            isPresented: $showShareOptions,
+                            titleVisibility: .visible) {
+            Button("Share to Gossip (recommended)") { shareToGossip() }
+            Button("Share via…") { shareToSystem() }
+            Button("Cancel", role: .cancel) { }
         }
     }
 
+    // MARK: Save / load
     private func checkIfSaved() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
@@ -500,27 +319,20 @@ struct EventCardView: View {
     private func saveEventToFirebase(event: EventModel, isSaved: Bool) {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
-
         if isSaved {
-            let payload: [String: Any] = [
-                "eventId": event.id,
-                "timestamp": Date().timeIntervalSince1970
-            ]
-            ref.setValue(payload)
+            ref.setValue(["eventId": event.id, "timestamp": Date().timeIntervalSince1970])
         } else {
             ref.removeValue()
         }
     }
 
+    // MARK: Checkout deep link (existing)
     private func openCheckout(ticketQty: Int, tableQty: Int) {
         guard let userId = Auth.auth().currentUser?.uid else {
-            print("❌ No user logged in")
-            return
+            print("❌ No user logged in"); return
         }
-
         let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
         let payoutDetails = event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "N/A"
-
         let ticketTotal = Double(ticketQty) * event.ticketPrice
         let tableTotal = Double(tableQty) * event.tablePrice
         let grossTotal = ticketTotal + tableTotal
@@ -545,7 +357,6 @@ struct EventCardView: View {
             URLQueryItem(name: "payoutDetails", value: payoutDetails),
             URLQueryItem(name: "eventImagePath", value: event.imagePath)
         ]
-
         if let url = components.url {
             print("🔗 Checkout URL:", url.absoluteString)
             UIApplication.shared.open(url)
@@ -553,78 +364,61 @@ struct EventCardView: View {
             print("❌ Failed to create checkout URL")
         }
     }
-}
 
-// MARK: - Share Modal
-struct ShareModal: View {
-    let eventId: String
-    @Binding var showCopiedAlert: Bool
-    @Environment(\.presentationMode) var presentationMode
-
-    var eventURL: String {
-        "https://blackappios.web.app/event.html?eventId=\(eventId)"
-    }
-
-    var body: some View {
-        VStack(spacing: 24) {
-            Text("Share This Event")
-                .font(.title2)
-                .bold()
-
-            Button(action: {
-                UIPasteboard.general.string = eventURL
-                showCopiedAlert = true
-                presentationMode.wrappedValue.dismiss()
-            }) {
-                Label("Copy Link", systemImage: "doc.on.doc")
-                    .foregroundColor(.blue)
-            }
-
-            HStack(spacing: 30) {
-                Button(action: {
-                    if let url = URL(string: "https://twitter.com/intent/tweet?text=Check out this event! \(eventURL)") {
-                        UIApplication.shared.open(url)
-                    }
-                }) {
-                    Image(systemName: "bird.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.blue)
-                }
-
-                Button(action: {
-                    if let url = URL(string: "https://wa.me/?text=Check out this event! \(eventURL)") {
-                        UIApplication.shared.open(url)
-                    }
-                }) {
-                    Image(systemName: "message.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.green)
-                }
-
-                Button(action: {
-                    if let url = URL(string: "https://www.facebook.com/sharer/sharer.php?u=\(eventURL)") {
-                        UIApplication.shared.open(url)
-                    }
-                }) {
-                    Image(systemName: "f.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.blue)
-                }
-
-                Button(action: {
-                    if let url = URL(string: "https://www.instagram.com/") {
-                        UIApplication.shared.open(url)
-                    }
-                }) {
-                    Image(systemName: "camera.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.pink)
-                }
-            }
-
-            Spacer()
+    // MARK: Share helpers (unchanged)
+    private func shareToGossip() {
+        guard let url = buildEventDeepLink() else {
+            shareToSystem(); return
         }
-        .padding()
+        let caption = makeEventCaption()
+        if let top = topMostController() {
+            GossipShareManager.shared.presentShare(from: top, payload: .link(url: url, text: caption))
+        } else {
+            shareToSystem()
+        }
+    }
+    private func shareToSystem() {
+        guard let url = buildEventDeepLink() else { return }
+        presentSystemShare([makeEventCaption(), url])
+    }
+    private func buildEventDeepLink() -> URL? {
+        URL(string: "https://blackappios.web.app/event.html?eventId=\(event.id)")
+    }
+    private func makeEventCaption() -> String {
+        var parts: [String] = []
+        parts.append(event.title)
+        parts.append("\(dateText) • \(timeText)")
+        if !event.location.isEmpty { parts.append(event.location) }
+        if event.ticketPrice > 0 { parts.append(String(format: "Tickets $%.0f", event.ticketPrice)) }
+        if event.tablePrice > 0 { parts.append(String(format: "Tables $%.0f", event.tablePrice)) }
+        return parts.joined(separator: " • ")
     }
 }
 
+
+// MARK: - Generic share presenters (safe fallback)
+private func presentSystemShare(_ items: [Any]) {
+    DispatchQueue.main.async {
+        guard let top = topMostController() else { return }
+        let av = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let pop = av.popoverPresentationController {
+            pop.sourceView = top.view
+            pop.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        top.present(av, animated: true)
+    }
+}
+
+private func topMostController(base: UIViewController? = {
+    let scenes = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .sorted { ($0.activationState == .foregroundActive) && ($1.activationState != .foregroundActive) }
+    let keyWin = scenes.first?.windows.first(where: { $0.isKeyWindow })
+    return keyWin?.rootViewController
+}()) -> UIViewController? {
+    if let nav = base as? UINavigationController { return topMostController(base: nav.visibleViewController) }
+    if let tab = base as? UITabBarController { return topMostController(base: tab.selectedViewController) }
+    if let presented = base?.presentedViewController { return topMostController(base: presented) }
+    return base
+}

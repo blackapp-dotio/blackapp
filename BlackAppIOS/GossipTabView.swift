@@ -9,6 +9,8 @@ import AVKit
 import AVFoundation
 import UniformTypeIdentifiers
 
+
+
 // MARK: - UserPost Model with Comments
 
 struct UserPost: Identifiable {
@@ -37,7 +39,33 @@ struct UserPost: Identifiable {
     }
 }
 
-// MARK: - Wrapper for Mixed RSS + Post Feed (TOP-LEVEL)
+// MARK: - Avatar
+
+struct AvatarView: View {
+    let urlString: String?
+    var size: CGFloat = 36
+
+    var body: some View {
+        if let s = urlString, let url = URL(string: s) {
+            AsyncImage(url: url) { img in
+                img.resizable().scaledToFill()
+            } placeholder: {
+                Circle().fill(Color.gray.opacity(0.25))
+            }
+            .frame(width: size, height: size)
+            .clipShape(Circle())
+        } else {
+            // Fallback placeholder avatar
+            Circle()
+                .fill(Color.gray.opacity(0.25))
+                .overlay(Image(systemName: "person.fill")
+                    .foregroundColor(.white.opacity(0.85)))
+                .frame(width: size, height: size)
+        }
+    }
+}
+
+// MARK: - Wrapper for Mixed RSS + Post Feed
 
 struct AnyIdentifiablePost: Identifiable {
     let timestamp: TimeInterval
@@ -51,7 +79,7 @@ struct AnyIdentifiablePost: Identifiable {
     }
 }
 
-// MARK: - Cache DTOs (Codable) — safe to persist
+// MARK: - Cache DTOs
 
 private struct CachedUserPost: Codable {
     struct Cmt: Codable { let id: String; let userId: String; let text: String; let timestamp: TimeInterval }
@@ -61,7 +89,7 @@ private struct CachedUserPost: Codable {
     let comments: [Cmt]
 }
 
-private struct CachedRSSArticle: Codable {
+private struct CachedGossipArticle: Codable {
     let title: String
     let link: String
     let description: String
@@ -70,24 +98,50 @@ private struct CachedRSSArticle: Codable {
     let videoURL: String?
 }
 
-// MARK: - GossipTabView (TOP-LEVEL)
+// MARK: - Gossip Article
+
+struct GossipArticle: Identifiable, Hashable {
+    let id: String = UUID().uuidString
+    let title: String
+    let link: String
+    let description: String
+    let pubDate: Date
+    let imageURL: URL?
+    let videoURL: URL?
+}
+
+// MARK: - Feed Source
+
+enum FeedKind { case nightlife, news }
+
+struct FeedSource: Hashable {
+    let url: String
+    let kind: FeedKind
+    let maxItems: Int
+}
+
+// MARK: - GossipTabView
 
 struct GossipTabView: View {
-    // MARK: Post-related state
-    @State private var rssArticles: [RSSArticle] = []
+    // Posts
     @State private var userPosts: [UserPost] = []
     @State private var combinedFeed: [AnyIdentifiablePost] = []
+    @State private var rssArticles: [GossipArticle] = []
+
+    // Composer
     @State private var newPostText: String = ""
     @State private var editingPostId: String? = nil
     @State private var selectedImage: UIImage? = nil
     @State private var selectedVideoURL: URL? = nil
-    @State private var selectedMediaType: ImagePicker.MediaType? = nil // .image or .video
+    @State private var selectedMediaType: ImagePicker.MediaType? = nil
+    @FocusState private var composerFocused: Bool
+
+    // Tags
     @State private var trendingTags: [String] = []
     @State private var showAllTags = false
     @State private var selectedTagFilter: String? = nil
-    @FocusState private var composerFocused: Bool
 
-    // MARK: UI state
+    // UI
     @State private var selectedURL: URL? = nil
     @State private var showWebView = false
     @State private var showImagePicker = false
@@ -98,18 +152,18 @@ struct GossipTabView: View {
     @State private var isUploading: Bool = false
     @State private var posting: Bool = false
 
-    // MARK: Infinite scroll (append in batches of 5)
+    // Paging
     @State private var loadingMore: Bool = false
     @State private var visibleCount: Int = 5
     private let batchSize: Int = 5
     private let throttler = Throttler()
 
-    // MARK: Cache locations
+    // Cache
     private var cacheDir: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first! }
     private var postsCacheURL: URL { cacheDir.appendingPathComponent("gossip_user_posts.json") }
     private var rssCacheURL: URL { cacheDir.appendingPathComponent("gossip_rss_articles.json") }
 
-    // MARK: Optional proxy (safe to ignore on iOS)
+    // Optional proxy (unchanged)
     private let proxyBase = "https://us-central1-wakandan-app.cloudfunctions.net/api/proxy?url="
     private func proxiedImageURL(_ imageUrl: String?) -> URL? {
         guard let raw = imageUrl, !raw.isEmpty else { return nil }
@@ -117,48 +171,50 @@ struct GossipTabView: View {
         return URL(string: proxyBase + encoded)
     }
 
-    // MARK: RSS URLs (merged + de-duped)
-    private let rssFeedURLs: [String] = [
-        "https://swayafrica.com/category/Entertainment/feed/",
-        "https://rss.app/feeds/MDlghVUX5yvecvRG.xml",
-        "https://rss.app/feeds/wlHd9RRJ1VuDYpHX.xml/",
-        "https://blackculture.com/news/rss/category/arts_and_entertainment",
-        "https://media.rss.com/afrosinthediaspora/feed.xml",
-        "https://digitalcollections.sit.edu/african_diaspora_research/announcements.html",
-        "https://theshaderoom.com/latest-tea/feed/",
-        "https://rss.app/feeds/hXAXAKLk6J0sbRX0.xml",
-        "https://rss.app/feeds/a0BC3EgcQ2gi6jt9.xml",
-        "https://www.pulse.ng/entertainment/rss",
-        "https://www.theafricanmirror.africa/arts-and-entertainment/feed/",
-        "https://www.africanexponent.com/rss/entertainment",
-        "https://www.okayafrica.com/music/rss/",
-        "https://celebrity.nine.com.au/rss",
-        "https://www.allabouttrh.com/feed/",
-        "https://bckonline.com/feed/",
-        "https://balleralert.com/feed/",
-        "https://rss.app/feeds/nsmT2WdQXSlshmcy.xml",
-        "https://rss.app/feeds/XqrrnyuiP2E5gvZY.xml",
-        "https://rss.app/feeds/Vgjdsm6FBHT3mj4G.xml",
-        "https://www.buzzfeed.com/celebrity.xml",
-        "https://rss.app/feeds/3zTVOBAND5ezpD5g.xml",
-        "https://sahiphopmag.co.za/feed/",
-        "https://naijavibes.com/feed/",
-        "https://tooxclusive.com/feed/",
-        "https://www.ghanacelebrities.com/feed/",
-        "https://theblackmedia.org/feed/",
-        "https://afro.com/section/arts-entertainment/feed/",
-        "https://globalgrind.com/category/entertainment/feed/",
-        "https://www.thesouthafrican.com/culture/entertainment/",
-        "https://rss.app/feeds/keM7mXLp4OlutaGg.xml",
-        "https://rss.app/feeds/KwsTlmbvwXiY4YX6.xml",
-        "https://rss.app/feeds/fQ6cY8V57Sk5ayox.xml"
+    // MARK: Sources — 100% Afro‑diaspora; nightlife‑leaning (~80% nightlife, ~20% news)
+    private var nightlifeFeeds: [FeedSource] = [
+        .init(url: "https://www.bellanaija.com/category/events/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "https://www.dancehallmag.com/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "https://urbanislandz.com/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "https://notjustok.com/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "https://naijavibes.com/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "https://tooxclusive.com/feed/", kind: .nightlife, maxItems: 3),
+        .init(url: "http://www.okayafrica.com/feeds/music.rss", kind: .nightlife, maxItems: 2),
+        .init(url: "https://www.thesouthafrican.com/culture/entertainment/feed/", kind: .nightlife, maxItems: 2),
+        .init(url: "https://www.largeup.com/feed/", kind: .nightlife, maxItems: 2),
+        .init(url: "https://thesource.com/feed/", kind: .nightlife, maxItems: 2)
     ]
-    .reduce(into: [String]()) { acc, u in if !acc.contains(u) { acc.append(u) } }
 
-    // MARK: Body
+    private var newsFeeds: [FeedSource] = [
+        .init(url: "https://allafrica.com/tools/headlines/rdf/entertainment/headlines.rdf", kind: .news, maxItems: 2),
+        .init(url: "https://www.africanews.com/feed/rss", kind: .news, maxItems: 2),
+        .init(url: "https://www.bellanaija.com/feed/", kind: .news, maxItems: 2),
+        .init(url: "https://www.pulse.ng/entertainment/rss", kind: .news, maxItems: 2)
+    ]
+
+    private var weightedFeedOrder: [FeedSource] {
+        var ordered: [FeedSource] = []
+        var n = nightlifeFeeds, e = newsFeeds
+        var ni = 0, ei = 0
+        while ni < n.count || ei < e.count {
+            for _ in 0..<4 where ni < n.count { ordered.append(n[ni]); ni += 1 }
+            if ei < e.count { ordered.append(e[ei]); ei += 1 }
+        }
+        return ordered
+    }
+
+    private let nightlifeKeywords: [String] = [
+        "party","nightlife","club","lounge","dj","soundsystem","sound system","mixtape","set",
+        "concert","live","show","tour","gig","festival","rave","block party","afterparty",
+        "dancefloor","dance floor","dance","stage","arena","hall","stadium","tickets","doors","hosted by"
+    ]
+
+    private let rssTimeout: TimeInterval = 3.5
+    private let perChunkParallelism = 3
 
     var body: some View {
         VStack(spacing: 0) {
+            EmailVerificationBanner()
             TopToolbarView(
                 onLogoTap: { reloadContent() },
                 onSearchTap: {
@@ -168,24 +224,39 @@ struct GossipTabView: View {
                 }
             )
 
-            // Composer
+            // MARK: Composer — uses your working placeholder, but one-line then expands
             VStack(spacing: 8) {
+                // Decide if editor should expand (focus, media, or non-empty text)
+                let expanded = composerFocused
+                    || selectedMediaType != nil
+                    || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
                 ZStack(alignment: .topLeading) {
+                    // TextEditor MUST be first so the placeholder can overlay it (like your original)
                     TextEditor(text: $newPostText)
                         .focused($composerFocused)
-                        .frame(minHeight: 60, maxHeight: 140)
+                        // one-line collapsed (36), expands when focused/has text/has media
+                        .frame(
+                            minHeight: (composerFocused
+                                        || selectedMediaType != nil
+                                        || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 88 : 36,
+                            maxHeight: (composerFocused
+                                        || selectedMediaType != nil
+                                        || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 140 : 36
+                        )
                         .padding(8)
                         .foregroundColor(.white)
                         .background(Color(.systemGray6).opacity(0.18))
                         .cornerRadius(10)
-                        // Dismiss keyboard when the last character typed is Return
+                        // your original "Return to dismiss" behavior
                         .onChange(of: newPostText) { newVal in
                             guard newVal.last == "\n" else { return }
                             newPostText = newVal.trimmingCharacters(in: .newlines)
                             composerFocused = false
                         }
 
-                    if newPostText.isEmpty {
+                    // Placeholder must be AFTER the TextEditor so it sits above it (your original approach)
+                    if newPostText.isEmpty && selectedMediaType == nil {
                         Text(editingPostId == nil ? "What’s the gist? (use #tags)" : "Editing post...")
                             .foregroundColor(.white.opacity(0.6))
                             .padding(.top, 14)
@@ -193,8 +264,9 @@ struct GossipTabView: View {
                             .allowsHitTesting(false)
                     }
                 }
+                .animation(.easeInOut(duration: 0.15), value: composerFocused || selectedMediaType != nil || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                // Media preview (kept simple to avoid heavy type-checking)
+                // Media preview (unchanged)
                 if let type = selectedMediaType {
                     if type == .image, let img = selectedImage {
                         Image(uiImage: img)
@@ -209,7 +281,7 @@ struct GossipTabView: View {
                     }
                 }
 
-                // Buttons
+                // Buttons (unchanged)
                 HStack(spacing: 16) {
                     Button(action: { showImagePicker = true }) {
                         Image(systemName: "photo.on.rectangle")
@@ -218,7 +290,6 @@ struct GossipTabView: View {
                             .foregroundColor(.white)
                             .clipShape(Circle())
                     }
-
                     Button(action: {
                         if let id = editingPostId {
                             updatePost(id)
@@ -237,7 +308,7 @@ struct GossipTabView: View {
             }
             .padding(.horizontal)
             .padding(.top, 8)
-            .toolbar { // keyboard accessory
+            .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Done") { composerFocused = false }
@@ -293,7 +364,7 @@ struct GossipTabView: View {
                 }
             }
 
-            // Feed (append in batches of 5)
+            // Feed
             Group {
                 if isLoading {
                     VStack {
@@ -306,7 +377,7 @@ struct GossipTabView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 14) {
-                            let page = Array(pagedSlice(of: combinedFeed))
+                            let page: [AnyIdentifiablePost] = Array(pagedSlice(of: combinedFeed))
                             ForEach(page, id: \.id) { item in
                                 item.view($selectedURL, $showWebView)
                                     .onAppear {
@@ -329,13 +400,11 @@ struct GossipTabView: View {
         .background(Color.black)
         .preferredColorScheme(.dark)
         .onAppear {
-            // 1) Show cached content instantly (if available)
-            loadCache()
-            // 2) Then refresh from network/backends
-            reloadContent()
+            loadCache()        // instant paint
+            reloadContent()    // refresh
         }
         .sheet(isPresented: $showWebView) {
-            if let url = selectedURL { WebView(url: url) }
+            if let url = selectedURL { GossipWebView(url: url) }
         }
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(
@@ -361,8 +430,9 @@ struct GossipTabView: View {
         }
     }
 
-    // Async export/compress to MP4 (medium quality). Falls back to original if export fails.
-    func exportVideoIfNeeded(inputURL: URL) async throws -> URL {
+    // MARK: - Video export & image write
+
+    private func exportVideoIfNeeded(inputURL: URL) async throws -> URL {
         let asset = AVAsset(url: inputURL)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetMediumQuality) else {
             return inputURL
@@ -378,19 +448,15 @@ struct GossipTabView: View {
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
             session.exportAsynchronously {
                 switch session.status {
-                case .completed:
-                    cont.resume(returning: outURL)
-                case .failed, .cancelled:
-                    cont.resume(returning: inputURL) // use original if export fails
-                default:
-                    cont.resume(returning: inputURL)
+                case .completed: cont.resume(returning: outURL)
+                case .failed, .cancelled: cont.resume(returning: inputURL)
+                default: cont.resume(returning: inputURL)
                 }
             }
         }
     }
 
-    // Write UIImage to temp as JPEG (async) to avoid big main-thread work
-    func writeImageToTemp(_ image: UIImage, quality: CGFloat = 0.85) throws -> URL {
+    private func writeImageToTemp(_ image: UIImage, quality: CGFloat = 0.85) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("jpg")
@@ -401,8 +467,7 @@ struct GossipTabView: View {
         return url
     }
 
-    // Simple async wrapper around Firebase Storage putFile
-    func uploadFileURL(_ localURL: URL, path: String, contentType: String? = nil) async throws -> String {
+    private func uploadFileURL(_ localURL: URL, path: String, contentType: String? = nil) async throws -> String {
         let ref = Storage.storage().reference().child(path)
         let meta = StorageMetadata()
         meta.contentType = contentType
@@ -420,12 +485,13 @@ struct GossipTabView: View {
 
     // MARK: - CRUD + Comments + Likes + Share
 
-    func reloadContent() {
-        fetchFeedsInChunks()
+    private func reloadContent() {
+        isLoading = combinedFeed.isEmpty
+        fetchFeedsWeighted()
         fetchUserPosts()
     }
 
-    func postToFirebase() {
+    private func postToFirebase() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
 
         posting = true
@@ -438,20 +504,16 @@ struct GossipTabView: View {
 
                 if selectedMediaType == .video, let inputURL = selectedVideoURL {
                     var needsStop = false
-                    if inputURL.startAccessingSecurityScopedResource() {
-                        needsStop = true
-                    }
+                    if inputURL.startAccessingSecurityScopedResource() { needsStop = true }
                     defer { if needsStop { inputURL.stopAccessingSecurityScopedResource() } }
 
                     let exportedURL = try await exportVideoIfNeeded(inputURL: inputURL)
                     let storagePath = "posts/\(uid)/videos/\(UUID().uuidString).mp4"
                     mediaURLString = try await uploadFileURL(exportedURL, path: storagePath, contentType: "video/mp4")
                     mediaTypeString = "video"
-
                     if exportedURL.path.contains(FileManager.default.temporaryDirectory.path) {
                         try? FileManager.default.removeItem(at: exportedURL)
                     }
-
                 } else if selectedMediaType == .image, let image = selectedImage {
                     let tempURL = try writeImageToTemp(image, quality: 0.85)
                     let storagePath = "posts/\(uid)/images/\(UUID().uuidString).jpg"
@@ -460,7 +522,6 @@ struct GossipTabView: View {
                     try? FileManager.default.removeItem(at: tempURL)
                 }
 
-                // Build post payload
                 let postId = UUID().uuidString
                 let now = Date().timeIntervalSince1970
                 var payload: [String: Any] = [
@@ -472,10 +533,7 @@ struct GossipTabView: View {
                 if let murl = mediaURLString { payload["mediaURL"] = murl }
                 if let mtype = mediaTypeString { payload["mediaType"] = mtype }
 
-                // Write DB (Realtime Database — adjust path if needed)
-                let ref = Database.database().reference()
-                    .child("posts")
-                    .child(postId)
+                let ref = Database.database().reference().child("posts").child(postId)
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     ref.setValue(payload) { error, _ in
                         if let error = error { return cont.resume(throwing: error) }
@@ -483,7 +541,6 @@ struct GossipTabView: View {
                     }
                 }
 
-                // Update UI on main
                 await MainActor.run {
                     let newItem = UserPost(
                         id: postId,
@@ -518,14 +575,14 @@ struct GossipTabView: View {
         }
     }
 
-    func updatePost(_ id: String) {
+    private func updatePost(_ id: String) {
         let ref = Database.database().reference().child("posts").child(id)
         ref.updateChildValues(["text": newPostText]) { _, _ in
             resetPostFields()
         }
     }
 
-    func resetPostFields() {
+    private func resetPostFields() {
         newPostText = ""
         selectedImage = nil
         selectedVideoURL = nil
@@ -534,13 +591,13 @@ struct GossipTabView: View {
         fetchUserPosts()
     }
 
-    func deletePost(_ post: UserPost) {
+    private func deletePost(_ post: UserPost) {
         Database.database().reference()
             .child("posts").child(post.id)
             .removeValue { _, _ in fetchUserPosts() }
     }
 
-    func postComment(to post: UserPost) {
+    private func postComment(to post: UserPost) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference()
             .child("comments").child(post.id).childByAutoId()
@@ -551,7 +608,7 @@ struct GossipTabView: View {
         ]) { _, _ in resetPostFields() }
     }
 
-    func toggleLike(for id: String) {
+    private func toggleLike(for id: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let r = Database.database().reference().child("likes").child(id).child(uid)
         r.observeSingleEvent(of: .value) { snap in
@@ -560,18 +617,18 @@ struct GossipTabView: View {
         }
     }
 
-    func sharePost(_ post: UserPost) {
+    private func sharePost(_ post: UserPost) {
         guard let root = UIApplication.shared.windows.first?.rootViewController else { return }
         root.present(UIActivityViewController(activityItems: [post.text], applicationActivities: nil), animated: true)
     }
 
-    func shareArticle(_ article: RSSArticle) {
+    private func shareArticle(_ article: GossipArticle) {
         guard let url = URL(string: article.link),
               let root = UIApplication.shared.windows.first?.rootViewController else { return }
         root.present(UIActivityViewController(activityItems: [url], applicationActivities: nil), animated: true)
     }
 
-    func updateTrendingTags() {
+    private func updateTrendingTags() {
         var tagCount: [String: Int] = [:]
         for post in userPosts {
             for tag in extractHashtags(from: post.text) { tagCount[tag, default: 0] += 1 }
@@ -580,52 +637,12 @@ struct GossipTabView: View {
             let combined = "\(article.title) \(article.description)"
             for tag in extractHashtags(from: combined) { tagCount[tag, default: 0] += 1 }
         }
-        trendingTags = Array(tagCount.sorted { $0.value > $1.value }.prefix(10).map { "#\($0.key)" })
+        trendingTags = Array(tagCount.sorted { $0.value > $1.value }.prefix(showAllTags ? 24 : 10).map { "#\($0.key)" })
     }
 
-    /// Ensure we have a readable, local file URL (mp4) ready for upload.
-    /// Handles ph:// assets, security-scoped URLs, and transcodes to mp4 if needed.
-    private func preparedVideoFileURL(from inputURL: URL, completion: @escaping (URL?) -> Void) {
-        func isReadableFile(_ url: URL) -> Bool {
-            return url.isFileURL && FileManager.default.isReadableFile(atPath: url.path)
-        }
-        if isReadableFile(inputURL), inputURL.pathExtension.lowercased() == "mp4" {
-            completion(inputURL)
-            return
-        }
-        var didStartAccess = false
-        if inputURL.startAccessingSecurityScopedResource() {
-            didStartAccess = true
-        }
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        let outURL = tmp.appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
-        let asset = AVURLAsset(url: inputURL)
-        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
-            print("❌ AVAssetExportSession unavailable")
-            if didStartAccess { inputURL.stopAccessingSecurityScopedResource() }
-            completion(nil)
-            return
-        }
-        session.outputURL = outURL
-        session.outputFileType = .mp4
-        session.shouldOptimizeForNetworkUse = true
-        session.exportAsynchronously {
-            if didStartAccess { inputURL.stopAccessingSecurityScopedResource() }
-            switch session.status {
-            case .completed:
-                completion(outURL)
-            case .failed, .cancelled:
-                print("❌ Video export failed: \(session.error?.localizedDescription ?? "unknown error")")
-                completion(nil)
-            default:
-                completion(nil)
-            }
-        }
-    }
+    // MARK: - User Posts + Profiles
 
-    // MARK: - Fetch User Posts + Likes + Comments
-
-    func fetchUserPosts(limit: UInt = 10) {
+    private func fetchUserPosts(limit: UInt = 10) {
         let pRef = Database.database().reference().child("posts")
         let lRef = Database.database().reference().child("likes")
         let cRef = Database.database().reference().child("comments")
@@ -692,84 +709,171 @@ struct GossipTabView: View {
                             }
                         }
 
-                        // Save posts cache whenever we update posts
                         savePostsCache()
                     }
                 }
             }
     }
 
-    // MARK: - Optimized Fetch RSS Articles in Chunks
+    // MARK: - Fast/Weighted RSS Fetch (+nightlife classifier & media requirement)
 
-    func fetchFeedsInChunks(chunkSize: Int = 3) {
-        Task {
-            let chunks = chunkedArray(rssFeedURLs, size: chunkSize)
-            for c in chunks {
-                var chunkArticles: [RSSArticle] = []
+    private func fetchFeedsWeighted() {
+        Task.detached(priority: .userInitiated) {
+            let all = weightedFeedOrder
+            let chunks = chunkedArray(all, size: perChunkParallelism)
+            for group in chunks {
+                var groupArticles: [GossipArticle] = []
 
-                await withTaskGroup(of: [RSSArticle].self) { group in
-                    for url in c { group.addTask { await fetchFeed(urlString: url) } }
-                    for await articles in group { chunkArticles.append(contentsOf: articles) }
+                await withTaskGroup(of: [GossipArticle].self) { tg in
+                    for feed in group {
+                        tg.addTask { await fetchFeed(urlString: feed.url, limit: feed.maxItems, expectedKind: feed.kind) }
+                    }
+                    for await arts in tg { groupArticles.append(contentsOf: arts) }
                 }
 
                 await MainActor.run {
-                    let existingTitles = Set(rssArticles.map { $0.title })
-                    let filtered = chunkArticles.filter { !existingTitles.contains($0.title) }
-                    rssArticles.append(contentsOf: filtered)
+                    let existingLinks = Set(rssArticles.map { $0.link })
+                    let fresh = groupArticles.filter { !existingLinks.contains($0.link) }
+
+                    rssArticles.append(contentsOf: fresh)
+                    rssArticles = enforceMix(rssArticles) // keep 80/20 bias
+
                     mergeContent()
                     saveRSSCache()
+                    isLoading = false
                 }
-            }
-
-            await MainActor.run {
-                if combinedFeed.isEmpty { isLoading = false } else { isLoading = false }
             }
         }
     }
 
-    func fetchFeed(urlString: String) async -> [RSSArticle] {
+    private func enforceMix(_ items: [GossipArticle]) -> [GossipArticle] {
+        let nightlife = items.filter { isNightlife($0) }
+        let news      = items.filter { !isNightlife($0) }
+        let total = max(items.count, 1)
+        let maxNight = Int(Double(total) * 0.8)
+        let maxNews  = Int(Double(total) * 0.2)
+        let nightSlice = Array(nightlife.sorted { $0.pubDate > $1.pubDate }.prefix(maxNight))
+        let newsSlice  = Array(news.sorted { $0.pubDate > $1.pubDate }.prefix(maxNews))
+        return (nightSlice + newsSlice).sorted { $0.pubDate > $1.pubDate }
+    }
+
+    private func isNightlife(_ a: GossipArticle) -> Bool {
+        let hay = (a.title + " " + a.description).lowercased()
+        return nightlifeKeywords.contains { kw in hay.contains(kw) }
+    }
+
+    private func makeSession() -> URLSession {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.timeoutIntervalForRequest = rssTimeout
+        cfg.timeoutIntervalForResource = rssTimeout
+        return URLSession(configuration: cfg)
+    }
+
+    private func fetchFeed(urlString: String, limit: Int = 3, expectedKind: FeedKind) async -> [GossipArticle] {
         guard let url = URL(string: urlString) else { return [] }
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let result = try FeedParser(data: data).parse()
-            guard case .success(let feed) = result else { return [] }
-            let items = feed.rssFeed?.items ?? []
+            let session = makeSession()
+            let (data, _) = try await session.data(from: url)
 
-            return items.prefix(3).compactMap { item -> RSSArticle? in
-                guard let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      let link = item.link,
-                      let pubDate = item.pubDate else { return nil }
-
-                let desc = extractPlainText(from: item.description ?? "")
-
-                let enclosureURL = item.enclosure?.attributes?.url
-                let mimeType = item.enclosure?.attributes?.type ?? ""
-                let isVideo = mimeType.contains("video")
-
-                let videoURL = isVideo ? enclosureURL.flatMap(URL.init) : nil
-
-                var imageURL: URL? = nil
-                if !isVideo {
-                    if let urlStr = enclosureURL, let valid = URL(string: urlStr) { imageURL = valid }
-                    else if let fallback = extractImageURL(from: item.description ?? ""), let valid = URL(string: fallback) { imageURL = valid }
+            let parser = FeedParser(data: data)
+            switch parser.parse() {
+            case .success(let feed):
+                var articles: [GossipArticle] = []
+                if let rss = feed.rssFeed {
+                    articles = (rss.items ?? []).compactMap { mapRSSItem($0) }
+                } else if let atom = feed.atomFeed {
+                    articles = (atom.entries ?? []).compactMap { mapAtomEntry($0) }
+                } else if let rdf = feed.rssFeed {
+                    articles = (rdf.items ?? []).compactMap { mapRSSItem($0) }
                 }
 
-                return RSSArticle(
-                    title: title,
-                    link: link,
-                    description: desc,
-                    pubDate: pubDate,
-                    imageURL: imageURL,
-                    videoURL: videoURL
-                )
+                // Require image or video for external items
+                articles = articles.filter { $0.imageURL != nil || $0.videoURL != nil }
+
+                // Bias to expected kind while honoring limit
+                if expectedKind == .nightlife {
+                    let nl = articles.filter { isNightlife($0) }
+                    let non = articles.filter { !isNightlife($0) }
+                    return Array((nl + non).prefix(limit))
+                } else {
+                    let non = articles.filter { !isNightlife($0) }
+                    let nl = articles.filter { isNightlife($0) }
+                    return Array((non + nl).prefix(limit))
+                }
+            case .failure:
+                return []
             }
         } catch {
-            print("❌ Error fetching/parsing \(urlString): \(error.localizedDescription)")
+            print("❌ Error fetching \(urlString): \(error.localizedDescription)")
             return []
         }
     }
 
-    func extractImageURL(from html: String) -> String? {
+    private func mapRSSItem(_ item: RSSFeedItem) -> GossipArticle? {
+        guard
+            let title = item.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+            let link = item.link
+        else { return nil }
+
+        let pub = item.pubDate ?? item.dublinCore?.dcDate ?? Date()
+        let descHTML = item.description ?? item.content?.contentEncoded ?? ""
+        let desc = extractPlainText(from: descHTML)
+
+        let enclosureURL = item.enclosure?.attributes?.url
+        let mimeType = item.enclosure?.attributes?.type ?? ""
+        let isVideo = mimeType.contains("video")
+
+        var imageURL: URL? = nil
+        var videoURL: URL? = nil
+
+        if isVideo, let v = enclosureURL, let vURL = URL(string: v) {
+            videoURL = vURL
+        } else {
+            if let e = enclosureURL, let u = URL(string: e) { imageURL = u }
+            else if let media = item.media?.mediaThumbnails?.first?.attributes?.url, let u = URL(string: media) { imageURL = u }
+            else if let mediaC = item.media?.mediaContents?.first?.attributes?.url, let u = URL(string: mediaC) { imageURL = u }
+            else if let fallback = extractImageURL(from: descHTML), let u = URL(string: fallback) { imageURL = u }
+        }
+
+        if imageURL == nil && videoURL == nil { return nil }
+
+        return GossipArticle(
+            title: title,
+            link: link,
+            description: desc,
+            pubDate: pub,
+            imageURL: imageURL,
+            videoURL: videoURL
+        )
+    }
+
+    private func mapAtomEntry(_ entry: AtomFeedEntry) -> GossipArticle? {
+        let title = (entry.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        let link = entry.links?.first?.attributes?.href ?? ""
+        guard !link.isEmpty else { return nil }
+        let pub = entry.published ?? entry.updated ?? Date()
+        let descHTML = entry.summary?.value ?? entry.content?.value ?? ""
+        let desc = extractPlainText(from: descHTML)
+
+        var imageURL: URL? = nil
+        if let thumb = entry.media?.mediaThumbnails?.first?.attributes?.url, let u = URL(string: thumb) { imageURL = u }
+        else if let fallback = extractImageURL(from: descHTML), let u = URL(string: fallback) { imageURL = u }
+
+        if imageURL == nil { return nil }
+
+        return GossipArticle(
+            title: title,
+            link: link,
+            description: desc,
+            pubDate: pub,
+            imageURL: imageURL,
+            videoURL: nil
+        )
+    }
+
+    private func extractImageURL(from html: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: "<img[^>]+src=[\"']([^\"']+)[\"']",
                                                    options: .caseInsensitive),
               let match = regex.firstMatch(in: html, options: [], range: NSRange(location: 0, length: (html as NSString).length)),
@@ -777,41 +881,62 @@ struct GossipTabView: View {
         return (html as NSString).substring(with: match.range(at: 1))
     }
 
-    // MARK: - Combine and Render Posts
+    // MARK: - Combine & Render (STRICT ALTERNATION)
 
-    func mergeContent() {
-        let filteredRSS: [AnyIdentifiablePost] = rssArticles
-            .filter { article in
-                guard let tag = selectedTagFilter?.lowercased() else { return true }
-                return article.title.lowercased().contains(tag) || article.description.lowercased().contains(tag)
+    private func mergeContent() {
+        // External (RSS) cards (media already enforced)
+        let rssCards: [AnyIdentifiablePost] = rssArticles
+            .filter { a in
+                (a.imageURL != nil || a.videoURL != nil)
+                && matchesSelectedTag("\(a.title) \(a.description)", selected: selectedTagFilter)
             }
-            .map { article in
-                AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.title) {
-                    Button(action: {
+            .sorted { $0.pubDate > $1.pubDate }
+            .map { (article: GossipArticle) in   // <- make it GossipArticle
+                AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.id) {
+                    Button {
                         selectedURL = URL(string: article.link)
                         showWebView = true
-                    }) {
-                        RSSCardView(article: article, selectedURL: $selectedURL, showWebView: $showWebView)
+                    } label: {
+                        GossipRSSCardView(                        // <- use the Gossip card
+                            article: article,
+                            selectedURL: $selectedURL,
+                            showWebView: $showWebView
+                        )
                     }
-                    .buttonStyle(PlainButtonStyle())
+                    .buttonStyle(.plain)
                 }
             }
 
-        let filteredUserPosts: [AnyIdentifiablePost] = userPosts
+        // User post cards (media optional)
+        let userCards: [AnyIdentifiablePost] = userPosts
             .filter { post in
-                guard let tag = selectedTagFilter?.lowercased() else { return true }
-                return post.text.lowercased().contains(tag)
+                matchesSelectedTag(post.text, selected: selectedTagFilter)
             }
+            .sorted { $0.timestamp > $1.timestamp }
             .map { post in
                 let profile = userProfiles[post.userId]
                 let displayName = profile?.name ?? "User"
 
                 return AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(displayName).foregroundColor(.white).font(.subheadline)
+
+                        // Header with avatar + name + timestamp
+                        HStack(alignment: .center, spacing: 10) {
+                            AvatarView(urlString: profile?.imageURL, size: 36)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(displayName)
+                                    .foregroundColor(.white)
+                                    .font(.subheadline).bold()
+                                Text(post.dateFormatted)
+                                    .font(.caption2)
+                                    .foregroundColor(.gray)
+                            }
+
                             Spacer()
                         }
+
+                        // Body text with tappable hashtags
                         TextWithHashtagsView(text: post.text) { tappedTag in
                             selectedTagFilter = tappedTag
                             mergeContent()
@@ -819,20 +944,29 @@ struct GossipTabView: View {
                         }
                         .padding(.vertical, 4)
 
+                        // Optional user media (allowed to be absent for user posts)
                         if let mediaURL = post.mediaURL, let url = URL(string: mediaURL) {
                             if post.mediaType == "video" {
-                                VideoPlayer(player: AVPlayer(url: url)).frame(height: 200).cornerRadius(10)
+                                VideoPlayer(player: AVPlayer(url: url))
+                                    .frame(height: 200)
+                                    .cornerRadius(10)
                             } else {
-                                AsyncImage(url: url) { img in img.resizable().scaledToFit() } placeholder: { ProgressView() }
-                                    .frame(maxHeight: 200).cornerRadius(10)
+                                AsyncImage(url: url) { img in
+                                    img.resizable().scaledToFill()
+                                } placeholder: {
+                                    ProgressView()
+                                }
+                                .frame(maxHeight: 200)
+                                .clipped()
+                                .cornerRadius(10)
                             }
                         }
 
-                        Text(post.dateFormatted).font(.caption).foregroundColor(.gray)
-
+                        // Footer actions
                         HStack(spacing: 20) {
                             Button(action: { toggleLike(for: post.id) }) {
-                                Image(systemName: "hand.thumbsup").foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
+                                Image(systemName: "hand.thumbsup")
+                                    .foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
                             }
                             Button(action: { commentTargetPost = post }) {
                                 Image(systemName: "bubble.right").foregroundColor(.gray)
@@ -851,11 +985,13 @@ struct GossipTabView: View {
                         }
                         .padding(.top, 4)
 
+                        // Comments
                         if !post.comments.isEmpty {
                             ForEach(post.comments) { c in
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(c.text).font(.caption).foregroundColor(.white)
-                                    Text(Date(timeIntervalSince1970: c.timestamp), style: .time).font(.caption2).foregroundColor(.gray)
+                                    Text(Date(timeIntervalSince1970: c.timestamp), style: .time)
+                                        .font(.caption2).foregroundColor(.gray)
                                 }
                                 .padding(.vertical, 2)
                             }
@@ -864,14 +1000,45 @@ struct GossipTabView: View {
                 }
             }
 
+        // Alternate strictly, starting with whichever is newest
+        let alternated = buildAlternating(user: userCards, external: rssCards)
+
         DispatchQueue.main.async {
             withAnimation {
-                combinedFeed = (filteredUserPosts + filteredRSS)
-                    .sorted { $0.timestamp > $1.timestamp }
+                combinedFeed = alternated
                 visibleCount = min(max(visibleCount, batchSize), combinedFeed.count)
                 if !combinedFeed.isEmpty { isLoading = false }
             }
         }
+    }
+
+    private enum NextPick { case user, external }
+
+    /// Strict alternation: start with the newest of the two heads, then alternate; append leftovers.
+    private func buildAlternating(user: [AnyIdentifiablePost], external: [AnyIdentifiablePost]) -> [AnyIdentifiablePost] {
+        var i = 0, j = 0
+        var out: [AnyIdentifiablePost] = []
+        guard !(user.isEmpty && external.isEmpty) else { return out }
+
+        // Decide who starts by comparing newest heads
+        let nextStart: NextPick = {
+            let uTs = user.first?.timestamp ?? -1
+            let eTs = external.first?.timestamp ?? -1
+            return (uTs >= eTs) ? .user : .external
+        }()
+
+        var next = nextStart
+        while i < user.count && j < external.count {
+            switch next {
+            case .user:
+                out.append(user[i]); i += 1; next = .external
+            case .external:
+                out.append(external[j]); j += 1; next = .user
+            }
+        }
+        if i < user.count { out.append(contentsOf: user[i...]) }
+        if j < external.count { out.append(contentsOf: external[j...]) }
+        return out
     }
 
     // MARK: - Paging
@@ -889,7 +1056,7 @@ struct GossipTabView: View {
         }
     }
 
-    // MARK: - Cache: Save / Load
+    // MARK: - Cache
 
     private func savePostsCache() {
         let toCache: [CachedUserPost] = userPosts.map { p in
@@ -907,7 +1074,7 @@ struct GossipTabView: View {
     }
 
     private func saveRSSCache() {
-        let toCache: [CachedRSSArticle] = rssArticles.map { a in
+        let toCache: [CachedGossipArticle] = rssArticles.map { a in
             .init(
                 title: a.title, link: a.link, description: a.description,
                 pubDate: a.pubDate.timeIntervalSince1970,
@@ -922,13 +1089,13 @@ struct GossipTabView: View {
     }
 
     private func loadCache() {
-        var cachedRSS: [RSSArticle] = []
+        var cachedRSS: [GossipArticle] = []
         var cachedPosts: [UserPost] = []
 
         if let data = try? Data(contentsOf: rssCacheURL),
-           let arr = try? JSONDecoder().decode([CachedRSSArticle].self, from: data) {
+           let arr = try? JSONDecoder().decode([CachedGossipArticle].self, from: data) {
             cachedRSS = arr.map {
-                RSSArticle(
+                GossipArticle(
                     title: $0.title,
                     link: $0.link,
                     description: $0.description,
@@ -953,34 +1120,34 @@ struct GossipTabView: View {
         }
 
         if !cachedRSS.isEmpty || !cachedPosts.isEmpty {
-            rssArticles = cachedRSS
+            rssArticles = enforceMix(cachedRSS)
             userPosts = cachedPosts
             mergeContent()
             resetPaging()
-            isLoading = false // show cached immediately
+            isLoading = false
         }
     }
 
     // MARK: - Helpers
 
-    func extractHashtags(from text: String) -> [String] {
+    private func extractHashtags(from text: String) -> [String] {
         let regex = try? NSRegularExpression(pattern: "#(\\w+)", options: [])
         let matches = regex?.matches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count)) ?? []
         return matches.compactMap { Range($0.range(at: 1), in: text).map { String(text[$0]).lowercased() } }
     }
 
-    func extractPlainText(from html: String) -> String {
+    private func extractPlainText(from html: String) -> String {
         guard let data = html.data(using: .utf8) else {
-            return html.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            return html.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
             .documentType: NSAttributedString.DocumentType.html,
             .characterEncoding: String.Encoding.utf8.rawValue
         ]
         if let attributed = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-            return attributed.string.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            return attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
-            return html.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            return html.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 
@@ -995,6 +1162,32 @@ struct GossipTabView: View {
         }
         return res
     }
+}
+
+// Extract lowercase hashtags (without the leading '#') from any text
+private func extractHashtags(from text: String) -> [String] {
+    let pattern = "#(\\w+)"
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
+    let ns = text as NSString
+    let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+    return matches.compactMap { match in
+        guard match.numberOfRanges > 1 else { return nil }
+        let range = match.range(at: 1)
+        guard range.location != NSNotFound else { return nil }
+        return ns.substring(with: range).lowercased()
+    }
+}
+
+// Tag/category matching without CMTag/CMTypedTag
+private func matchesSelectedTag(_ text: String, selected: String?) -> Bool {
+    guard let selected = selected?
+        .lowercased()
+        .trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+    else { return true } // no filter → match all
+
+    let tags = extractHashtags(from: text) // already lowercase
+    if tags.contains(selected) { return true }
+    return text.lowercased().contains(selected)
 }
 
 // MARK: - Hashtag text renderer
@@ -1043,5 +1236,98 @@ private final class Throttler {
         let item = DispatchWorkItem { [weak self] in action(); self?.workItems[key] = nil }
         workItems[key] = item
         queue.asyncAfter(deadline: .now() + interval, execute: item)
+    }
+}
+
+// MARK: - Card + WebView
+
+struct GossipRSSCardView: View {
+    let article: GossipArticle
+    @Binding var selectedURL: URL?
+    @Binding var showWebView: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let imgURL = article.imageURL {
+                AsyncImage(url: imgURL) { phase in
+                    switch phase {
+                    case .empty:
+                        ZStack { Rectangle().fill(Color.gray.opacity(0.2)); ProgressView() }
+                            .frame(height: 180)
+                            .cornerRadius(12)
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                            .frame(height: 180).clipped()
+                            .cornerRadius(12)
+                    case .failure(_):
+                        Rectangle().fill(Color.gray.opacity(0.2))
+                            .frame(height: 180)
+                            .cornerRadius(12)
+                    @unknown default:
+                        Rectangle().fill(Color.gray.opacity(0.2))
+                            .frame(height: 180)
+                            .cornerRadius(12)
+                    }
+                }
+            } else if let v = article.videoURL {
+                VideoPlayer(player: AVPlayer(url: v))
+                    .frame(height: 200)
+                    .cornerRadius(12)
+            }
+
+            Text(article.title)
+                .font(.headline)
+                .foregroundColor(.white)
+                .lineLimit(3)
+
+            Text(article.description)
+                .font(.subheadline)
+                .foregroundColor(.white.opacity(0.8))
+                .lineLimit(3)
+
+            HStack(spacing: 16) {
+                Button {
+                    selectedURL = URL(string: article.link)
+                    showWebView = true
+                } label: {
+                    Label("Open", systemImage: "safari")
+                }
+                .foregroundColor(.blue)
+
+                Button {
+                    if let url = URL(string: article.link),
+                       let root = UIApplication.shared.windows.first?.rootViewController {
+                        root.present(UIActivityViewController(activityItems: [url], applicationActivities: nil), animated: true)
+                    }
+                } label: {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+                .foregroundColor(.gray)
+            }
+            .font(.callout)
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(14)
+    }
+}
+
+struct GossipWebView: UIViewRepresentable {
+    let url: URL
+    func makeUIView(context: Context) -> WKWebView {
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        let cfg = WKWebViewConfiguration()
+        cfg.defaultWebpagePreferences = prefs
+        let wv = WKWebView(frame: .zero, configuration: cfg)
+        wv.allowsBackForwardNavigationGestures = true
+        wv.isOpaque = false
+        wv.backgroundColor = .black
+        return wv
+    }
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 6.0
+        webView.load(req)
     }
 }

@@ -3,6 +3,7 @@ import Firebase
 import FirebaseAuth
 import FirebaseDatabase
 import FirebaseFirestore
+import FirebaseFunctions       // ✅ needed for the callable
 import GoogleSignIn
 import OneSignalFramework
 
@@ -11,20 +12,25 @@ class AuthViewModel: ObservableObject {
     @Published var currentUser: User?
     
     // Optional helper for use in views
-    var currentUserId: String? {
-        return currentUser?.uid
-    }
+    var currentUserId: String? { currentUser?.uid }
+
+    // Cache Functions instance
+    private let functions = Functions.functions()
 
     init() {
         self.user = Auth.auth().currentUser
         self.currentUser = Auth.auth().currentUser
         migrateUsersFromRealtimeToFirestore()
 
-        Auth.auth().addStateDidChangeListener { _, user in
+        // Listen for auth state changes
+        Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            guard let self = self else { return }
             DispatchQueue.main.async {
                 self.currentUser = user
-                if user != nil {
+                if let _ = user {
                     OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+                    // ✅ Ensure defaults exist after any sign-in path
+                    self.seedUserDefaultsIfNeeded()
                 }
             }
         }
@@ -44,7 +50,13 @@ class AuthViewModel: ObservableObject {
     }
 
     // MARK: - Email Sign Up
-    func signUp(email: String, password: String, name: String, username: String, profileImageURL: String = "", completion: @escaping (Error?) -> Void) {
+    func signUp(email: String,
+                password: String,
+                name: String,
+                username: String,
+                profileImageURL: String = "",
+                completion: @escaping (Error?) -> Void)
+    {
         Auth.auth().createUser(withEmail: email, password: password) { result, error in
             guard let result = result, error == nil else {
                 DispatchQueue.main.async { completion(error) }
@@ -53,19 +65,23 @@ class AuthViewModel: ObservableObject {
             
             let uid = result.user.uid
             self.user = result.user
-            
+
+            // Seed minimal profile in RTDB + Firestore (also include defaults—harmless if callable runs too)
             let userData: [String: Any] = [
                 "name": name,
                 "username": username,
-                "profileImageURL": profileImageURL
+                "profileImageURL": profileImageURL,
+                "circleSize": 0,
+                "badgeTier": "white"
             ]
-            
-            Database.database().reference().child("users").child(uid).setValue(userData)
-            Firestore.firestore().collection("users").document(uid).setData(userData)
-            
+            Database.database().reference().child("users").child(uid).updateChildValues(userData)
+            Firestore.firestore().collection("users").document(uid).setData(userData, merge: true)
+
             DispatchQueue.main.async {
                 self.currentUser = result.user
                 OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+                // ✅ Also call callable to guarantee defaults server-side
+                self.seedUserDefaultsIfNeeded()
                 completion(nil)
             }
         }
@@ -79,6 +95,8 @@ class AuthViewModel: ObservableObject {
                     self.user = result.user
                     self.currentUser = result.user
                     OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+                    // ✅ Ensure defaults
+                    self.seedUserDefaultsIfNeeded()
                 }
                 completion(error)
             }
@@ -97,9 +115,7 @@ class AuthViewModel: ObservableObject {
         
         GIDSignIn.sharedInstance.signIn(withPresenting: presentingVC) { result, error in
             if let error = error {
-                DispatchQueue.main.async {
-                    completion(error)
-                }
+                DispatchQueue.main.async { completion(error) }
                 return
             }
             
@@ -122,18 +138,22 @@ class AuthViewModel: ObservableObject {
                         
                         let uid = user.uid
                         let name = user.displayName ?? "Unnamed"
-                        let username = user.email?.components(separatedBy: "@").first ?? uid.prefix(6).description
+                        let username = user.email?.components(separatedBy: "@").first ?? String(uid.prefix(6))
                         let profileImageURL = user.photoURL?.absoluteString ?? ""
                         
                         let userData: [String: Any] = [
                             "name": name,
                             "username": username,
-                            "profileImageURL": profileImageURL
+                            "profileImageURL": profileImageURL,
+                            "circleSize": 0,
+                            "badgeTier": "white"
                         ]
-                        
-                        Database.database().reference().child("users").child(uid).setValue(userData)
-                        Firestore.firestore().collection("users").document(uid).setData(userData)
+                        Database.database().reference().child("users").child(uid).updateChildValues(userData)
+                        Firestore.firestore().collection("users").document(uid).setData(userData, merge: true)
+
                         OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+                        // ✅ Ensure defaults on server too
+                        self.seedUserDefaultsIfNeeded()
                     }
                     completion(error)
                 }
@@ -141,7 +161,22 @@ class AuthViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Realtime to Firestore Migration
+    // MARK: - Callable: ensureUserDefaults
+    /// Calls the Cloud Function `ensureUserDefaults` to guarantee `circleSize` and `badgeTier` exist server-side.
+    private func seedUserDefaultsIfNeeded() {
+        guard Auth.auth().currentUser != nil else { return }
+        functions.httpsCallable("ensureUserDefaults").call { result, error in
+            if let error = error {
+                print("❌ ensureUserDefaults error: \(error.localizedDescription)")
+                return
+            }
+            if let dict = result?.data as? [String: Any] {
+                print("✅ ensureUserDefaults:", dict)
+            }
+        }
+    }
+
+    // MARK: - Realtime to Firestore Migration (unchanged)
     func migrateUsersFromRealtimeToFirestore() {
         let realtimeRef = Database.database().reference().child("users")
         let firestoreRef = Firestore.firestore().collection("users")
@@ -160,8 +195,10 @@ class AuthViewModel: ObservableObject {
                 if let name = data["name"] as? String { userData["name"] = name }
                 if let username = data["username"] as? String { userData["username"] = username }
                 if let image = data["profileImageURL"] as? String { userData["profileImageURL"] = image }
-                
-                firestoreRef.document(uid).setData(userData) { error in
+                if let circle = data["circleSize"] as? Int { userData["circleSize"] = circle }
+                if let badge = data["badgeTier"] as? String { userData["badgeTier"] = badge }
+
+                firestoreRef.document(uid).setData(userData, merge: true) { error in
                     if let error = error {
                         print("❌ Failed to write user \(uid): \(error.localizedDescription)")
                     } else {

@@ -701,75 +701,81 @@ exports.logManualPurchase = fn.https.onRequest(
   })
 );
 
-// ===================================================
-// Nightlife Approvals — callable functions (vetted)
+/// ===================================================
+// Nightlife Approvals — callable functions (v3)
+// Supports promoter, venue, entertainer
+// Actions: approve | reject | suspend | reinstate
 // ===================================================
 
+// submitNightlifeApplication
 exports.submitNightlifeApplication = fn.https.onCall(async (data, context) => {
-  if (!context.auth)
+  if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "Login required");
+  }
   const uid = context.auth.uid;
+
   const {
     type,
     fullName = "",
     email = "",
     phone = "",
     businessName = "",
+    stageName = "",           // used for entertainer
     website = null,
     instagram = null,
     tiktok = null,
     description = null,
   } = data || {};
 
-  if (!["promoter", "venue"].includes(type)) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "type must be 'promoter' or 'venue'"
-    );
+  if (!["promoter", "venue", "entertainer"].includes(type)) {
+    throw new functions.https.HttpsError("invalid-argument", "type must be 'promoter' | 'venue' | 'entertainer'");
   }
   if (!fullName || !email) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "fullName and email are required"
-    );
+    throw new functions.https.HttpsError("invalid-argument", "fullName and email are required");
   }
 
   const node =
-    type === "promoter" ? "promoterApplications" : "venueApplications";
+    type === "promoter" ? "promoterApplications" :
+    type === "venue"    ? "venueApplications"    :
+                          "entertainerApplications";
+
   const payload = {
     uid,
+    type,
     fullName,
     email,
     phone,
     businessName,
+    ...(type === "entertainer" ? { stageName } : {}),
     website,
     instagram,
     tiktok,
     description,
     status: "pending",
-    submittedAt: Date.now(),
+    approved: false,
+    suspended: false,
+    submittedAt: admin.database.ServerValue.TIMESTAMP,
   };
+
   await db.ref(`${node}/${uid}`).set(payload);
   return { ok: true };
 });
 
+// listNightlifeApplications
 exports.listNightlifeApplications = fn.https.onCall(async (data) => {
-  const { type, status, limit = 200 } = data || {};
-  if (!["promoter", "venue"].includes(type)) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "type must be 'promoter' or 'venue'"
-    );
+  const { type, status = "pending", limit = 200 } = data || {};
+  if (!["promoter", "venue", "entertainer"].includes(type)) {
+    throw new functions.https.HttpsError("invalid-argument", "type must be 'promoter' | 'venue' | 'entertainer'");
   }
   if (!["pending", "approved", "rejected"].includes(status)) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "status must be pending|approved|rejected"
-    );
+    throw new functions.https.HttpsError("invalid-argument", "status must be 'pending' | 'approved' | 'rejected'");
   }
 
   const node =
-    type === "promoter" ? "promoterApplications" : "venueApplications";
+    type === "promoter" ? "promoterApplications" :
+    type === "venue"    ? "venueApplications"    :
+                          "entertainerApplications";
+
   const snap = await db
     .ref(node)
     .orderByChild("status")
@@ -782,83 +788,217 @@ exports.listNightlifeApplications = fn.https.onCall(async (data) => {
     const v = child.val() || {};
     items.push({
       uid: child.key,
+      type: v.type || type,
       fullName: v.fullName || "",
       email: v.email || "",
       phone: v.phone || "",
       businessName: v.businessName || "",
-      website: v.website || null,
-      instagram: v.instagram || null,
-      tiktok: v.tiktok || null,
-      description: v.description || null,
+      website: v.website ?? null,
+      instagram: v.instagram ?? null,
+      tiktok: v.tiktok ?? null,
+      description: v.description ?? null,
       status: v.status || "pending",
+      suspended: !!v.suspended,   // included for UIs (approved list can show suspended)
       submittedAt: v.submittedAt || null,
     });
   });
 
   return { items };
 });
+// APPROVE / REJECT / SUSPEND / REINSTATE (promoter | venue | entertainer)
+// v1 callable, pinned to us-central1
+exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
+  const { HttpsError } = functions.https;
 
-exports.reviewNightlifeApplication = fn.https.onCall(async (data) => {
-  const { type, uid, action, reason = null, venue = null } = data || {};
+  try {
+    // ---- auth ----
+    if (!context.auth) {
+      throw new HttpsError("unauthenticated", "Login required");
+    }
+    const adminUid = context.auth.uid || null;
 
-  if (!["promoter", "venue"].includes(type)) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "type must be 'promoter' or 'venue'"
-    );
-  }
-  if (!uid || !["approve", "reject"].includes(action)) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "uid and action required"
-    );
-  }
+    // ---- args ----
+    const { type, uid, action, reason = null, venue = null } = data || {};
+    const ALLOWED_TYPES = new Set(["promoter", "venue", "entertainer"]);
+    const ALLOWED_ACTIONS = new Set(["approve", "reject", "suspend", "reinstate"]);
 
-  const isPromoter = type === "promoter";
-  const appNode = isPromoter ? "promoterApplications" : "venueApplications";
-  const appRef = db.ref(`${appNode}/${uid}`);
-  const appSnap = await appRef.get();
-  if (!appSnap.exists())
-    throw new functions.https.HttpsError("not-found", "Application not found");
-
-  const updates = {};
-  if (action === "reject") {
-    updates[`${appNode}/${uid}/status`] = "rejected";
-    updates[`${appNode}/${uid}/reviewedAt`] = Date.now();
-    if (reason) updates[`${appNode}/${uid}/reason`] = reason;
-    await db.ref().update(updates);
-    return { ok: true, status: "rejected" };
-  }
-
-  // APPROVE
-  if (isPromoter) {
-    updates[`promoters/${uid}`] = { approved: true, createdAt: Date.now() };
-    updates[`${appNode}/${uid}/status`] = "approved";
-    updates[`${appNode}/${uid}/reviewedAt`] = Date.now();
-    await db.ref().update(updates);
-    return { ok: true, status: "approved", type: "promoter" };
-  } else {
-    const venueId =
-      venue && typeof venue.venueId === "string" ? venue.venueId.trim() : "";
-    if (!venueId) {
-      throw new functions.https.HttpsError(
+    if (!ALLOWED_TYPES.has(type)) {
+      throw new HttpsError(
         "invalid-argument",
-        "venue.venueId is required to approve a venue"
+        "type must be 'promoter' | 'venue' | 'entertainer'"
       );
     }
+    if (!uid || !ALLOWED_ACTIONS.has(action)) {
+      throw new HttpsError("invalid-argument", "uid and valid action required");
+    }
 
-    const venueUpdates = {};
-    if (venue.name) venueUpdates[`venues/${venueId}/name`] = venue.name;
-    if (venue.address) venueUpdates[`venues/${venueId}/address`] = venue.address;
-    venueUpdates[`venues/${venueId}/approved`] = true;
-    venueUpdates[`venueAdmins/${venueId}/${uid}`] = true;
+    const appNode =
+      type === "promoter" ? "promoterApplications" :
+      type === "venue"    ? "venueApplications"    :
+                            "entertainerApplications";
 
-    updates[`${appNode}/${uid}/status`] = "approved";
-    updates[`${appNode}/${uid}/reviewedAt`] = Date.now();
+    const appRef = db.ref(`${appNode}/${uid}`);
+    const appSnap = await appRef.get();
+    if (!appSnap.exists()) {
+      throw new HttpsError("not-found", "Application not found");
+    }
+    const app = appSnap.val() || {};
+    const now = admin.database.ServerValue.TIMESTAMP;
 
-    await db.ref().update({ ...updates, ...venueUpdates });
+    // helpers
+    const updates = {};
+    const set = (path, val) => { updates[path] = val; };
+    const markReviewed = () => {
+      set(`${appNode}/${uid}/reviewedAt`, now);
+      if (adminUid) set(`${appNode}/${uid}/reviewedBy`, adminUid);
+    };
 
-    return { ok: true, status: "approved", type: "venue", venueId };
+    // ---------- REJECT ----------
+    if (action === "reject") {
+      set(`${appNode}/${uid}/status`, "rejected");
+      set(`${appNode}/${uid}/approved`, false);
+      set(`${appNode}/${uid}/suspended`, false);
+      if (reason) set(`${appNode}/${uid}/reason`, String(reason));
+      markReviewed();
+      await db.ref().update(updates);
+      return { ok: true, action, status: "rejected", type };
+    }
+
+    // ---------- SUSPEND / REINSTATE ----------
+    if (action === "suspend" || action === "reinstate") {
+      const suspended = action === "suspend";
+
+      // mirror to application
+      set(`${appNode}/${uid}/suspended`, suspended);
+      set(`${appNode}/${uid}/moderatedAt`, now);
+      if (adminUid) set(`${appNode}/${uid}/moderatedBy`, adminUid);
+
+      // mirror to role node(s)
+      if (type === "promoter") {
+        set(`promoters/${uid}/suspended`, suspended);
+        set(`promoters/${uid}/moderatedAt`, now);
+        if (adminUid) set(`promoters/${uid}/moderatedBy`, adminUid);
+      } else if (type === "entertainer") {
+        set(`entertainers/${uid}/suspended`, suspended);
+        set(`entertainers/${uid}/moderatedAt`, now);
+        if (adminUid) set(`entertainers/${uid}/moderatedBy`, adminUid);
+      } else {
+        // venue: use owner index to find venueId (safe if missing)
+        const ownerSnap = await db.ref(`venueOwners/${uid}`).get();
+        const owner = ownerSnap.exists() ? ownerSnap.val() || {} : {};
+        const venueId = owner.venueId || null;
+
+        set(`venueOwners/${uid}/suspended`, suspended);
+        set(`venueOwners/${uid}/moderatedAt`, now);
+        if (adminUid) set(`venueOwners/${uid}/moderatedBy`, adminUid);
+
+        if (venueId) {
+          set(`venues/${venueId}/suspended`, suspended);
+          set(`venues/${venueId}/moderatedAt`, now);
+          if (adminUid) set(`venues/${venueId}/moderatedBy`, adminUid);
+        }
+      }
+
+      await db.ref().update(updates);
+      return { ok: true, action, suspended, type };
+    }
+
+    // ---------- APPROVE ----------
+    set(`${appNode}/${uid}/status`, "approved");
+    set(`${appNode}/${uid}/approved`, true);
+    set(`${appNode}/${uid}/suspended`, false);
+    markReviewed();
+
+    if (type === "promoter") {
+      set(`promoters/${uid}/approved`, true);
+      set(`promoters/${uid}/suspended`, false);
+      set(`promoters/${uid}/createdAt`, now);
+      await db.ref().update(updates);
+      return { ok: true, action: "approve", status: "approved", type };
+    }
+
+    // ---------- APPROVE ----------
+set(`${appNode}/${uid}/status`, "approved");
+set(`${appNode}/${uid}/approved`, true);
+set(`${appNode}/${uid}/suspended`, false);
+markReviewed();
+set(`${appNode}/${uid}/approvedAt`, now); // <-- add approvedAt like venue/promoter
+
+if (type === "entertainer") {
+  const stageName =
+    (app.stageName && String(app.stageName).trim()) ||
+    (app.businessName && String(app.businessName).trim()) || "";
+
+  // Create/overwrite entertainers/{uid} to match your other role nodes
+  set(`entertainers/${uid}/approved`, true);
+  set(`entertainers/${uid}/approvedAt`, now);
+  set(`entertainers/${uid}/suspended`, false);
+  set(`entertainers/${uid}/createdAt`, now);
+
+  // Keep parity with what you store for venues/promoters
+  set(`entertainers/${uid}/uid`, uid);
+  set(`entertainers/${uid}/sourceApplication`, "entertainerApplications");
+
+  // Copy key profile fields so the portal can render without chasing the app node
+  if (app.fullName)      set(`entertainers/${uid}/fullName`, app.fullName);
+  if (stageName)         set(`entertainers/${uid}/stageName`, stageName);
+  if (app.businessName)  set(`entertainers/${uid}/businessName`, app.businessName);
+  if (app.email)         set(`entertainers/${uid}/email`, app.email);
+  if (app.phone)         set(`entertainers/${uid}/phone`, app.phone);
+  if (app.instagram)     set(`entertainers/${uid}/instagram`, app.instagram);
+  if (app.tiktok)        set(`entertainers/${uid}/tiktok`, app.tiktok);
+  if (app.website)       set(`entertainers/${uid}/website`, app.website);
+  if (app.description)   set(`entertainers/${uid}/description`, app.description);
+
+  await db.ref().update(updates);
+  return { ok: true, action: "approve", status: "approved", type };
+}
+
+
+    // venue approval
+    let venueId =
+      venue && typeof venue.venueId === "string" && venue.venueId.trim()
+        ? venue.venueId.trim()
+        : "";
+
+    if (!venueId) {
+      const newRef = db.ref("venues").push();
+      venueId = newRef.key;
+      await newRef.set({
+        name: (venue && venue.name) || app.businessName || "",
+        address: (venue && venue.address) || "",
+        approved: true,
+        suspended: false,
+        createdAt: now,
+      });
+    } else {
+      const vUpdates = { approved: true, suspended: false };
+      if (venue?.name && venue.name.trim()) vUpdates.name = venue.name.trim();
+      if (venue?.address && venue.address.trim()) vUpdates.address = venue.address.trim();
+      await db.ref(`venues/${venueId}`).update(vUpdates);
+    }
+
+    set(`venueAdmins/${venueId}/${uid}`, true);
+    set(`venueOwners/${uid}/venueId`, venueId);
+    set(`venueOwners/${uid}/approved`, true);
+    set(`venueOwners/${uid}/suspended`, false);
+    set(`venueOwners/${uid}/linkedAt`, now);
+    set(`${appNode}/${uid}/venueId`, venueId);
+
+    await db.ref().update(updates);
+    return { ok: true, action: "approve", status: "approved", type, venueId };
+  } catch (e) {
+    console.error("reviewNightlifeApplication error:", e);
+
+    // If it was already an HttpsError (e.g., invalid-argument), keep it.
+    if (e instanceof functions.https.HttpsError) throw e;
+
+    // Otherwise surface real info to the client (iOS will log this under FunctionsErrorDetailsKey).
+    throw new functions.https.HttpsError(
+      "internal",
+      "reviewNightlifeApplication failed",
+      { message: e?.message || String(e), stack: e?.stack, name: e?.name }
+    );
   }
 });
 
@@ -1212,3 +1352,479 @@ try {
 } catch (e) {
   console.log("ℹ️ externalFeeds module not present, skipping");
 }
+
+//--------------
+//ACCEPTINVITES
+//--------------
+
+
+/**
+ * acceptInvite (Callable, v1)
+ * data: { inviterId: string, inviteeId: string }
+ * auth: required; inviterId must equal context.auth.uid
+ */
+exports.acceptInvite = functions.https.onCall(async (data, context) => {
+  const auth = context.auth;
+  const inviterId = data && data.inviterId;
+  const inviteeId = data && data.inviteeId;
+
+  // ---- Validation ----
+  if (!auth || !auth.uid) {
+    throw new functions.https.HttpsError('unauthenticated', 'You must be signed in to accept an invite.');
+  }
+  if (!inviterId || !inviteeId) {
+    throw new functions.https.HttpsError('invalid-argument', 'inviterId and inviteeId are required.');
+  }
+  if (inviterId !== auth.uid) {
+    throw new functions.https.HttpsError('permission-denied', 'inviterId must match the authenticated user.');
+  }
+  if (inviterId === inviteeId) {
+    throw new functions.https.HttpsError('failed-precondition', 'Self-invites are not allowed.');
+  }
+
+  const acceptRef = db.ref(`invitesAccepted/${inviteeId}`);
+
+  // ---- Step 1: Idempotent accept via transaction ----
+  const acceptTxn = await acceptRef.transaction((current) => {
+    if (current) return; // already accepted -> abort write
+    return {
+      inviterId,
+      inviteeId,
+      timestamp: Date.now(),
+      status: 'accepted',
+    };
+  }, { applyLocally: false });
+
+  if (!acceptTxn.committed) {
+    // Another process already accepted — return current state
+    const [circleSize, badgeTier] = await Promise.all([
+      getCircleSize(inviterId),
+      getBadgeTier(inviterId),
+    ]);
+    return {
+      status: 'already_accepted',
+      circleSize,
+      badgeTier,
+      payload: acceptTxn.snapshot.val(),
+    };
+  }
+
+  // ---- Step 2: Increment inviter's circleSize atomically ----
+  const circleRef = db.ref(`users/${inviterId}/circleSize`);
+  const circleTxn = await circleRef.transaction(
+    (val) => (typeof val === 'number' ? val + 1 : 1),
+    { applyLocally: false }
+  );
+  const circleSize = circleTxn.snapshot.val() || 1;
+
+  // ---- Step 3: Compute badge tier (white baseline, then rainbow → black) ----
+  const tiers = [
+    { name: 'white',  threshold: 0 },
+    { name: 'red',    threshold: 5 },
+    { name: 'orange', threshold: 10 },
+    { name: 'yellow', threshold: 20 },
+    { name: 'green',  threshold: 40 },
+    { name: 'blue',   threshold: 80 },
+    { name: 'indigo', threshold: 160 },
+    { name: 'violet', threshold: 320 },
+    { name: 'black',  threshold: 640 },
+  ];
+  let badge = 'white';
+  for (let i = tiers.length - 1; i >= 0; i--) {
+    if (circleSize >= tiers[i].threshold) { badge = tiers[i].name; break; }
+  }
+
+  // ---- Step 4: Contacts (both directions) + badge (multi-path update) ----
+  const updates = {};
+  updates[`users/${inviterId}/badgeTier`] = badge;
+  updates[`contacts/${inviterId}/${inviteeId}`] = true;
+  updates[`contacts/${inviteeId}/${inviterId}`] = true;
+
+  await db.ref().update(updates);
+
+  return {
+    status: 'accepted',
+    circleSize,
+    badgeTier: badge,
+  };
+});
+
+// ------- Helpers (v1) -------
+async function getCircleSize(uid) {
+  const snap = await db.ref(`users/${uid}/circleSize`).get();
+  return snap.exists() ? snap.val() : 0;
+}
+async function getBadgeTier(uid) {
+  const snap = await db.ref(`users/${uid}/badgeTier`).get();
+  return snap.exists() ? snap.val() : 'white';
+}
+
+/**
+ * OPTIONAL: seed defaults on-demand if your signup flow doesn’t do it.
+ * Call from client once after sign-in.
+ */
+ exports.ensureUserDefaults = functions.https.onCall(async (_, context) => {
+   if (!context.auth || !context.auth.uid) {
+     throw new functions.https.HttpsError('unauthenticated', 'Sign in required.');
+   }
+   const uid = context.auth.uid;
+   const ref = db.ref(`users/${uid}`);
+   const snap = await ref.get();
+   if (!snap.exists()) {
+     await ref.set({ circleSize: 0, badgeTier: 'white' });
+     return { created: true, circleSize: 0, badgeTier: 'white' };
+   }
+   const val = snap.val() || {};
+   const updates = {};
+   if (typeof val.circleSize !== 'number') updates.circleSize = 0;
+   if (typeof val.badgeTier !== 'string') updates.badgeTier = 'white';
+   if (Object.keys(updates).length) await ref.update(updates);
+   return { created: false, ...val, ...updates };
+ });
+
+
+const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
+
+const REGION = 'us-central1'; // change if you deploy elsewhere
+
+// ---------- helpers ----------
+const chatId = (a, b) => [a, b].sort().join('_');
+
+// human-friendly short codes: BA-7GQ4N9 (no 0/1/O/I)
+const CODE_PREFIX = 'BA-';
+const CODE_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+function makeCode(len = 7) {
+  let s = CODE_PREFIX;
+  for (let i = 0; i < len; i++) {
+    s += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+  }
+  return s;
+}
+
+async function generateUniqueCode() {
+  for (let i = 0; i < 8; i++) {
+    const code = makeCode();
+    const ref = db.collection('inviteCodes').doc(code);
+    const snap = await ref.get();
+    if (!snap.exists) return code;
+  }
+  throw new Error('Could not generate unique invite code after several attempts');
+}
+
+async function ensureMutualContacts(aUid, bUid, status, source) {
+  const aRef = db.collection('users').doc(aUid).collection('contacts').doc(bUid);
+  const bRef = db.collection('users').doc(bUid).collection('contacts').doc(aUid);
+  const dcRef = db.collection('directChats').doc(chatId(aUid, bUid));
+
+  const [aSnap, bSnap, dcSnap] = await Promise.all([aRef.get(), bRef.get(), dcRef.get()]);
+  const active = status === 'active';
+
+  const batch = db.batch();
+
+  const up = (ref, cur) => {
+    const curStatus = cur?.status;
+    const curAccepted = !!cur?.accepted;
+    const needs = curStatus !== status || curAccepted !== active;
+    if (needs) {
+      batch.set(
+        ref,
+        {
+          status,
+          accepted: active,
+          source,
+          createdAt: cur?.createdAt || serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  };
+
+  up(aRef, aSnap.data());
+  up(bRef, bSnap.data());
+
+  if (!dcSnap.exists) {
+    batch.set(dcRef, {
+      participants: [aUid, bUid],
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      pending: !active,
+      userA: aUid,
+      userB: bUid,
+    });
+  } else if (active && dcSnap.get('pending') === true) {
+    batch.update(dcRef, { pending: false, updatedAt: serverTimestamp() });
+  }
+
+  await batch.commit();
+}
+
+// ---------- TRIGGERS ----------
+
+// 1) Assign short invite code to NEW users (if missing)
+exports.onUserCreated = functions
+  .region(REGION)
+  .firestore.document('users/{uid}')
+  .onCreate(async (snap, ctx) => {
+    const uid = ctx.params.uid;
+    const data = snap.data() || {};
+    if (data.inviteCode) return; // already has one (idempotent)
+
+    const code = await generateUniqueCode();
+    await Promise.all([
+      snap.ref.set({ inviteCode: code }, { merge: true }),
+      db.collection('inviteCodes').doc(code).set({
+        uid,
+        createdAt: serverTimestamp(),
+      }),
+    ]);
+  });
+
+// 2) When user doc gets a `referrer`, link both sides + active DM (once)
+exports.onUserReferrerSet = functions
+  .region(REGION)
+  .firestore.document('users/{uid}')
+  .onWrite(async (change, ctx) => {
+    if (!change.after.exists) return;
+
+    const uid = ctx.params.uid;
+    const before = change.before.data() || {};
+    const after = change.after.data() || {};
+
+    const prevRef = before.referrer;
+    const referrer = after.referrer;
+    const processed = after.referralProcessed === true;
+
+    if (!referrer || processed) return;
+    if (referrer === uid) return; // ignore self
+    if (prevRef === referrer) return; // no change
+
+    await ensureMutualContacts(referrer, uid, 'active', 'invite');
+
+    await change.after.ref.set({ referralProcessed: true }, { merge: true });
+  });
+
+// 3) If either side activates a pending contact, mirror & clear chat.pending
+exports.onContactActivated = functions
+  .region(REGION)
+  .firestore.document('users/{uid}/contacts/{otherUid}')
+  .onUpdate(async (change, ctx) => {
+    const uid = ctx.params.uid;
+    const other = ctx.params.otherUid;
+
+    const before = change.before.data() || {};
+    const after = change.after.data() || {};
+
+    const wasActive = before.status === 'active' && before.accepted === true;
+    const isActive = after.status === 'active' && after.accepted === true;
+    if (!isActive || wasActive) return;
+
+    const mirrorRef = db.collection('users').doc(other).collection('contacts').doc(uid);
+    const dcRef = db.collection('directChats').doc(chatId(uid, other));
+
+    const [mirrorSnap, dcSnap] = await Promise.all([mirrorRef.get(), dcRef.get()]);
+
+    const batch = db.batch();
+
+    const mirrorIsActive =
+      mirrorSnap.exists &&
+      mirrorSnap.get('status') === 'active' &&
+      mirrorSnap.get('accepted') === true;
+
+    if (!mirrorIsActive) {
+      batch.set(
+        mirrorRef,
+        {
+          status: 'active',
+          accepted: true,
+          source: after.source || 'search',
+          createdAt: mirrorSnap.get?.('createdAt') || serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    if (dcSnap.exists && dcSnap.get('pending') === true) {
+      batch.update(dcRef, { pending: false, updatedAt: serverTimestamp() });
+    }
+
+    await batch.commit();
+  });
+
+// ---------- ONE-TIME BACKFILL ENDPOINT ----------
+// Assign inviteCode to existing users (and ensure mapping), paginated.
+// Protect with an admin key: `firebase functions:config:set backfill.key="YOUR_SECRET"`
+exports.backfillInviteCodes = functions
+  .region(REGION)
+  .https.onRequest(async (req, res) => {
+    try {
+      if (req.method !== 'POST') {
+        res.status(405).send('Use POST');
+        return;
+      }
+
+      const configured = (functions.config()?.backfill?.key) || '';
+      const provided = req.header('x-admin-key') || '';
+      if (!configured || provided !== configured) {
+        res.status(403).send('forbidden');
+        return;
+      }
+
+      // pagination
+      const limit = Math.min(parseInt(String(req.query.limit || '200'), 10), 500);
+      const after = req.query.after ? String(req.query.after) : undefined;
+
+      let q = db.collection('users').orderBy(admin.firestore.FieldPath.documentId()).limit(limit);
+      if (after) q = q.startAfter(after);
+
+      const snap = await q.get();
+      if (snap.empty) {
+        res.json({ processed: 0, assigned: 0, fixedMappings: 0, nextAfter: null });
+        return;
+      }
+
+      let processed = 0;
+      let assigned = 0;
+      let fixedMappings = 0;
+
+      const batch = db.batch();
+
+      for (const doc of snap.docs) {
+        processed++;
+        const uid = doc.id;
+        const data = doc.data() || {};
+        const existingCode = data.inviteCode;
+
+        if (!existingCode) {
+          const code = await generateUniqueCode();
+          batch.set(doc.ref, { inviteCode: code }, { merge: true });
+          batch.set(db.collection('inviteCodes').doc(code), { uid, createdAt: serverTimestamp() });
+          assigned++;
+        } else {
+          const mapRef = db.collection('inviteCodes').doc(existingCode);
+          const mapSnap = await mapRef.get();
+          if (!mapSnap.exists) {
+            batch.set(mapRef, { uid, createdAt: serverTimestamp() }, { merge: true });
+            fixedMappings++;
+          }
+        }
+      }
+
+      await batch.commit();
+
+      const nextAfter = snap.docs[snap.docs.length - 1]?.id || null;
+      res.json({ processed, assigned, fixedMappings, nextAfter });
+    } catch (e) {
+      console.error('backfillInviteCodes error:', e);
+      res.status(500).send(e?.message || 'error');
+    }
+  });
+
+// ===== Backfill invite codes for existing users (safe to append) =====
+/*  Usage (after setting config key and deploying):
+      ADMIN_KEY="YOUR_SUPER_SECRET"
+      BASE="https://us-central1-<PROJECT_ID>.cloudfunctions.net/backfillInviteCodes"
+      curl -sS -X POST "$BASE?limit=300" -H "x-admin-key: $ADMIN_KEY"
+*/
+
+// If these paths differ in your project, adjust:
+var USERS_COLL = 'users';
+var INVITE_CODES_COLL = 'inviteCodes';
+
+// Local Firestore handle so we don't clash with any existing RTDB `db` var
+function _fs() { return require('firebase-admin').firestore(); }
+
+// Short code helpers
+var _CODE_PREFIX = 'BA-';
+var _CODE_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // no 0,1,O,I
+
+function _makeCode(len) {
+  len = len || 7;
+  var s = _CODE_PREFIX;
+  for (var i = 0; i < len; i++) {
+    s += _CODE_CHARS[Math.floor(Math.random() * _CODE_CHARS.length)];
+  }
+  return s;
+}
+
+async function _generateUniqueCode() {
+  var fs = _fs();
+  for (var i = 0; i < 8; i++) {
+    var code = _makeCode();
+    var ref = fs.collection(INVITE_CODES_COLL).doc(code);
+    var snap = await ref.get();
+    if (!snap.exists) return code;
+  }
+  throw new Error('Could not generate unique invite code');
+}
+
+exports.backfillInviteCodes = require('firebase-functions')
+  .region('us-central1') // <- change if your other functions use a different region
+  .https.onRequest(async function(req, res) {
+    try {
+      if (req.method !== 'POST') {
+        res.status(405).send('Use POST'); return;
+      }
+
+      // Read protected admin key from functions config (v1-safe)
+      var cfg = require('firebase-functions').config();
+      var configured = (cfg && cfg.backfill && cfg.backfill.key) ? cfg.backfill.key : '';
+      var provided = req.header('x-admin-key') || '';
+      if (!configured || provided !== configured) {
+        res.status(403).send('forbidden'); return;
+      }
+
+      // Pagination
+      var limitRaw = String(req.query.limit || '200');
+      var limit = parseInt(limitRaw, 10);
+      if (!limit || limit < 1) limit = 200;
+      if (limit > 500) limit = 500;
+
+      var after = req.query.after ? String(req.query.after) : null;
+
+      var fs = _fs();
+      var q = fs.collection(USERS_COLL)
+                .orderBy(require('firebase-admin').firestore.FieldPath.documentId())
+                .limit(limit);
+      if (after) q = q.startAfter(after);
+
+      var snap = await q.get();
+      if (snap.empty) {
+        res.json({ processed: 0, assigned: 0, fixedMappings: 0, nextAfter: null }); return;
+      }
+
+      var processed = 0, assigned = 0, fixedMappings = 0;
+      var batch = fs.batch();
+      var ts = require('firebase-admin').firestore.FieldValue.serverTimestamp();
+
+      for (var i = 0; i < snap.docs.length; i++) {
+        var doc = snap.docs[i];
+        processed++;
+        var uid = doc.id;
+        var data = doc.data() || {};
+        var existingCode = data.inviteCode;
+
+        if (!existingCode) {
+          var code = await _generateUniqueCode();
+          batch.set(doc.ref, { inviteCode: code }, { merge: true });
+          batch.set(fs.collection(INVITE_CODES_COLL).doc(code), { uid: uid, createdAt: ts }, { merge: true });
+          assigned++;
+        } else {
+          var mapRef = fs.collection(INVITE_CODES_COLL).doc(existingCode);
+          var mapSnap = await mapRef.get();
+          if (!mapSnap.exists) {
+            batch.set(mapRef, { uid: uid, createdAt: ts }, { merge: true });
+            fixedMappings++;
+          }
+        }
+      }
+
+      await batch.commit();
+      var nextAfter = snap.docs[snap.docs.length - 1] ? snap.docs[snap.docs.length - 1].id : null;
+      res.json({ processed: processed, assigned: assigned, fixedMappings: fixedMappings, nextAfter: nextAfter });
+    } catch (e) {
+      console.error('backfillInviteCodes error:', e);
+      res.status(500).send(e && e.message ? e.message : 'error');
+    }
+  });
+

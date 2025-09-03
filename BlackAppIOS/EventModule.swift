@@ -924,21 +924,25 @@ struct EditEventView: View {
     @State private var showImagePicker = false
     @State private var isUploading = false
 
-    let payoutOptions = ["PayPal", "CashApp"]
-
     init(event: EventModel) {
         self.event = event
+
+        // Normalize payout to PayPal only
+        let normalizedMethod = "PayPal"
+        let normalizedDetails = (event.payoutMethod == "PayPal") ? event.payoutDetails : ""
+
         _title = State(initialValue: event.title)
         _description = State(initialValue: event.description)
         _location = State(initialValue: event.location)
         _selectedDate = State(initialValue: event.date)
-        _payoutMethod = State(initialValue: event.payoutMethod)
-        _payoutDetails = State(initialValue: event.payoutDetails)
+        _payoutMethod = State(initialValue: normalizedMethod)
+        _payoutDetails = State(initialValue: normalizedDetails)
         _ticketPrice = State(initialValue: event.ticketPrice)
         _ticketQuantity = State(initialValue: event.ticketQuantity)
         _tablePrice = State(initialValue: event.tablePrice)
         _tableQuantity = State(initialValue: event.tableQuantity)
     }
+
 
     var body: some View {
         NavigationView {
@@ -963,15 +967,18 @@ struct EditEventView: View {
                 }
 
                 Section(header: Text("Payout Information")) {
-                    Picker("Payout Method", selection: $payoutMethod) {
-                        ForEach(payoutOptions, id: \.self) { method in
-                            Text(method)
-                        }
+                    HStack {
+                        Text("Payout Method")
+                        Spacer()
+                        Text("PayPal")
+                            .foregroundColor(.secondary)
                     }
-                    TextField(payoutMethod == "PayPal" ? "Enter PayPal Email" : "Enter Cash App Tag", text: $payoutDetails)
+
+                    TextField("Enter PayPal Email", text: $payoutDetails)
                         .keyboardType(.emailAddress)
-                        .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
                 }
+
 
                 Section(header: Text("Ticket Sales")) {
                     TextField("Ticket Price (USD)", value: $ticketPrice, format: .number)
@@ -1136,18 +1143,21 @@ struct RSSCardView: View {
 }
 
 
+import UIKit
 import SwiftUI
 import Firebase
 import FirebaseAuth
 
 struct EventDetailView: View {
     let event: EventModel
+
     @State private var showWebViewModal = false
     @State private var selectedURL: URL?
     @State private var showCheckoutConfirmation = false
     @State private var isSaved = false
-    @State private var showShareSheet = false
-    @State private var showCopiedAlert = false
+
+    // NEW: Gossip-first share UI
+    @State private var showShareOptions = false
 
     var body: some View {
         ScrollView {
@@ -1194,13 +1204,23 @@ struct EventDetailView: View {
                 }
 
                 HStack {
-                    Button(action: {
-                        showShareSheet = true
-                    }) {
+                    // NEW: Gossip-first share entry
+                    Button {
+                        showShareOptions = true
+                    } label: {
                         Label("Share", systemImage: "square.and.arrow.up")
                             .padding(8)
                             .background(Color.gray.opacity(0.2))
                             .cornerRadius(8)
+                    }
+                    .confirmationDialog("Share Event", isPresented: $showShareOptions, titleVisibility: .visible) {
+                        Button("Share to Gossip (recommended)") {
+                            shareToGossip()
+                        }
+                        Button("Share via…") {
+                            shareToSystem()
+                        }
+                        Button("Cancel", role: .cancel) {}
                     }
 
                     Button(action: toggleSaveEvent) {
@@ -1234,6 +1254,7 @@ struct EventDetailView: View {
                 let baseTotal = Double(ticketQty) * event.ticketPrice + Double(tableQty) * event.tablePrice
                 let totalWithFee = baseTotal * 1.02
 
+                // Preserve your existing hosted flow
                 let urlString = """
                 https://blackappios.web.app/index.html?\
                 eventId=\(event.id)&\
@@ -1259,35 +1280,9 @@ struct EventDetailView: View {
                 }
             }
         }
-        .sheet(isPresented: $showShareSheet) {
-            ShareModalView(eventId: event.id, eventTitle: event.title, showCopiedAlert: $showCopiedAlert)
-        }
-        .overlay(
-            VStack {
-                if showCopiedAlert {
-                    Text("Link copied to clipboard!")
-                        .font(.subheadline)
-                        .foregroundColor(.white)
-                        .padding(.horizontal)
-                        .padding(.vertical, 8)
-                        .background(Color.black.opacity(0.8))
-                        .cornerRadius(10)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                        .zIndex(1)
-                        .padding(.top, 40)
-                }
-                Spacer()
-            }
-        )
     }
 
-    private func formattedDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
-    }
-
+    // MARK: - Save / load
     private func toggleSaveEvent() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
@@ -1314,7 +1309,80 @@ struct EventDetailView: View {
             self.isSaved = snapshot.exists()
         }
     }
+
+    // MARK: - Gossip-first sharing
+    private func shareToGossip() {
+        guard let url = buildEventDeepLink() else {
+            shareToSystem()
+            return
+        }
+        let caption = makeEventCaption()
+        if let top = topMostController() {
+            // Uses your GossipShareKit.swift (already added earlier)
+            GossipShareManager.shared.presentShare(from: top, payload: .link(url: url, text: caption))
+        } else {
+            shareToSystem()
+        }
+    }
+
+    private func shareToSystem() {
+        guard let url = buildEventDeepLink() else { return }
+        presentSystemShare([makeEventCaption(), url])
+    }
+
+    private func buildEventDeepLink() -> URL? {
+        // Keep your current hosted event page
+        URL(string: "https://blackappios.web.app/event.html?eventId=\(event.id)")
+        // If/when you move to a canonical path:
+        // URL(string: "https://blackapp.app/e/\(event.id)")
+    }
+
+    private func makeEventCaption() -> String {
+        let dateText = formattedDate(event.date)
+        var parts: [String] = []
+        parts.append(event.title)
+        if !event.location.isEmpty { parts.append(event.location) }
+        parts.append(dateText)
+        if event.ticketPrice > 0 { parts.append(String(format: "Tickets $%.0f", event.ticketPrice)) }
+        if event.tablePrice > 0 { parts.append(String(format: "Tables $%.0f", event.tablePrice)) }
+        return parts.joined(separator: " • ")
+    }
+
+    private func formattedDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
 }
+
+// MARK: - Generic share presenters (safe fallback)
+private func presentSystemShare(_ items: [Any]) {
+    DispatchQueue.main.async {
+        guard let top = topMostController() else { return }
+        let av = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let pop = av.popoverPresentationController {
+            pop.sourceView = top.view
+            pop.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        top.present(av, animated: true)
+    }
+}
+
+private func topMostController(base: UIViewController? = {
+    let scenes = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .sorted { ($0.activationState == .foregroundActive) && ($1.activationState != .foregroundActive) }
+    let keyWin = scenes.first?.windows.first(where: { $0.isKeyWindow })
+    return keyWin?.rootViewController
+}()) -> UIViewController? {
+    if let nav = base as? UINavigationController { return topMostController(base: nav.visibleViewController) }
+    if let tab = base as? UITabBarController { return topMostController(base: tab.selectedViewController) }
+    if let presented = base?.presentedViewController { return topMostController(base: presented) }
+    return base
+}
+
 
 struct ShareModalView: View {
     let eventId: String

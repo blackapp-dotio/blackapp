@@ -43,6 +43,8 @@ struct MessageCardView: View {
                             .frame(maxHeight: 200)
                         } else if message.type == "video" {
                             VideoPlayerView(videoURL: url)
+
+
                                 .frame(height: 200)
                         }
                     }
@@ -76,5 +78,19 @@ struct MessageCardView: View {
         let first = parts.first?.prefix(1) ?? ""
         let second = parts.dropFirst().first?.prefix(1) ?? ""
         return (first + second).uppercased()
+    }
+}
+import SwiftUI
+import AVKit
+
+struct VideoPlayerView: View {
+    let videoURL: URL
+    @State private var player: AVPlayer? = nil
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .onAppear { player = AVPlayer(url: videoURL) }
+            .onDisappear { player?.pause(); player = nil }
+            .cornerRadius(10)
     }
 }

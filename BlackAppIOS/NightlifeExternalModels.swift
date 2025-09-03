@@ -459,7 +459,7 @@ public final class FeedsAPI {
 
         // Ensure city is ALWAYS present
         let cityParam = city.trimmingCharacters(in: .whitespacesAndNewlines)
-        var items: [URLQueryItem] = [
+        let items: [URLQueryItem] = [
             URLQueryItem(name: "city", value: cityParam.isEmpty ? "New York" : cityParam),
             URLQueryItem(name: "start", value: FeedsAPI.iso8601Z(start)),
             URLQueryItem(name: "end",   value: FeedsAPI.iso8601Z(end)),
@@ -720,16 +720,21 @@ final class ExternalFeedsClient {
         }
     }
 
-
-    private static func dedupeAndSortImageFirst(_ list: [ExternalEvent]) -> [ExternalEvent] {
+    /// Prefer events that have a hero image, then sort by date; also de-dupes by (id|title|date)
+    static func dedupeAndSortImageFirst(_ list: [ExternalEvent]) -> [ExternalEvent] {
         var seen = Set<String>()
         let deduped = list.filter { e in
-            let k = "\(e.source ?? "")|\(e.id)|\(e.title)|\(Int(e.date.timeIntervalSince1970))"
+            let k = "\(e.id)|\(e.title)|\(Int(e.date.timeIntervalSince1970))"
             if seen.contains(k) { return false }
             seen.insert(k)
             return true
         }
-        return deduped.sortedImageFirstThenDate()
+        return deduped.sorted { a, b in
+            let aHas = !(a.heroImage?.isEmpty ?? true)
+            let bHas = !(b.heroImage?.isEmpty ?? true)
+            if aHas != bHas { return aHas && !bHas } // photos first
+            return a.date < b.date
+        }
     }
 }
 
@@ -812,16 +817,17 @@ fileprivate struct ExternalSafariBridge: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
 }
 
-// MARK: - Explorer UI (pulls from ExternalFeedsClient)
+// MARK: - Single-column, big-banner explorer
 
 public struct ExternalEventsExplorerView: View {
     @State private var all: [ExternalEvent] = []
     @State private var filtered: [ExternalEvent] = []
     @State private var isLoading = true
 
-    @State private var cityQuery = ""
+    @State private var query = ""
     @State private var useDateFilter = false
     @State private var selectedDate = Date()
+    @State private var onlyWithPhotos = true   // ← default to photos-first
 
     @State private var showSafari = false
     @State private var safariURL: URL?
@@ -831,23 +837,30 @@ public struct ExternalEventsExplorerView: View {
     public var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
-                // Search + date filters
+                // Filters
                 VStack(spacing: 8) {
                     HStack {
-                        TextField("City / venue / event", text: $cityQuery)
+                        TextField("Search city / venue / event", text: $query)
                             .textFieldStyle(.roundedBorder)
-                            .onChange(of: cityQuery) { _ in applyFilters() }
+                            .onChange(of: query) { _ in applyFilters() }
                     }
                     HStack(spacing: 12) {
-                        Toggle(isOn: $useDateFilter) { Label("Filter by date", systemImage: "calendar") }
+                        Toggle(isOn: $useDateFilter) { Label("Date", systemImage: "calendar") }
                             .toggleStyle(SwitchToggleStyle(tint: .accentColor))
+
                         DatePicker("", selection: $selectedDate, displayedComponents: .date)
                             .labelsHidden()
                             .disabled(!useDateFilter)
                             .opacity(useDateFilter ? 1 : 0.4)
                             .onChange(of: selectedDate) { _ in if useDateFilter { applyFilters() } }
+
+                        Toggle("Photos only", isOn: $onlyWithPhotos)
+                            .onChange(of: onlyWithPhotos) { _ in applyFilters() }
+                            .toggleStyle(SwitchToggleStyle(tint: .accentColor))
+
                         Spacer()
-                        Button("Reset") { resetFilters() }.font(.footnote)
+                        Button("Reset") { resetFilters() }
+                            .font(.footnote)
                     }
                 }
                 .padding(10)
@@ -859,52 +872,25 @@ public struct ExternalEventsExplorerView: View {
                     ProgressView("Loading…").padding(.top, 24)
                 } else if filtered.isEmpty {
                     VStack(spacing: 8) {
-                        Text("No external events match your filters").foregroundColor(.secondary)
+                        Text("No events match your filters").foregroundColor(.secondary)
                         Button("Reset Filters") { resetFilters() }
                     }
                     .padding(.top, 24)
                 } else {
-                    List(filtered, id: \.id) { e in
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(alignment: .top, spacing: 12) {
-                                if let src = e.heroImage, let url = URL(string: src) {
-                                    AsyncImage(url: url) { phase in
-                                        switch phase {
-                                        case .empty: Color.gray.opacity(0.15)
-                                        case .success(let img): img.resizable().scaledToFill()
-                                        case .failure: Color.gray.opacity(0.15)
-                                        @unknown default: Color.gray.opacity(0.15)
-                                        }
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(filtered, id: \.id) { e in
+                                EventBannerRow(e: e) {
+                                    if let u = e.externalURL, let url = URL(string: u) {
+                                        safariURL = url
+                                        showSafari = true
                                     }
-                                    .frame(width: 64, height: 64)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
                                 }
-
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(e.title).font(.headline).lineLimit(2)
-                                    Text("\(e.venueName)\(e.venueName.isEmpty ? "" : " • ")\(e.address)")
-                                        .font(.subheadline).foregroundColor(.secondary)
-                                        .lineLimit(1)
-                                    Text(e.date.formatted(date: .abbreviated, time: .shortened))
-                    .font(.footnote).foregroundColor(.secondary)
-                                }
-                                Spacer(minLength: 8)
+                                .padding(.horizontal)
                             }
-
-                            HStack {
-                                if let p = e.price { Text(String(format: "$%.0f", p)) }
-                                if let s = e.source { Text(s.capitalized).foregroundColor(.secondary) }
-                                Spacer()
-                                if let u = e.externalURL, let url = URL(string: u) {
-                                    Button("View") { safariURL = url; showSafari = true }
-                                        .buttonStyle(.borderedProminent)
-                                }
-                            }
-                            .font(.footnote)
                         }
-                        .padding(.vertical, 6)
+                        .padding(.bottom, 12)
                     }
-                    .listStyle(.plain)
                 }
             }
             .navigationTitle("Explore Events")
@@ -918,7 +904,7 @@ public struct ExternalEventsExplorerView: View {
     private func initialLoad() {
         isLoading = true
         ExternalFeedsClient.shared.load(
-            city: "New York", // ensure the endpoints get a city immediately
+            city: "New York", // default city; change or drive by location
             start: Date(),
             end: Calendar.current.date(byAdding: .day, value: 30, to: Date())
         ) { list in
@@ -929,8 +915,9 @@ public struct ExternalEventsExplorerView: View {
     }
 
     private func resetFilters() {
-        cityQuery = ""
+        query = ""
         useDateFilter = false
+        onlyWithPhotos = true
         selectedDate = Date()
         applyFilters()
     }
@@ -938,7 +925,7 @@ public struct ExternalEventsExplorerView: View {
     private func applyFilters() {
         var out = all
 
-        let q = cityQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !q.isEmpty {
             out = out.filter { e in
                 e.address.localizedCaseInsensitiveContains(q) ||
@@ -954,7 +941,93 @@ public struct ExternalEventsExplorerView: View {
             out = out.filter { $0.date >= dayStart && $0.date < dayEnd }
         }
 
-        // 👇 Image-first sort here as well for a consistent, visually-appealing feed
-        filtered = out.sortedImageFirstThenDate()
+        if onlyWithPhotos {
+            out = out.filter { !($0.heroImage?.isEmpty ?? true) }
+        }
+
+        // Photos first, de-duped, then by date
+        filtered = ExternalFeedsClient.dedupeAndSortImageFirst(out)
+    }
+}
+
+// MARK: - Full-width banner row
+
+fileprivate struct EventBannerRow: View {
+    let e: ExternalEvent
+    var onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack(alignment: .bottomLeading) {
+                    if let img = e.heroImage, let url = URL(string: img) {
+                        AsyncImage(url: url, transaction: Transaction(animation: .easeInOut)) { phase in
+                            switch phase {
+                            case .empty:
+                                Color.gray.opacity(0.2).overlay(ProgressView())
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .scaledToFill()
+                                    .transition(.opacity)
+                            case .failure:
+                                Color.gray.opacity(0.2)
+                            @unknown default:
+                                Color.gray.opacity(0.2)
+                            }
+                        }
+                    } else {
+                        Color.gray.opacity(0.2)
+                    }
+
+                    LinearGradient(
+                        colors: [.black.opacity(0.0), .black.opacity(0.65)],
+                        startPoint: .center, endPoint: .bottom
+                    )
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(e.title)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                            .shadow(radius: 2)
+
+                        Text("\(e.venueName)\(e.venueName.isEmpty ? "" : " • ")\(cityFromAddress(e.address) ?? "")")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.92))
+                            .lineLimit(1)
+
+                        Text(e.date.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.85))
+                    }
+                    .padding(12)
+                }
+                .frame(height: 240)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                HStack(spacing: 8) {
+                    if let p = e.price {
+                        Text(String(format: "$%.0f", p))
+                            .font(.subheadline).bold()
+                    }
+                    Spacer()
+                    if let s = e.source {
+                        Text(s.capitalized)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.bottom, 6)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func cityFromAddress(_ address: String?) -> String? {
+        guard let address = address, !address.isEmpty else { return nil }
+        let parts = address.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if parts.count >= 2 { return parts[parts.count - 2] }
+        return parts.last
     }
 }

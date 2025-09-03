@@ -29,7 +29,7 @@ import Foundation
     
     
     
-    // Chat Bubble Shape
+/*    // Chat Bubble Shape
 struct WaterDropShape: Shape {
     var isSender: Bool
 
@@ -49,7 +49,7 @@ struct WaterDropShape: Shape {
 
         return path
     }
-}
+} */
 // MARK: - Support Message Model
 struct SupportMessage: Identifiable {
     let id: String
@@ -65,6 +65,78 @@ struct SupportMessage: Identifiable {
         formatter.dateStyle = .short
         formatter.timeStyle = .short
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+}
+
+import SwiftUI
+import FirebaseAuth
+
+struct EmailVerificationBanner: View {
+    @State private var isVerified: Bool = Auth.auth().currentUser?.isEmailVerified ?? true
+    @State private var sending = false
+    @State private var info: String?
+
+    var body: some View {
+        Group {
+            if !isVerified {
+                VStack(spacing: 8) {
+                    HStack(alignment: .center) {
+                        Image(systemName: "envelope.badge")
+                        Text("Please verify your email to secure your account.")
+                            .font(.subheadline)
+                        Spacer()
+                        Button("Resend") { resend() }
+                            .disabled(sending)
+                        Button("I’ve verified") { reload() }
+                    }
+                    if let info { Text(info).font(.caption).foregroundColor(.gray) }
+                }
+                .padding(12)
+                .background(Color.yellow.opacity(0.15))
+                .cornerRadius(12)
+                .padding(.horizontal)
+            }
+        }
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        Auth.auth().currentUser?.reload { _ in
+            isVerified = Auth.auth().currentUser?.isEmailVerified ?? false
+        }
+    }
+
+    private func resend() {
+        guard let user = Auth.auth().currentUser else { return }
+        sending = true
+
+        Auth.auth().useAppLanguage() // optional localization
+        let acs = makeActionCodeSettings()
+
+        user.sendEmailVerification(with: acs) { error in
+            sending = false
+            if let error = error {
+                info = "Failed to send: \(error.localizedDescription)"
+                print("❌ resend verification: \(error.localizedDescription)")
+            } else {
+                info = "Verification email sent."
+                print("✅ resend verification sent to \(user.email ?? "(no email)")")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { info = nil }
+        }
+    }
+
+    // Keep this here so the banner is standalone
+    private func makeActionCodeSettings() -> ActionCodeSettings {
+        let acs = ActionCodeSettings()
+        acs.url = URL(string: "https://blackappios.web.app/verify") // your Hosting domain
+        acs.handleCodeInApp = false
+        if let bundleId = Bundle.main.bundleIdentifier {
+            acs.setIOSBundleID(bundleId)
+        }
+        // If you use Firebase Dynamic Links, you can set:
+        // acs.dynamicLinkDomain = "blackappios.page.link"
+        return acs
     }
 }
 

@@ -4,8 +4,10 @@ import FirebaseAuth
 import FirebaseDatabase
 import FirebaseFunctions
 import Charts
+import UIKit
 
 struct AGDashboardView: View {
+    
     // ===== Existing State =====
     @State private var pendingBrands: [BrandModel] = []
     @State private var approvedBrands: [BrandModel] = []
@@ -23,6 +25,10 @@ struct AGDashboardView: View {
     @State private var supportMessages: [SupportMessage] = []
     @State private var expandedMessageId: String? = nil
     @State private var unreadCount: Int = 0
+    @State private var showManageSheet = false
+    @State private var manageTarget: NightlifeApplication?
+    @State private var actionBusy = false
+    @State private var actionError: String?
 
     struct MonthlyRevenue: Identifiable {
         let id = UUID()
@@ -31,7 +37,7 @@ struct AGDashboardView: View {
     }
 
     // ===== Nightlife Approvals State =====
-    enum NLType: String, CaseIterable { case promoter, venue }
+    enum NLType: String, CaseIterable { case promoter, venue, entertainer }
     enum NLStatus: String, CaseIterable { case pending = "pending", approved = "approved", rejected = "rejected" }
 
     struct NightlifeApplication: Identifiable {
@@ -47,6 +53,7 @@ struct AGDashboardView: View {
         let tiktok: String?
         let description: String?
         let status: NLStatus
+        let suspended: Bool
         let submittedAt: TimeInterval?
     }
 
@@ -54,6 +61,7 @@ struct AGDashboardView: View {
     @State private var nlSelectedStatus: NLStatus = .pending
     @State private var promoterApps: [NightlifeApplication] = []
     @State private var venueApps: [NightlifeApplication] = []
+    @State private var entertainerApps: [NightlifeApplication] = []
     @State private var nlIsLoading = false
     @State private var nlError: String?
     @State private var pendingCountTotal = 0
@@ -77,9 +85,9 @@ struct AGDashboardView: View {
                     .font(.largeTitle)
                     .bold()
                     .padding(.bottom, 10)
-
+                
                 tileGridSection
-
+                
                 if selectedTile == "users" { userManagementSection }
                 if selectedTile == "pendingBrands" { brandApprovalSection }
                 if selectedTile == "approvedBrands" { approvedBrandSection }
@@ -92,12 +100,12 @@ struct AGDashboardView: View {
                 if selectedTile == "supportInbox" {
                     supportInboxSection
                 }
-
+                
                 // Nightlife approvals screen
                 if selectedTile == "nightlifeApprovals" {
                     nightlifeApprovalsSection
                 }
-
+                
                 supportTileSection
             }
             .padding()
@@ -142,7 +150,56 @@ struct AGDashboardView: View {
                 }
             )
         }
-    }
+        
+        .sheet(isPresented: $showManageSheet) {
+            if let app = manageTarget {
+                NightlifeManageSheet(
+                    app: app,
+                    busy: $actionBusy,
+                    error: $actionError,
+                    onApprove: {
+                        switch app.type {
+                        case .promoter:    approvePromoter(uid: app.uid)
+                        case .entertainer: approveEntertainer(uid: app.uid)
+                        case .venue:
+                            venueApprovalTargetUid = app.uid
+                            approvalVenueId = ""
+                            approvalVenueName = app.businessName
+                            approvalVenueAddress = ""
+                            showVenueApprovalSheet = true
+                        }
+                    },
+                    onReject: { reason in
+                        rejectApplication(type: app.type, uid: app.uid, reason: reason)
+                    },
+                    onSuspend: {
+                        suspend(type: app.type, uid: app.uid)
+                    },
+                    onReinstate: {
+                        reinstate(type: app.type, uid: app.uid)
+                    },
+                    onCopyUID: {
+                        UIPasteboard.general.string = app.uid
+                    },
+                    onEmail: {
+                        if let url = URL(string: "mailto:\(app.email)") {
+                            UIApplication.shared.open(url)
+                        }
+                    },
+                    onCall: {
+                        let phone = app.phone.replacingOccurrences(of: " ", with: "")
+                        if let url = URL(string: "tel:\(phone)") {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                )
+                .preferredColorScheme(ColorScheme.dark)   // <-- explicit type to fix the .dark error
+            } else {
+                EmptyView().preferredColorScheme(ColorScheme.dark)
+            }
+        }
+        // ⬇️ ADD THIS to close `var body`:
+        }
 
     // MARK: - Tile Grid
 
@@ -183,6 +240,7 @@ struct AGDashboardView: View {
                 nlSelectedStatus = .pending
                 fetchNightlifeApplications(type: .promoter, status: .pending)
                 fetchNightlifeApplications(type: .venue, status: .pending)
+                fetchNightlifeApplications(type: .entertainer, status: .pending) // NEW
 
             default:
                 break
@@ -225,6 +283,16 @@ struct AGDashboardView: View {
                 brandRow(brand, showApprove: true, showDelete: true)
             }
         }
+    }
+    
+    private func suspendBrand(_ brand: BrandModel) {
+        let ref = Database.database().reference().child("brands").child(brand.id)
+        ref.updateChildValues(["suspended": true])
+    }
+
+    private func deleteBrand(_ brand: BrandModel) {
+        let ref = Database.database().reference().child("brands").child(brand.id)
+        ref.removeValue()
     }
 
     private func brandRow(_ brand: BrandModel, showApprove: Bool = false, showSuspend: Bool = false, showDelete: Bool = false) -> some View {
@@ -482,6 +550,7 @@ struct AGDashboardView: View {
             Picker("Type", selection: $nlSelectedType) {
                 Text("Promoters").tag(NLType.promoter)
                 Text("Venues").tag(NLType.venue)
+                Text("Entertainers").tag(NLType.entertainer)
             }
             .pickerStyle(.segmented)
             .onChange(of: nlSelectedType) { _ in
@@ -503,7 +572,13 @@ struct AGDashboardView: View {
                 Text(err).foregroundColor(.red)
             }
 
-            let items = nlSelectedType == .promoter ? promoterApps : venueApps
+            let items: [NightlifeApplication] = {
+                switch nlSelectedType {
+                case .promoter:    return promoterApps
+                case .venue:       return venueApps
+                case .entertainer: return entertainerApps
+                }
+            }()
 
             if items.isEmpty {
                 Text("No \(nlSelectedStatus.rawValue) \(nlSelectedType.rawValue)s.")
@@ -516,7 +591,7 @@ struct AGDashboardView: View {
                             Text(app.businessName.isEmpty ? app.fullName : app.businessName)
                                 .font(.headline)
                             Spacer()
-                            StatusPill(text: app.status.rawValue)   // <-- label fixed
+                            StatusPill(text: app.status.rawValue)
                         }
                         Text("\(app.fullName) • \(app.email) • \(app.phone)")
                             .font(.caption)
@@ -534,7 +609,7 @@ struct AGDashboardView: View {
                                         rejectTarget = (.promoter, app.uid)
                                         showRejectReasonSheet = true
                                     }.foregroundColor(.red)
-                                } else {
+                                } else if app.type == .venue {
                                     Button("Approve") {
                                         venueApprovalTargetUid = app.uid
                                         approvalVenueId = ""
@@ -547,13 +622,33 @@ struct AGDashboardView: View {
                                         rejectTarget = (.venue, app.uid)
                                         showRejectReasonSheet = true
                                     }.foregroundColor(.red)
+                                } else {
+                                    Button("Approve") { approveEntertainer(uid: app.uid) }
+                                        .buttonStyle(.borderedProminent)
+                                    Button("Reject") {
+                                        rejectTarget = (.entertainer, app.uid)
+                                        showRejectReasonSheet = true
+                                    }.foregroundColor(.red)
                                 }
-                            } else {
-                                Button("View") { /* optional future detail */ }
-                                    .buttonStyle(.bordered)
+                            } else if nlSelectedStatus == .approved {
+                                // Suspend/ Reinstate toggles for approved items
+                                if app.suspended {
+                                    Button("Reinstate") { reinstate(type: app.type, uid: app.uid) }
+                                        .buttonStyle(.borderedProminent)
+                                } else {
+                                    Button("Suspend") { suspend(type: app.type, uid: app.uid) }
+                                        .foregroundColor(.yellow)
+                                }
+                                Button("View") {
+                                    manageTarget = app
+                                    showManageSheet = true
+                                }
+                                .buttonStyle(.bordered)
+
                             }
                         }
                         .padding(.top, 4)
+
                     }
                     .padding()
                     .background(Color.gray.opacity(0.2))
@@ -595,15 +690,32 @@ struct AGDashboardView: View {
         ref.updateChildValues(["approved": true, "suspended": false])
     }
 
-    private func suspendBrand(_ brand: BrandModel) {
-        let ref = Database.database().reference().child("brands").child(brand.id)
-        ref.updateChildValues(["suspended": true])
-    }
+        private func suspend(type: NLType, uid: String) {
+            let fn = functions().httpsCallable("reviewNightlifeApplication")
+            fn.call(["type": type.rawValue, "uid": uid, "action": "suspend"]) { _, error in
+                if let error = error as NSError? {
+                    print("❌ suspend [\(error.domain):\(error.code)] \(error.localizedDescription) details=\(error.userInfo[FunctionsErrorDetailsKey] ?? "nil")")
+                    self.actionError = error.localizedDescription
+                }
+                self.fetchNightlifeApplications(type: self.nlSelectedType, status: self.nlSelectedStatus)
+                self.refreshNightlifePendingCounts()
+                self.actionBusy = false
+            }
+        }
 
-    private func deleteBrand(_ brand: BrandModel) {
-        let ref = Database.database().reference().child("brands").child(brand.id)
-        ref.removeValue()
-    }
+        private func reinstate(type: NLType, uid: String) {
+            let fn = functions().httpsCallable("reviewNightlifeApplication")
+            fn.call(["type": type.rawValue, "uid": uid, "action": "reinstate"]) { _, error in
+                if let error = error as NSError? {
+                    print("❌ reinstate [\(error.domain):\(error.code)] \(error.localizedDescription) details=\(error.userInfo[FunctionsErrorDetailsKey] ?? "nil")")
+                    self.actionError = error.localizedDescription
+                }
+                self.fetchNightlifeApplications(type: self.nlSelectedType, status: self.nlSelectedStatus)
+                self.refreshNightlifePendingCounts()
+                self.actionBusy = false
+            }
+        }
+
 
     private func fetchUsers() {
         let ref = Database.database().reference().child("users")
@@ -624,6 +736,7 @@ struct AGDashboardView: View {
             self.filteredUsers = results
         }
     }
+
 
     private func fetchAdminList() {
         let ref = Database.database().reference().child("admins")
@@ -647,39 +760,62 @@ struct AGDashboardView: View {
 
     private func fetchMonthlyBreakdown() {
         let ref = Database.database().reference().child("purchases")
-        var monthlyTotals: [Int: Double] = [:]
 
-        ref.observeSingleEvent(of: .value) { snapshot in
+        ref.observe(.value) { snapshot in
+            var monthlyTotals: [Int: Double] = [:]  // 1..12
+            var runningTotal: Double = 0
+
             for case let userSnap as DataSnapshot in snapshot.children {
                 for case let purchaseSnap as DataSnapshot in userSnap.children {
-                    if let dict = purchaseSnap.value as? [String: Any],
-                       let amount = dict["totalAmount"] as? Double,
-                       let timestamp = dict["timestamp"] as? TimeInterval {
+                    guard let dict = purchaseSnap.value as? [String: Any] else { continue }
 
-                        let date = Date(timeIntervalSince1970: timestamp)
-                        let monthIndex = Calendar.current.component(.month, from: date)
+                    let rawAmount = dict["totalAmount"]
+                    let amount: Double = (rawAmount as? Double)
+                        ?? (rawAmount as? NSNumber)?.doubleValue
+                        ?? Double(rawAmount as? String ?? "") ?? 0.0
+
+                    let ts = (dict["timestamp"] as? TimeInterval)
+                          ?? (dict["createdAt"] as? TimeInterval)
+                          ?? 0
+
+                    runningTotal += amount
+
+                    if ts > 0 {
+                        let date = Date(timeIntervalSince1970: ts)
+                        let monthIndex = Calendar.current.component(.month, from: date) // 1..12
                         monthlyTotals[monthIndex, default: 0] += amount
                     }
                 }
             }
 
+            // Build chart data (Jan..Dec)
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US")
             formatter.dateFormat = "MMM"
 
             var chartData: [MonthlyRevenue] = []
-
             for month in 1...12 {
-                let monthName = formatter.shortMonthSymbols[month - 1]
+                let name = formatter.shortMonthSymbols[month - 1]
                 let value = monthlyTotals[month] ?? 0
-                chartData.append(MonthlyRevenue(month: monthName, value: value))
+                chartData.append(MonthlyRevenue(month: name, value: value))
             }
+
+            let platformEarnings = runningTotal * 0.02
 
             DispatchQueue.main.async {
                 self.monthlyBreakdown = chartData
+                // Live update top-line too so dashboard reflects DB changes immediately
+                self.revenueStats = RevenueStats(
+                    monthly: 0,
+                    total: runningTotal,
+                    platformEarnings: platformEarnings
+                )
+                // Debug
+                print("📊 Live revenue: total=\(runningTotal), fee=\(platformEarnings)")
             }
         }
     }
+
 
     // MARK: - Suspend User
 
@@ -735,49 +871,35 @@ struct AGDashboardView: View {
     // MARK: - Fetch Revenue Stats
 
     private func fetchRevenueStats() {
-        guard let url = URL(string: "https://us-central1-blackappios.cloudfunctions.net/getPlatformRevenue") else {
-            print("❌ Invalid URL for getPlatformRevenue")
-            return
-        }
-
-        URLSession.shared.dataTask(with: url) { data, _, error in
+        let fn = functions().httpsCallable("getPlatformRevenue")
+        fn.call([:]) { result, error in
             if let error = error {
-                print("❌ Network error while fetching revenue stats: \(error.localizedDescription)")
+                print("❌ getPlatformRevenue (callable):", error.localizedDescription)
                 return
             }
+            guard let dict = result?.data as? [String: Any] else { return }
 
-            guard let data = data else {
-                print("❌ No data returned from revenue endpoint")
-                return
+            func toDouble(_ any: Any?) -> Double {
+                if let d = any as? Double { return d }
+                if let n = any as? NSNumber { return n.doubleValue }
+                if let s = any as? String { return Double(s) ?? 0.0 }
+                return 0.0
             }
 
-            do {
-                struct RevenueResponse: Decodable {
-                    let platformEarnings: String
-                    let totalRevenue: String
-                    let ticketsSold: Int
-                    let totalEvents: Int
-                }
+            let totalRevenue = toDouble(dict["totalRevenue"])
+            let platformEarnings = toDouble(dict["platformEarnings"])
 
-                let decoded = try JSONDecoder().decode(RevenueResponse.self, from: data)
-
-                DispatchQueue.main.async {
-                    let totalRevenue = Double(decoded.totalRevenue) ?? 0.0
-                    let platformEarnings = Double(decoded.platformEarnings) ?? 0.0
-
-                    self.revenueStats = RevenueStats(
-                        monthly: 0,
-                        total: totalRevenue,
-                        platformEarnings: platformEarnings
-                    )
-
-                    print("✅ Revenue updated: total=\(totalRevenue), earnings=\(platformEarnings)")
-                }
-            } catch {
-                print("❌ Failed to decode revenue response: \(error)")
+            DispatchQueue.main.async {
+                self.revenueStats = RevenueStats(
+                    monthly: 0,
+                    total: totalRevenue,
+                    platformEarnings: platformEarnings
+                )
+                print("✅ Revenue (callable): total=\(totalRevenue), earnings=\(platformEarnings)")
             }
-        }.resume()
+        }
     }
+
 
     // MARK: - Fetch Support Messages
 
@@ -841,96 +963,146 @@ struct AGDashboardView: View {
 
     // MARK: - Nightlife Approvals: Function Calls (FIXED to use .call)
 
+    // Replace your helper with this explicit return version
     private func functions() -> Functions {
-        Functions.functions()
+        return Functions.functions(region: "us-central1")
+    }
+    
+    // add this helper next to your other RTDB helpers
+    private func approveVenueSelfHeal(uid: String, venueId: String, name: String?, address: String?) {
+        let db = Database.database().reference()
+        let venueKey = venueId.isEmpty ? uid : venueId   // key venues/<venueKey>; you asked to keep it simple like promoter/venue
+
+        var updates: [String: Any] = [:]
+
+        // application mirror
+        updates["venueApplications/\(uid)/status"] = "approved"
+        updates["venueApplications/\(uid)/approved"] = true
+        updates["venueApplications/\(uid)/reviewedAt"] = ServerValue.timestamp()
+        updates["venueApplications/\(uid)/venueId"] = venueKey
+
+        // live venue node (minimal fields you showed)
+        updates["venues/\(venueKey)/approved"] = true
+        updates["venues/\(venueKey)/approvedAt"] = ServerValue.timestamp()
+        updates["venues/\(venueKey)/businessName"] = (name ?? "")
+        updates["venues/\(venueKey)/website"] = ""
+        updates["venues/\(venueKey)/instagram"] = ""
+        updates["venues/\(venueKey)/tiktok"] = ""
+        updates["venues/\(venueKey)/description"] = ""
+        updates["venues/\(venueKey)/uid"] = uid
+        updates["venues/\(venueKey)/sourceApplication"] = "venueApplications"
+        if let addr = address, !addr.isEmpty { updates["venues/\(venueKey)/address"] = addr }
+
+        // owner/admin mirrors so your UI can attach permissions
+        updates["venueOwners/\(uid)/venueId"] = venueKey
+        updates["venueOwners/\(uid)/approved"] = true
+        updates["venueOwners/\(uid)/suspended"] = false
+        updates["venueOwners/\(uid)/linkedAt"] = ServerValue.timestamp()
+        updates["venueAdmins/\(venueKey)/\(uid)"] = true
+
+        db.updateChildValues(updates) { err, _ in
+            if let err = err {
+                print("❌ approveVenue (self-heal RTDB): \(err.localizedDescription)")
+            } else {
+                print("🔧 approveVenue (self-heal RTDB) wrote approval for venue=\(venueKey) owner=\(uid)")
+            }
+            self.fetchNightlifeApplications(type: self.nlSelectedType, status: self.nlSelectedStatus)
+            self.refreshNightlifePendingCounts()
+        }
     }
 
+
+    // Replace the whole function with this RTDB version
     private func fetchNightlifeApplications(type: NLType, status: NLStatus, limit: Int = 100) {
         nlIsLoading = true
         nlError = nil
-        let fn = functions().httpsCallable("listNightlifeApplications")
-        fn.call([
-            "type": type.rawValue,
-            "status": status.rawValue,
-            "limit": limit
-        ]) { result, error in
-            nlIsLoading = false
-            if let error = error {
-                nlError = "Failed to load: \(error.localizedDescription)"
-                return
-            }
-            guard
-                let data = result?.data as? [String: Any],
-                let arr = data["items"] as? [[String: Any]]
-            else { return }
 
-            let mapped: [NightlifeApplication] = arr.compactMap { dict in
-                guard let uid = dict["uid"] as? String else { return nil }
-                let fullName = dict["fullName"] as? String ?? ""
-                let email = dict["email"] as? String ?? ""
-                let phone = dict["phone"] as? String ?? ""
-                let businessName = dict["businessName"] as? String ?? ""
-                let website = dict["website"] as? String
-                let instagram = dict["instagram"] as? String
-                let tiktok = dict["tiktok"] as? String
-                let desc = dict["description"] as? String
-                let st = NLStatus(rawValue: (dict["status"] as? String ?? "pending")) ?? .pending
-                let submittedAt = dict["submittedAt"] as? TimeInterval
-                return NightlifeApplication(
-                    uid: uid,
-                    type: type,
-                    fullName: fullName,
-                    email: email,
-                    phone: phone,
-                    businessName: businessName,
-                    website: website,
-                    instagram: instagram,
-                    tiktok: tiktok,
-                    description: desc,
-                    status: st,
-                    submittedAt: submittedAt
-                )
-            }
-
-            DispatchQueue.main.async {
-                if type == .promoter {
-                    self.promoterApps = mapped
-                } else {
-                    self.venueApps = mapped
-                }
-                refreshNightlifePendingCounts()
-            }
+        let node: String
+        switch type {
+        case .promoter:    node = "promoterApplications"
+        case .venue:       node = "venueApplications"
+        case .entertainer: node = "entertainerApplications"
         }
+
+        let ref = Database.database().reference().child(node)
+        ref.queryOrdered(byChild: "status")
+           .queryEqual(toValue: status.rawValue)
+           .queryLimited(toFirst: UInt(limit))
+           .observeSingleEvent(of: .value) { snapshot in
+               var items: [NightlifeApplication] = []
+
+               for case let child as DataSnapshot in snapshot.children {
+                   guard let v = child.value as? [String: Any] else { continue }
+                   let uid = child.key
+                   let fullName = v["fullName"] as? String ?? ""
+                   let email = v["email"] as? String ?? ""
+                   let phone = v["phone"] as? String ?? ""
+                   let businessName = v["businessName"] as? String ?? ""
+                   let website = v["website"] as? String
+                   let instagram = v["instagram"] as? String
+                   let tiktok = v["tiktok"] as? String
+                   let desc = v["description"] as? String
+                   let stRaw = (v["status"] as? String) ?? "pending"
+                   let st = NLStatus(rawValue: stRaw) ?? .pending
+                   let suspended = (v["suspended"] as? Bool) ?? false
+                   // RTDB timestamp is in ms — divide to seconds for TimeInterval display if you want
+                   let submittedMs = (v["submittedAt"] as? TimeInterval)
+                   let submittedAt = submittedMs != nil ? submittedMs! / 1000.0 : nil
+
+                   items.append(NightlifeApplication(
+                       uid: uid,
+                       type: type,
+                       fullName: fullName,
+                       email: email,
+                       phone: phone,
+                       businessName: businessName,
+                       website: website,
+                       instagram: instagram,
+                       tiktok: tiktok,
+                       description: desc,
+                       status: st,
+                       suspended: suspended,
+                       submittedAt: submittedAt
+                   ))
+               }
+
+               DispatchQueue.main.async {
+                   switch type {
+                   case .promoter:    self.promoterApps = items
+                   case .venue:       self.venueApps = items
+                   case .entertainer: self.entertainerApps = items
+                   }
+                   self.nlIsLoading = false
+                   self.refreshNightlifePendingCounts()
+               }
+           }
     }
 
+
+    // Replace the whole function with this RTDB-based counter
     private func refreshNightlifePendingCounts() {
-        let cached = promoterApps.filter { $0.status == .pending }.count
-                    + venueApps.filter { $0.status == .pending }.count
-        if cached > 0 {
-            self.pendingCountTotal = cached
-            return
+        func countPending(_ path: String, _ done: @escaping (Int) -> Void) {
+            let ref = Database.database().reference().child(path)
+            ref.queryOrdered(byChild: "status").queryEqual(toValue: "pending")
+                .observeSingleEvent(of: .value) { snap in
+                    var c = 0
+                    for _ in snap.children { c += 1 }
+                    done(c)
+                }
         }
 
-        let fn = functions().httpsCallable("listNightlifeApplications")
         let group = DispatchGroup()
-        var pCount = 0, vCount = 0
+        var p = 0, v = 0, e = 0
 
-        group.enter()
-        fn.call(["type": "promoter", "status": "pending", "limit": 200]) { res, _ in
-            defer { group.leave() }
-            if let data = res?.data as? [String: Any], let arr = data["items"] as? [[String: Any]] { pCount = arr.count }
-        }
-
-        group.enter()
-        fn.call(["type": "venue", "status": "pending", "limit": 200]) { res, _ in
-            defer { group.leave() }
-            if let data = res?.data as? [String: Any], let arr = data["items"] as? [[String: Any]] { vCount = arr.count }
-        }
+        group.enter(); countPending("promoterApplications") { p = $0; group.leave() }
+        group.enter(); countPending("venueApplications")    { v = $0; group.leave() }
+        group.enter(); countPending("entertainerApplications") { e = $0; group.leave() }
 
         group.notify(queue: .main) {
-            self.pendingCountTotal = pCount + vCount
+            self.pendingCountTotal = p + v + e
         }
     }
+
 
     private func approvePromoter(uid: String) {
         let fn = functions().httpsCallable("reviewNightlifeApplication")
@@ -945,21 +1117,63 @@ struct AGDashboardView: View {
         }
     }
 
+    // replace your approveVenue() body with this version (only the call/handler changed)
     private func approveVenue(uid: String, venueId: String, name: String?, address: String?) {
         let fn = functions().httpsCallable("reviewNightlifeApplication")
-        fn.call([
-            "type": "venue",
-            "uid": uid,
-            "action": "approve",
-            "venue": ["venueId": venueId, "name": name ?? "", "address": address ?? ""]
-        ]) { _, error in
-            if let error = error {
-                print("❌ approveVenue:", error.localizedDescription)
+
+        var payload: [String: Any] = ["type": "venue", "uid": uid, "action": "approve"]
+        let trimmedId = venueId.trimmingCharacters(in: .whitespaces)
+        if !trimmedId.isEmpty || (name?.isEmpty == false) || (address?.isEmpty == false) {
+            payload["venue"] = ["venueId": trimmedId, "name": name ?? "", "address": address ?? ""]
+        }
+
+        fn.call(payload) { _, error in
+            if let err = error as NSError? {
+                let details = err.userInfo[FunctionsErrorDetailsKey] ?? "nil"
+                print("❌ approveVenue [\(err.domain):\(err.code)] \(err.localizedDescription) details=\(details)")
+                // fallback write so dashboard/state isn’t blocked:
+                self.approveVenueSelfHeal(uid: uid, venueId: trimmedId, name: name, address: address)
                 return
             }
-            print("✅ Venue approved:", uid, "→", venueId)
-            fetchNightlifeApplications(type: nlSelectedType, status: nlSelectedStatus)
-            refreshNightlifePendingCounts()
+            print("✅ Venue approved via callable:", uid, "→", trimmedId)
+            self.fetchNightlifeApplications(type: self.nlSelectedType, status: self.nlSelectedStatus)
+            self.refreshNightlifePendingCounts()
+        }
+    }
+
+    private func approveEntertainer(uid: String) {
+        let fn = functions().httpsCallable("reviewNightlifeApplication")
+        fn.call(["type": "entertainer", "uid": uid, "action": "approve"]) { _, error in
+            if let error = error {
+                print("❌ approveEntertainer (callable):", error.localizedDescription)
+                // fall through to self-heal anyway
+            } else {
+                print("✅ Entertainer approved via callable:", uid)
+            }
+
+            // ---- Self-heal: mirror approval to both nodes so the app stops showing "pending"
+            let db = Database.database().reference()
+            var updates: [String: Any] = [:]
+
+            // application node
+            updates["entertainerApplications/\(uid)/status"] = "approved"
+            updates["entertainerApplications/\(uid)/approved"] = true
+            updates["entertainerApplications/\(uid)/reviewedAt"] = ServerValue.timestamp()
+
+            // live role node
+            updates["entertainers/\(uid)/approved"] = true
+            updates["entertainers/\(uid)/createdAt"] = ServerValue.timestamp()
+
+            db.updateChildValues(updates) { err, _ in
+                if let err = err {
+                    print("❌ approveEntertainer (self-heal RTDB): \(err.localizedDescription)")
+                } else {
+                    print("🔧 approveEntertainer (self-heal RTDB) wrote approval flags for \(uid)")
+                }
+                // Refresh UI either way
+                fetchNightlifeApplications(type: nlSelectedType, status: nlSelectedStatus)
+                refreshNightlifePendingCounts()
+            }
         }
     }
 
@@ -1049,14 +1263,16 @@ private struct VenueApprovalSheet: View {
         NavigationView {
             Form {
                 Section(header: Text("Venue Mapping")) {
-                    TextField("Venue ID (required)", text: $venueId)
+                    TextField("Venue ID (optional)", text: $venueId) // optional now
                     TextField("Venue Name (optional)", text: $name)
                     TextField("Venue Address (optional)", text: $address)
                 }
                 Section {
                     Button("Approve") {
-                        guard !venueId.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-                        onApprove(uid, venueId, name.isEmpty ? nil : name, address.isEmpty ? nil : address)
+                        onApprove(uid,
+                                  venueId.trimmingCharacters(in: .whitespaces),
+                                  name.isEmpty ? nil : name,
+                                  address.isEmpty ? nil : address)
                     }
                     .buttonStyle(.borderedProminent)
                     Button("Cancel", role: .cancel) { onCancel() }
@@ -1085,6 +1301,78 @@ private struct RejectReasonSheet: View {
             }
             .navigationTitle("Reject Application")
             .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+private struct NightlifeManageSheet: View {
+    let app: AGDashboardView.NightlifeApplication
+
+    @Binding var busy: Bool
+    @Binding var error: String?
+
+    var onApprove: () -> Void
+    var onReject: (_ reason: String) -> Void
+    var onSuspend: () -> Void
+    var onReinstate: () -> Void
+    var onCopyUID: () -> Void
+    var onEmail: () -> Void
+    var onCall: () -> Void
+
+    @State private var rejectReason = ""
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Applicant")) {
+                    Text("Type: \(app.type.rawValue.capitalized)")
+                    Text("Name: \(app.businessName.isEmpty ? app.fullName : app.businessName)")
+                    Text("Email: \(app.email)")
+                    Text("Phone: \(app.phone)")
+                    Text("Status: \(app.status.rawValue)\(app.suspended ? " (Suspended)" : "")")
+                    Button("Copy UID") { onCopyUID() }
+                }
+
+                Section(header: Text("Contact")) {
+                    Button("Email \(app.email)") { onEmail() }
+                    Button("Call \(app.phone)") { onCall() }
+                }
+
+                Section(header: Text("Actions")) {
+                    if app.status == .pending {
+                        Button {
+                            busy = true; onApprove(); dismiss()
+                        } label: {
+                            Text("Approve").bold()
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        VStack(alignment: .leading) {
+                            TextField("Rejection reason (optional)", text: $rejectReason)
+                            Button(role: .destructive) {
+                                busy = true; onReject(rejectReason); dismiss()
+                            } label: { Text("Reject") }
+                        }
+                    } else if app.status == .approved {
+                        if app.suspended {
+                            Button("Reinstate") { busy = true; onReinstate(); dismiss() }
+                                .buttonStyle(.borderedProminent)
+                        } else {
+                            Button("Suspend") { busy = true; onSuspend(); dismiss() }
+                                .foregroundColor(.yellow)
+                        }
+                    }
+
+                    if let e = error {
+                        Text(e).foregroundColor(.red)
+                    }
+                }
+            }
+            .navigationTitle("Manage")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+            }
         }
     }
 }

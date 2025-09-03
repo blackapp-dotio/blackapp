@@ -2,15 +2,23 @@ import Foundation
 import FirebaseDatabase
 
 
-struct RSSArticle: Identifiable, Codable {
-    let id = UUID()
+// MARK: - Article model used across the Gossip tab
+
+struct RSSArticle: Identifiable, Hashable {
     let title: String
     let link: String
     let description: String
     let pubDate: Date
-    let imageURL: URL? // ← Make this optional
-    let videoURL: URL? // ✅ Add this line
+    let imageURL: URL?
+    let videoURL: URL?
+
+    // Stable id: prefer link; fall back to title+time
+    var id: String {
+        if !link.isEmpty { return link }
+        return "\(title)|\(pubDate.timeIntervalSince1970)"
+    }
 }
+
 
 
 
@@ -176,3 +184,5 @@ public struct NightlifeMiniAppIcon: View {
         .shadow(color: Color.purple.opacity(0.35), radius: 14, x: 0, y: 8)
     }
 }
+
+
