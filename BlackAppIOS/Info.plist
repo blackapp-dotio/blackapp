@@ -2,25 +2,45 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleGetInfoString</key>
-	<string></string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeRole</key>
-			<string>None</string>
-			<key>CFBundleURLName</key>
-			<string></string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>blackappios</string>
-				<string>com.googleusercontent.apps.228561181689-nsgktb9doqtnsmnv2i0bdskaj2v6ke9r</string>
-			</array>
-		</dict>
-	</array>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-	</array>
+    <!-- Existing keys preserved -->
+    <key>CFBundleGetInfoString</key>
+    <string></string>
+
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>None</string>
+            <key>CFBundleURLName</key>
+            <string></string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>blackappios</string>
+                <string>com.googleusercontent.apps.228561181689-nsgktb9doqtnsmnv2i0bdskaj2v6ke9r</string>
+            </array>
+        </dict>
+    </array>
+
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>remote-notification</string>
+    </array>
+
+    <!-- Required privacy purpose strings -->
+    <key>NSCameraUsageDescription</key>
+    <string>BlackApp uses your camera so you can capture nightlife photos and videos for the Gossip feed.</string>
+
+    <key>NSMicrophoneUsageDescription</key>
+    <string>BlackApp uses your microphone to record audio with your videos.</string>
+
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>BlackApp lets you choose photos and videos from your library to share.</string>
+
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>BlackApp can save your captured photos and videos to your library if you choose.</string>
+
+    <!-- Optional (Apple warned but not required to fix). Safe to keep if any SDK references Core Location. -->
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>BlackApp uses your location to suggest nearby events and nightlife spots.</string>
 </dict>
 </plist>

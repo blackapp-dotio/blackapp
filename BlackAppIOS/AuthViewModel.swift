@@ -3,40 +3,45 @@ import Firebase
 import FirebaseAuth
 import FirebaseDatabase
 import FirebaseFirestore
-import FirebaseFunctions       // ✅ needed for the callable
+import FirebaseFunctions
 import GoogleSignIn
 import OneSignalFramework
 
-class AuthViewModel: ObservableObject {
+final class AuthViewModel: ObservableObject {
     @Published var user: User?
     @Published var currentUser: User?
-    
-    // Optional helper for use in views
+
     var currentUserId: String? { currentUser?.uid }
 
-    // Cache Functions instance
     private let functions = Functions.functions()
 
+    // MARK: - Init
     init() {
         self.user = Auth.auth().currentUser
         self.currentUser = Auth.auth().currentUser
-        migrateUsersFromRealtimeToFirestore()
 
-        // Listen for auth state changes
+        // 🔄 Listen for auth changes
         Auth.auth().addStateDidChangeListener { [weak self] _, user in
-            guard let self = self else { return }
+            guard let self else { return }
             DispatchQueue.main.async {
+                self.user = user
                 self.currentUser = user
-                if let _ = user {
-                    OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
-                    // ✅ Ensure defaults exist after any sign-in path
-                    self.seedUserDefaultsIfNeeded()
-                }
+
+                guard let user else { return }
+                // Push tokens → server
+                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
+                // 1) Ensure minimal defaults (CF)
+                self.seedUserDefaultsIfNeeded()
+
+                // 2) Ensure profile exists & normalized in both DBs (fast search)
+                Task { await self.ensureCurrentUserProfileMirroredAndNormalized(user) }
             }
         }
     }
 
-    // MARK: - Sign Out
+    // MARK: - Public Auth APIs
+
     func signOut() {
         do {
             try Auth.auth().signOut()
@@ -49,7 +54,6 @@ class AuthViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Email Sign Up
     func signUp(email: String,
                 password: String,
                 name: String,
@@ -62,63 +66,58 @@ class AuthViewModel: ObservableObject {
                 DispatchQueue.main.async { completion(error) }
                 return
             }
-            
-            let uid = result.user.uid
-            self.user = result.user
 
-            // Seed minimal profile in RTDB + Firestore (also include defaults—harmless if callable runs too)
-            let userData: [String: Any] = [
-                "name": name,
-                "username": username,
-                "profileImageURL": profileImageURL,
-                "circleSize": 0,
-                "badgeTier": "white"
-            ]
-            Database.database().reference().child("users").child(uid).updateChildValues(userData)
-            Firestore.firestore().collection("users").document(uid).setData(userData, merge: true)
+            let fbUser = result.user
+            self.user = fbUser
+            self.currentUser = fbUser
 
-            DispatchQueue.main.async {
-                self.currentUser = result.user
-                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
-                // ✅ Also call callable to guarantee defaults server-side
+            Task {
+                // Upsert normalized profile to both DBs
+                await self.upsertProfileForCurrentUser(
+                    name: name,
+                    username: username,
+                    profileImageURL: profileImageURL
+                )
+
+                // Defaults + tokens
                 self.seedUserDefaultsIfNeeded()
-                completion(nil)
+                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
+                DispatchQueue.main.async { completion(nil) }
             }
         }
     }
 
-    // MARK: - Email Sign In
     func signIn(email: String, password: String, completion: @escaping (Error?) -> Void) {
         Auth.auth().signIn(withEmail: email, password: password) { result, error in
             DispatchQueue.main.async {
-                if let result = result {
-                    self.user = result.user
-                    self.currentUser = result.user
+                if let user = result?.user {
+                    self.user = user
+                    self.currentUser = user
                     OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
-                    // ✅ Ensure defaults
                     self.seedUserDefaultsIfNeeded()
+                    Task { await self.ensureCurrentUserProfileMirroredAndNormalized(user) }
                 }
                 completion(error)
             }
         }
     }
 
-    // MARK: - Google Sign-In
     func signInWithGoogle(presentingVC: UIViewController, completion: @escaping (Error?) -> Void) {
         guard let clientID = FirebaseApp.app()?.options.clientID else {
             completion(NSError(domain: "Firebase", code: -1, userInfo: [NSLocalizedDescriptionKey: "Missing Firebase Client ID"]))
             return
         }
-        
+
         let config = GIDConfiguration(clientID: clientID)
         GIDSignIn.sharedInstance.configuration = config
-        
+
         GIDSignIn.sharedInstance.signIn(withPresenting: presentingVC) { result, error in
             if let error = error {
                 DispatchQueue.main.async { completion(error) }
                 return
             }
-            
+
             guard let googleUser = result?.user,
                   let idToken = googleUser.idToken?.tokenString else {
                 DispatchQueue.main.async {
@@ -126,85 +125,142 @@ class AuthViewModel: ObservableObject {
                 }
                 return
             }
-            
+
             let accessToken = googleUser.accessToken.tokenString
             let credential = GoogleAuthProvider.credential(withIDToken: idToken, accessToken: accessToken)
-            
-            Auth.auth().signIn(with: credential) { authResult, error in
-                DispatchQueue.main.async {
-                    if let user = authResult?.user {
-                        self.user = user
-                        self.currentUser = user
-                        
-                        let uid = user.uid
-                        let name = user.displayName ?? "Unnamed"
-                        let username = user.email?.components(separatedBy: "@").first ?? String(uid.prefix(6))
-                        let profileImageURL = user.photoURL?.absoluteString ?? ""
-                        
-                        let userData: [String: Any] = [
-                            "name": name,
-                            "username": username,
-                            "profileImageURL": profileImageURL,
-                            "circleSize": 0,
-                            "badgeTier": "white"
-                        ]
-                        Database.database().reference().child("users").child(uid).updateChildValues(userData)
-                        Firestore.firestore().collection("users").document(uid).setData(userData, merge: true)
 
-                        OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
-                        // ✅ Ensure defaults on server too
-                        self.seedUserDefaultsIfNeeded()
-                    }
-                    completion(error)
+            Auth.auth().signIn(with: credential) { authResult, error in
+                if let error = error {
+                    DispatchQueue.main.async { completion(error) }
+                    return
+                }
+
+                guard let fbUser = authResult?.user else {
+                    DispatchQueue.main.async { completion(nil) }
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    self.user = fbUser
+                    self.currentUser = fbUser
+                }
+
+                // Build best-effort profile from Google
+                let uid = fbUser.uid
+                let name = fbUser.displayName ?? "User"
+                let emailHandle = fbUser.email?.components(separatedBy: "@").first ?? String(uid.prefix(6))
+                let usernameRaw = emailHandle.isEmpty ? String(uid.prefix(6)) : emailHandle
+                let profileImageURL = fbUser.photoURL?.absoluteString ?? ""
+
+                Task {
+                    await self.upsertProfileForCurrentUser(
+                        name: name,
+                        username: usernameRaw,
+                        profileImageURL: profileImageURL
+                    )
+
+                    OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+                    self.seedUserDefaultsIfNeeded()
+                    DispatchQueue.main.async { completion(nil) }
                 }
             }
         }
     }
 
-    // MARK: - Callable: ensureUserDefaults
-    /// Calls the Cloud Function `ensureUserDefaults` to guarantee `circleSize` and `badgeTier` exist server-side.
+    // MARK: - Write/Normalize Helpers
+
+    /// Ensures the current user has a normalized profile in both RTDB and Firestore.
+    private func ensureCurrentUserProfileMirroredAndNormalized(_ fbUser: User) async {
+        // Try to read a minimal profile; if missing or not normalized, upsert.
+        let (name, username, photo) = await readBestEffortCurrentProfile(uid: fbUser.uid)
+        await upsertProfileForCurrentUser(
+            name: name ?? (fbUser.displayName ?? "User"),
+            username: username ?? (fbUser.email?.components(separatedBy: "@").first ?? String(fbUser.uid.prefix(6))),
+            profileImageURL: photo ?? fbUser.photoURL?.absoluteString ?? ""
+        )
+    }
+
+    /// Upserts to RTDB and Firestore with normalized, indexed fields.
+    private func upsertProfileForCurrentUser(name: String,
+                                             username: String,
+                                             profileImageURL: String) async
+    {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+
+        // Derive clean username & normalized search fields
+        let cleanUsername = username.replacingOccurrences(of: " ", with: "")
+        let nameLower = name.lowercased()
+        let usernameLower = cleanUsername.lowercased()
+
+        // Merge payload (safe defaults)
+        var payload: [String: Any] = [
+            "name": name,
+            "username": cleanUsername,
+            "profileImageURL": profileImageURL,
+            // defaults if absent server-side; CF will also enforce
+            "circleSize": FieldValue.increment(Int64(0)),
+  // Firestore-friendly no-op; ignored by RTDB
+            "badgeTier": "white",
+            // normalized searchable fields
+            "nameLower": nameLower,
+            "usernameLower": usernameLower
+        ]
+
+        // RTDB write
+        let rtdbRef = Database.database().reference(withPath: "users/\(uid)")
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            // RTDB lacks FieldValue.increment. Strip it.
+            var rtdbPayload = payload
+            rtdbPayload["circleSize"] = (rtdbPayload["circleSize"] as? Int) ?? 0
+            rtdbRef.updateChildValues(rtdbPayload) { _, _ in cont.resume() }
+        }
+
+        // Firestore write (merge)
+        let fsRef = Firestore.firestore().collection("users").document(uid)
+        do {
+            try await fsRef.setData(payload, merge: true)
+        } catch {
+            print("❌ Firestore user upsert failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Reads a minimal profile from RTDB first (hot cache), falling back to Firestore.
+    private func readBestEffortCurrentProfile(uid: String) async -> (String?, String?, String?) {
+        // RTDB
+        let r = Database.database().reference(withPath: "users/\(uid)")
+        let rtdb: [String: Any]? = await withCheckedContinuation { cont in
+            r.observeSingleEvent(of: .value) { snap in
+                cont.resume(returning: snap.value as? [String: Any])
+            }
+        }
+        if let d = rtdb {
+            let name = (d["name"] as? String) ?? (d["displayName"] as? String)
+            let username = (d["username"] as? String) ?? (d["handle"] as? String)
+            let photo = (d["profileImageURL"] as? String) ?? (d["photoURL"] as? String)
+            return (name, username, photo)
+        }
+
+        // Firestore
+        do {
+            let doc = try await Firestore.firestore().collection("users").document(uid).getDocument()
+            let d = doc.data() ?? [:]
+            let name = (d["name"] as? String) ?? (d["displayName"] as? String)
+            let username = (d["username"] as? String) ?? (d["handle"] as? String)
+            let photo = (d["profileImageURL"] as? String) ?? (d["photoURL"] as? String)
+            return (name, username, photo)
+        } catch {
+            print("⚠️ Firestore get user failed: \(error.localizedDescription)")
+            return (nil, nil, nil)
+        }
+    }
+
+    // MARK: - Cloud Function: ensure defaults exist
     private func seedUserDefaultsIfNeeded() {
         guard Auth.auth().currentUser != nil else { return }
         functions.httpsCallable("ensureUserDefaults").call { result, error in
-            if let error = error {
-                print("❌ ensureUserDefaults error: \(error.localizedDescription)")
-                return
-            }
+            if let error { print("❌ ensureUserDefaults error: \(error.localizedDescription)") }
             if let dict = result?.data as? [String: Any] {
                 print("✅ ensureUserDefaults:", dict)
-            }
-        }
-    }
-
-    // MARK: - Realtime to Firestore Migration (unchanged)
-    func migrateUsersFromRealtimeToFirestore() {
-        let realtimeRef = Database.database().reference().child("users")
-        let firestoreRef = Firestore.firestore().collection("users")
-        
-        realtimeRef.observeSingleEvent(of: .value) { snapshot in
-            guard snapshot.exists() else {
-                print("❌ No users found in Realtime Database.")
-                return
-            }
-            
-            for case let child as DataSnapshot in snapshot.children {
-                let uid = child.key
-                guard let data = child.value as? [String: Any] else { continue }
-                
-                var userData: [String: Any] = [:]
-                if let name = data["name"] as? String { userData["name"] = name }
-                if let username = data["username"] as? String { userData["username"] = username }
-                if let image = data["profileImageURL"] as? String { userData["profileImageURL"] = image }
-                if let circle = data["circleSize"] as? Int { userData["circleSize"] = circle }
-                if let badge = data["badgeTier"] as? String { userData["badgeTier"] = badge }
-
-                firestoreRef.document(uid).setData(userData, merge: true) { error in
-                    if let error = error {
-                        print("❌ Failed to write user \(uid): \(error.localizedDescription)")
-                    } else {
-                        print("✅ Migrated user \(uid) to Firestore.")
-                    }
-                }
             }
         }
     }

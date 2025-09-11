@@ -361,38 +361,95 @@ struct ProfileTabView: View {
 
     private func saveProfile() {
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        let ref = Database.database().reference().child("users").child(uid)
 
-        if profileImage == nil {
-            ref.observeSingleEvent(of: .value) { snapshot in
-                var data: [String: Any] = ["name": name, "bio": bio]
-                if let existingData = snapshot.value as? [String: Any],
-                   let existingProfileURL = existingData["profileImageURL"] as? String {
-                    data["profileImageURL"] = existingProfileURL
+        let rtdbRef = Database.database().reference().child("users").child(uid)
+        let fsRef   = Firestore.firestore().collection("users").document(uid)
+
+        // 1) Read existing to preserve photo/username if you didn't change them here
+        rtdbRef.observeSingleEvent(of: .value) { snapshot in
+            let existing = snapshot.value as? [String: Any] ?? [:]
+            let existingPhoto = (existing["profileImageURL"] as? String)
+            let existingUsername = (existing["username"] as? String)
+
+            // If you have a `username` text field in this view, prefer that; otherwise keep existing or derive.
+            let derivedFallback = self.deriveUsername(fromName: self.name, uid: uid)
+            let baseUsername = (existingUsername?.isEmpty == false ? existingUsername! : derivedFallback)
+            let cleanUsername = baseUsername.replacingOccurrences(of: " ", with: "")
+            let nameLower = self.name.lowercased()
+            let usernameLower = cleanUsername.lowercased()
+
+            // Helper to proceed with final photo url (existing or newly uploaded)
+            func finishWrite(using finalPhotoURL: String?) {
+                // Build a single payload for both Firestore & RTDB
+                var doc: [String: Any] = [
+                    "name": self.name,
+                    "bio": self.bio,
+                    "username": cleanUsername,
+                    "profileImageURL": finalPhotoURL ?? existingPhoto ?? "",
+                    // normalized, indexed fields for fast search
+                    "nameLower": nameLower,
+                    "usernameLower": usernameLower
+                ]
+
+                // 2) Firestore (merge)
+                fsRef.setData(doc, merge: true) { err in
+                    if let err = err { print("❌ Firestore profile update failed: \(err.localizedDescription)") }
                 }
-                ref.updateChildValues(data)
-            }
-        } else {
-            if let image = profileImage, let imageData = image.jpegData(compressionQuality: 0.8) {
-                let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
-                storageRef.putData(imageData) { _, error in
+
+                // 3) RTDB (no FieldValue types here)
+                rtdbRef.updateChildValues(doc) { error, _ in
                     if let error = error {
-                        print("❌ Upload failed: \(error.localizedDescription)")
-                        return
+                        print("❌ RTDB profile update failed: \(error.localizedDescription)")
+                    } else {
+                        print("✅ Profile saved (RTDB + Firestore) with normalized fields.")
                     }
-                    storageRef.downloadURL { url, _ in
-                        if let url = url {
-                            let data: [String: Any] = [
-                                "name": name,
-                                "bio": bio,
-                                "profileImageURL": url.absoluteString
-                            ]
-                            ref.updateChildValues(data)
-                        }
-                    }
+                }
+            }
+
+            // 4) Upload image only if you picked a new one; else reuse existing
+            guard let image = self.profileImage else {
+                finishWrite(using: existingPhoto) // no new image; keep what we had
+                return
+            }
+
+            // Compress & upload avatar
+            guard let data = image.jpegData(compressionQuality: 0.82) else {
+                print("⚠️ Couldn’t encode JPEG; keeping previous photo.")
+                finishWrite(using: existingPhoto)
+                return
+            }
+
+            let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
+            let meta = StorageMetadata(); meta.contentType = "image/jpeg"
+
+            storageRef.putData(data, metadata: meta) { _, uploadError in
+                if let uploadError = uploadError {
+                    print("❌ Avatar upload failed: \(uploadError.localizedDescription)")
+                    finishWrite(using: existingPhoto) // don’t block profile save
+                    return
+                }
+                storageRef.downloadURL { url, _ in
+                    finishWrite(using: url?.absoluteString ?? existingPhoto)
                 }
             }
         }
+    }
+
+    // MARK: - Local helper (same file)
+    private func deriveUsername(fromName name: String, uid: String) -> String {
+        // Prefer email handle when available
+        if let email = Auth.auth().currentUser?.email,
+           let handle = email.split(separator: "@").first, !handle.isEmpty {
+            return String(handle)
+        }
+        // Fallback: alphanumerics from name, otherwise suffix of uid
+        let allowed = CharacterSet.alphanumerics
+        let base = name.lowercased()
+            .components(separatedBy: allowed.inverted)
+            .filter { !$0.isEmpty }
+            .joined()
+        if base.count >= 3 { return base }
+        return (base.isEmpty ? "user" : base) + String(uid.suffix(6)).lowercased()
     }
 
     private func fetchProfile() {

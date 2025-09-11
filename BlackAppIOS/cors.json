@@ -1,0 +1,12 @@
+[
+  {
+    "origin": [
+      "https://blackapp.io",
+      "https://black-app-web.web.app",
+      "https://blackappios.web.app"
+    ],
+    "method": ["GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type"],
+    "maxAgeSeconds": 3600
+  }
+]

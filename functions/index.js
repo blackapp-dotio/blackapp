@@ -1828,3 +1828,556 @@ exports.backfillInviteCodes = require('firebase-functions')
     }
   });
 
+
+
+
+
+
+
+
+----------------------------------------------------------------------------------
+----------------------------------------------------------------------------------
+
+import SwiftUI
+import AVFoundation
+import AVKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
+
+// MARK: - Filters
+
+enum LCFilterKind: String, CaseIterable, Identifiable {
+    case none, mono, sepia, vivid
+    var id: String { rawValue }
+}
+
+private let ciContext = CIContext()
+
+func applyFilter(_ kind: LCFilterKind, to image: UIImage) -> UIImage {
+    guard kind != .none, let cg = image.cgImage else { return image }
+    let ci = CIImage(cgImage: cg)
+
+    let out: CIImage
+    switch kind {
+    case .mono:
+        let f = CIFilter.photoEffectNoir()
+        f.inputImage = ci
+        out = f.outputImage ?? ci
+    case .sepia:
+        let f = CIFilter.sepiaTone()
+        f.intensity = 0.9
+        f.inputImage = ci
+        out = f.outputImage ?? ci
+    case .vivid:
+        let f = CIFilter.colorControls()
+        f.inputImage = ci
+        f.saturation = 1.4
+        f.contrast   = 1.1
+        f.brightness = 0.05
+        out = f.outputImage ?? ci
+    case .none:
+        out = ci
+    }
+
+    guard let cgOut = ciContext.createCGImage(out, from: out.extent) else { return image }
+    return UIImage(cgImage: cgOut, scale: image.scale, orientation: image.imageOrientation)
+}
+
+func makeVideoComposition(for asset: AVAsset, kind: LCFilterKind) -> AVVideoComposition? {
+    guard kind != .none else { return nil }
+    return AVVideoComposition(asset: asset) { request in
+        var img = request.sourceImage.clampedToExtent()
+
+        switch kind {
+        case .mono:
+            let f = CIFilter.photoEffectNoir()
+            f.inputImage = img
+            img = f.outputImage ?? img
+        case .sepia:
+            let f = CIFilter.sepiaTone()
+            f.intensity = 0.9
+            f.inputImage = img
+            img = f.outputImage ?? img
+        case .vivid:
+            let f = CIFilter.colorControls()
+            f.inputImage = img
+            f.saturation = 1.4
+            f.contrast   = 1.1
+            f.brightness = 0.05
+            img = f.outputImage ?? img
+        case .none:
+            break
+        }
+
+        let cropped = img.cropped(to: request.sourceImage.extent)
+        request.finish(with: cropped, context: nil)
+    }
+}
+
+func exportFilteredVideo(asset: AVAsset, kind: LCFilterKind, completion: @escaping (URL?) -> Void) {
+    let outputURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("mp4")
+
+    guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetMediumQuality) else {
+        completion(nil); return
+    }
+    exporter.outputURL = outputURL
+    exporter.outputFileType = .mp4
+    exporter.shouldOptimizeForNetworkUse = true
+    exporter.videoComposition = makeVideoComposition(for: asset, kind: kind)
+
+    exporter.exportAsynchronously {
+        guard exporter.status == .completed else { completion(nil); return }
+        completion(outputURL)
+    }
+}
+
+// MARK: - Camera Manager
+
+final class BAICameraManager: NSObject, ObservableObject {
+    let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "bai.camera.session")
+    private var videoDeviceInput: AVCaptureDeviceInput?
+
+    private let photoOutput = AVCapturePhotoOutput()
+    private let movieOutput = AVCaptureMovieFileOutput()
+
+    @Published var isRecording = false
+    @Published var usingFrontCamera = false
+
+    // Callbacks to UI
+    var onPhoto: ((UIImage) -> Void)?
+    var onVideo: ((URL) -> Void)?
+
+    override init() {
+        super.init()
+        session.sessionPreset = .high
+    }
+
+    func requestPermissionsAndConfigure() {
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] vGranted in
+            AVCaptureDevice.requestAccess(for: .audio) { aGranted in
+                guard vGranted else { return }
+                self?.sessionQueue.async { self?.configureSession() }
+            }
+        }
+    }
+
+    private func configureSession() {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        // Inputs
+        session.inputs.forEach { session.removeInput($0) }
+        let position: AVCaptureDevice.Position = usingFrontCamera ? .front : .back
+        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+              let videoInput = try? AVCaptureDeviceInput(device: videoDevice),
+              session.canAddInput(videoInput) else { return }
+        session.addInput(videoInput)
+        videoDeviceInput = videoInput
+
+        if let audio = AVCaptureDevice.default(for: .audio),
+           let audioInput = try? AVCaptureDeviceInput(device: audio),
+           session.canAddInput(audioInput) {
+            session.addInput(audioInput)
+        }
+
+        // Outputs
+        session.outputs.forEach { session.removeOutput($0) }
+
+        if session.canAddOutput(photoOutput) {
+            session.addOutput(photoOutput)
+            photoOutput.isHighResolutionCaptureEnabled = true
+        }
+        if session.canAddOutput(movieOutput) {
+            session.addOutput(movieOutput)
+        }
+    }
+
+    func startRunning() {
+        sessionQueue.async {
+            if !self.session.isRunning { self.session.startRunning() }
+        }
+    }
+
+    func stopRunning() {
+        sessionQueue.async {
+            if self.session.isRunning { self.session.stopRunning() }
+        }
+    }
+
+    func flipCamera() {
+        usingFrontCamera.toggle()
+        sessionQueue.async { self.configureSession() }
+    }
+
+    // MARK: Photo
+
+    func capturePhoto() {
+        let settings = AVCapturePhotoSettings()
+        settings.flashMode = .off
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    // MARK: Video
+
+    func startRecording() {
+        guard !movieOutput.isRecording else { return }
+
+        if let conn = movieOutput.connection(with: .video),
+           conn.isVideoOrientationSupported {
+            conn.videoOrientation = .portrait
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("mov")
+        movieOutput.startRecording(to: url, recordingDelegate: self)
+        DispatchQueue.main.async {
+            self.isRecording = true
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+    }
+
+    func stopRecording() {
+        guard movieOutput.isRecording else { return }
+        movieOutput.stopRecording()
+    }
+}
+
+extension BAICameraManager: AVCapturePhotoCaptureDelegate {
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingPhoto photo: AVCapturePhoto,
+                     error: Error?) {
+        guard error == nil,
+              let data = photo.fileDataRepresentation(),
+              let image = UIImage(data: data) else { return }
+        DispatchQueue.main.async { self.onPhoto?(image) }
+    }
+}
+
+extension BAICameraManager: AVCaptureFileOutputRecordingDelegate {
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didFinishRecordingTo outputFileURL: URL,
+                    from connections: [AVCaptureConnection],
+                    error: Error?) {
+        DispatchQueue.main.async {
+            self.isRecording = false
+            guard error == nil else { return }
+            self.onVideo?(outputFileURL)
+        }
+    }
+}
+
+// MARK: - Preview Layer Host
+
+struct BAICameraPreview: UIViewRepresentable {
+    let session: AVCaptureSession
+    func makeUIView(context: Context) -> PreviewView {
+        let v = PreviewView()
+        v.videoPreviewLayer.session = session
+        v.videoPreviewLayer.videoGravity = .resizeAspectFill
+        return v
+    }
+    func updateUIView(_ uiView: PreviewView, context: Context) {}
+}
+
+final class PreviewView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+}
+
+// MARK: - LiveCaptureView
+
+struct LiveCaptureView: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var camera = BAICameraManager()
+
+    // Editing / preview state
+    @State private var capturedImage: UIImage? = nil
+    @State private var capturedVideoURL: URL? = nil
+    @State private var selectedFilter: LCFilterKind = .none
+    @State private var isExportingVideo = false
+    @State private var previewPlayer: AVPlayer? = nil
+
+    var body: some View {
+        ZStack {
+            // Live camera when nothing captured yet
+            if capturedImage == nil && capturedVideoURL == nil {
+                BAICameraPreview(session: camera.session)
+                    .ignoresSafeArea()
+            } else {
+                // ===== PREVIEW WITH FILTERS =====
+                Group {
+                    if let img = capturedImage {
+                        AnyView(filteredImageView(img))
+                    } else if let url = capturedVideoURL {
+                        AnyView(filteredVideoView(url))
+                    }
+                }
+                .transition(.opacity)
+                .ignoresSafeArea(edges: .bottom)
+            }
+
+            // Top bar
+            VStack {
+                HStack {
+                    Button {
+                        if capturedImage != nil || capturedVideoURL != nil {
+                            // Exit editor back to camera
+                            capturedImage = nil
+                            capturedVideoURL = nil
+                            selectedFilter = .none
+                            previewPlayer?.pause()
+                            previewPlayer = nil
+                        } else {
+                            dismiss()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 16, weight: .semibold))
+                            .padding(10)
+                            .background(Color.black.opacity(0.35))
+                            .clipShape(Circle())
+                            .foregroundColor(.white)
+                    }
+                    Spacer()
+                    Button {
+                        camera.flipCamera()
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera")
+                            .font(.system(size: 16, weight: .semibold))
+                            .padding(10)
+                            .background(Color.black.opacity(0.35))
+                            .clipShape(Circle())
+                            .foregroundColor(.white)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 48)
+
+                Spacer()
+
+                // Bottom controls (capture vs editor)
+                if capturedImage == nil && capturedVideoURL == nil {
+                    captureControls
+                } else {
+                    editorControls
+                }
+            }
+        }
+        .background(Color.black.ignoresSafeArea())
+        .onAppear {
+            camera.onPhoto = { img in
+                capturedImage = img
+                capturedVideoURL = nil
+                selectedFilter = .none
+            }
+            camera.onVideo = { url in
+                capturedVideoURL = url
+                capturedImage = nil
+                selectedFilter = .none
+            }
+            camera.requestPermissionsAndConfigure()
+            camera.startRunning()
+        }
+        .onDisappear {
+            previewPlayer?.pause()
+            camera.stopRunning()
+        }
+    }
+
+    // MARK: UI blocks
+
+    private var captureControls: some View {
+        VStack(spacing: 18) {
+            if camera.isRecording {
+                Text("Recording…")
+                    .font(.caption)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.red.opacity(0.9))
+                    .cornerRadius(10)
+            }
+
+            HStack {
+                Spacer()
+                // Photo shutter
+                Button {
+                    camera.capturePhoto()
+                } label: {
+                    Circle()
+                        .strokeBorder(Color.white, lineWidth: 6)
+                        .frame(width: 74, height: 74)
+                        .overlay(Circle().fill(Color.white.opacity(0.9)).frame(width: 60, height: 60))
+                }
+                Spacer()
+            }
+
+            // Video button row
+            HStack(spacing: 22) {
+                Button {
+                    camera.isRecording ? camera.stopRecording() : camera.startRecording()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: camera.isRecording ? "stop.fill" : "record.circle")
+                        Text(camera.isRecording ? "Stop" : "Record")
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(camera.isRecording ? Color.red : Color.white.opacity(0.16))
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+            }
+            .padding(.bottom, 36)
+        }
+        .padding(.bottom, 18)
+    }
+
+    private var editorControls: some View {
+        VStack(spacing: 12) {
+            // Filter chips
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(LCFilterKind.allCases) { f in
+                        Button {
+                            selectedFilter = f
+                            if capturedVideoURL != nil {
+                                rebuildPreviewPlayerForCurrentVideo()
+                            }
+                        } label: {
+                            Text(f.rawValue.capitalized)
+                                .font(.caption)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(selectedFilter == f ? Color.blue.opacity(0.9) : Color.white.opacity(0.2))
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+
+            // Use -> send to Gossip + dismiss
+            Button {
+                routeToGossip()
+            } label: {
+                HStack {
+                    if isExportingVideo { ProgressView().padding(.trailing, 6) }
+                    Text(isExportingVideo ? "Preparing…" : "Use")
+                        .bold()
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(Color.blue)
+                .foregroundColor(.white)
+                .cornerRadius(14)
+                .padding(.horizontal, 16)
+            }
+            .disabled(isExportingVideo)
+            .padding(.bottom, 28)
+        }
+        .background(
+            LinearGradient(colors: [Color.black.opacity(0.05), Color.black.opacity(0.65)],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea(edges: .bottom)
+        )
+    }
+
+    // MARK: Helpers (moved logic out of ViewBuilder)
+
+    private func filteredImageView(_ img: UIImage) -> some View {
+        let filtered = applyFilter(selectedFilter, to: img)
+        return Image(uiImage: filtered)
+            .resizable()
+            .scaledToFit()
+            .frame(maxHeight: 360)
+            .cornerRadius(12)
+            .padding(.horizontal, 12)
+    }
+
+    private func filteredVideoView(_ url: URL) -> some View {
+        let asset = AVAsset(url: url)
+        let item  = AVPlayerItem(asset: asset)
+        if let comp = makeVideoComposition(for: asset, kind: selectedFilter) {
+            item.videoComposition = comp
+        }
+        _ = makeOrReusePlayer(with: item)
+        return VideoPlayer(player: previewPlayer)
+            .frame(height: 360)
+            .cornerRadius(12)
+            .padding(.horizontal, 12)
+            .onAppear { previewPlayer?.play() }
+            .onDisappear { previewPlayer?.pause() }
+    }
+
+    private func makeOrReusePlayer(with item: AVPlayerItem) -> AVPlayer {
+        if let p = previewPlayer {
+            p.replaceCurrentItem(with: item)
+            p.isMuted = true
+            return p
+        } else {
+            let p = AVPlayer(playerItem: item)
+            p.isMuted = true
+            previewPlayer = p
+            return p
+        }
+    }
+
+    private func rebuildPreviewPlayerForCurrentVideo() {
+        guard let url = capturedVideoURL else { return }
+        let asset = AVAsset(url: url)
+        let item  = AVPlayerItem(asset: asset)
+        if let comp = makeVideoComposition(for: asset, kind: selectedFilter) {
+            item.videoComposition = comp
+        }
+        _ = makeOrReusePlayer(with: item)
+        previewPlayer?.play()
+    }
+
+    private func routeToGossip() {
+        // Photo path
+        if let img = capturedImage {
+            let filtered = applyFilter(selectedFilter, to: img)
+            let payload: [String: Any] = [
+                "type": "photo",
+                "filter": selectedFilter.rawValue,
+                "hasURL": false,
+                "hasImage": true,
+                "mediaURL": NSNull(),
+                "image": filtered
+            ]
+            NotificationCenter.default.post(name: .inviteOrbCapturedMedia, object: nil, userInfo: payload)
+            dismiss()
+            return
+        }
+
+        // Video path
+        if let url = capturedVideoURL {
+            isExportingVideo = true
+            let asset = AVAsset(url: url)
+            exportFilteredVideo(asset: asset, kind: selectedFilter) { outputURL in
+                DispatchQueue.main.async {
+                    self.isExportingVideo = false
+                    let finalURL = outputURL ?? url
+                    let payload: [String: Any] = [
+                        "type": "video",
+                        "filter": self.selectedFilter.rawValue,
+                        "hasURL": true,
+                        "hasImage": false,
+                        "mediaURL": finalURL,
+                        "image": NSNull()
+                    ]
+                    NotificationCenter.default.post(name: .inviteOrbCapturedMedia, object: nil, userInfo: payload)
+                    self.dismiss()
+                }
+            }
+        }
+    }
+}
+
+

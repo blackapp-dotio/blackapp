@@ -9,6 +9,7 @@ import FirebaseCore
 import FirebaseAuth
 import FirebaseDatabase
 import FirebaseFirestore
+import AVKit
 
 // MARK: - User Model (robust to missing username)
 struct UserProfile: Identifiable, Hashable {
@@ -64,6 +65,13 @@ struct UserProfile: Identifiable, Hashable {
         self.circleSize = cs
     }
 }
+// Put this near the top of SearchView.swift, right after the model declarations.
+
+// Makes UserProfile eligible for JSONCache read/write
+extension UserProfile: Codable {}
+
+// Makes BrandSummary eligible for JSONCache read/write
+extension BrandSummary: Codable {}
 
 // MARK: - Brand summary for preview
 struct BrandSummary: Identifiable, Hashable {
@@ -73,12 +81,22 @@ struct BrandSummary: Identifiable, Hashable {
     let isApproved: Bool
 }
 
-// MARK: - Screen
+// MARK: - Debouncer (for suggestive search)
+private final class Debouncer {
+    private var work: DispatchWorkItem?
+    func debounce(delay: TimeInterval, _ block: @escaping () -> Void) {
+        work?.cancel()
+        let w = DispatchWorkItem(block: block)
+        work = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: w)
+    }
+}
+
+// MARK: - Search Screen (suggestive, fast)
 struct SearchView: View {
-    // Query & data
+    // Query & results
     @State private var searchText: String = ""
-    @State private var allUsers: [UserProfile] = []
-    @State private var filteredUsers: [UserProfile] = []
+    @State private var results: [UserProfile] = []
 
     // UX state
     @State private var isLoading: Bool = false
@@ -86,15 +104,13 @@ struct SearchView: View {
     @State private var selectedUser: UserProfile? = nil
     @State private var showPreview: Bool = false
 
-    // Chat state (use .sheet(item:) so it’s swipe-to-dismiss)
+    // Chat state
     @State private var chatTarget: UserProfile? = nil
 
     // Debug
-    @State private var lastPathTried: String = ""
-    @State private var fetchedCount: Int = 0
+    @State private var sourceNote: String = ""
 
-    // If you know the exact path, put it first. We’ll stop at the first that yields users.
-    private let candidateUserPaths = ["users", "userProfiles", "profiles", "usersPublic"]
+    private let debouncer = Debouncer()
 
     var body: some View {
         NavigationView {
@@ -102,78 +118,75 @@ struct SearchView: View {
                 // Search bar
                 UserSearchBar(text: $searchText, onClear: {
                     searchText = ""
-                    filteredUsers = allUsers
-                    log("Search cleared; showing all users (\(allUsers.count)).")
+                    results.removeAll()
+                    isLoading = false
+                    loadError = nil
+                    sourceNote = ""
                 })
-                .onChange(of: searchText) { _ in performSearch() }
+                .onChange(of: searchText) { newValue in
+                    debouncer.debounce(delay: 0.30) {
+                        Task { await runSuggestiveSearch() }
+                    }
+                }
 
-                // Debug header (tap to copy)
-                if !lastPathTried.isEmpty {
-                    Text("Source: /\(lastPathTried) • \(fetchedCount) users")
+                if !sourceNote.isEmpty {
+                    Text(sourceNote)
                         .font(.caption)
                         .foregroundColor(.gray)
                         .padding(.top, 4)
-                        .onTapGesture {
-                            UIPasteboard.general.string = "/\(lastPathTried) (\(fetchedCount))"
-                            log("Copied debug: /\(lastPathTried) (\(fetchedCount))")
-                        }
                 }
 
-                if isLoading {
-                    ProgressView("Loading users…").padding()
-                } else if let err = loadError {
-                    SearchErrorView(message: err, onRetry: { loadUsers() })
-                } else if filteredUsers.isEmpty {
-                    EmptyStateView(message: searchText.isEmpty
-                                   ? "Start typing to find people"
-                                   : "No users match “\(searchText)”")
-                } else {
-                    // Results
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(filteredUsers, id: \.id) { user in
-                                Button {
-                                    selectedUser = user
-                                    showPreview = true
-                                    log("Preview user tapped: id=\(user.id), @\(user.username)")
-                                } label: {
-                                    UserRow(user: user)
+                Group {
+                    if searchText.trimmingCharacters(in: .whitespacesAndNewlines).count < 2 {
+                        EmptyStateView(message: "Start typing a name or @username")
+                    } else if isLoading {
+                        ProgressView("Searching…").padding()
+                    } else if let err = loadError {
+                        SearchErrorView(message: err, onRetry: { Task { await runSuggestiveSearch(force: true) } })
+                    } else if results.isEmpty {
+                        EmptyStateView(message: "No users match “\(searchText)”")
+                    } else {
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(results, id: \.id) { user in
+                                    Button {
+                                        selectedUser = user
+                                        showPreview = true
+                                        log("Preview user tapped: id=\(user.id), @\(user.username)")
+                                    } label: {
+                                        UserRow(user: user)
+                                    }
+                                    .buttonStyle(PlainButtonStyle())
+                                    Divider().background(Color(.separator))
                                 }
-                                .buttonStyle(PlainButtonStyle())
-                                Divider().background(Color(.separator))
                             }
+                            .padding(.horizontal)
+                            .padding(.top, 8)
                         }
-                        .padding(.horizontal)
-                        .padding(.top, 8)
                     }
                 }
             }
             .background(Color.black.ignoresSafeArea())
             .preferredColorScheme(.dark)
             .navigationTitle("Search")
-            .onAppear {
-                if allUsers.isEmpty { loadUsers() }
-                observeRTDBConnectivity()
-            }
+            .onAppear { observeRTDBConnectivity() } // lightweight connectivity note only
 
-            // Profile preview sheet w/ brands
+            // Profile preview sheet
             .sheet(isPresented: $showPreview) {
                 if let u = selectedUser {
                     UserPreviewSheet(
                         user: u,
                         onMessage: {
-                            Task {
-                                await prepareDMAndOpen(for: u)
-                            }
+                            Task { await prepareDMAndOpen(for: u) }
                         }
                     )
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
-                    .interactiveDismissDisabled(false) // allow swipe down
+                    .interactiveDismissDisabled(false)
                 }
             }
 
-            // Chat presented as a SHEET (not fullScreen), swipe-to-dismiss enabled
+            // Chat sheet
             .sheet(item: $chatTarget, onDismiss: {
                 log("Chat dismissed"); chatTarget = nil
             }) { target in
@@ -186,149 +199,169 @@ struct SearchView: View {
         }
     }
 
-    // MARK: - Logic
-    private func performSearch() {
-        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if q.isEmpty {
-            filteredUsers = allUsers
-            log("Search empty; showing all users (\(allUsers.count)).")
-            return
-        }
-        let results = allUsers.filter { u in
-            let n = u.name.lowercased()
-            let h = u.username.lowercased()
-            return n.contains(q) || h.contains(q) || n.hasPrefix(q) || h.hasPrefix(q)
-        }
-        filteredUsers = results
-        log("Search query: “\(q)” → \(results.count) matches.")
+    // MARK: - Suggestive search pipeline
+    private func cacheKey(for q: String) -> String { "user-suggest-\(q.lowercased())" }
+
+    private func normalizedQuery() -> String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func loadUsers() {
-        isLoading = true
-        loadError = nil
-        allUsers.removeAll()
-        filteredUsers.removeAll()
-        fetchedCount = 0
-        lastPathTried = ""
-
-        if FirebaseApp.app() == nil {
-            log("⚠️ FirebaseApp not configured. Call FirebaseApp.configure() at app start.")
-        }
-        let uid = Auth.auth().currentUser?.uid ?? "nil"
-        log("Auth currentUser uid=\(uid) (nil means not signed in).")
-
-        tryFetchPath(at: 0, collected: [:])
-    }
-
-    private func tryFetchPath(at index: Int, collected: [String: UserProfile]) {
-        guard index < candidateUserPaths.count else {
-            finalizeFetch(collected: collected, usedPath: lastPathTried.isEmpty ? "—" : lastPathTried)
+    private func runSuggestiveSearch(force: Bool = false) async {
+        let q = normalizedQuery()
+        guard q.count >= 2 else {
+            results.removeAll()
+            isLoading = false
+            loadError = nil
+            sourceNote = ""
             return
         }
 
-        let path = candidateUserPaths[index]
-        lastPathTried = path
-        log("Fetching from /\(path)…")
+        // Serve cached result instantly (10 min TTL), then refresh in background.
+        if !force, let cached: [UserProfile] = JSONCache.shared.read(cacheKey(for: q), type: [UserProfile].self, maxAge: 10*60) {
+            results = cached
+            sourceNote = "Cached • \(cached.count) users"
+        } else {
+            sourceNote = ""
+        }
 
-        let ref = Database.database().reference(withPath: path)
-        ref.observeSingleEvent(of: .value) { snapshot in
-            if !snapshot.exists() {
-                log("No data at /\(path). Trying next path…")
-                tryFetchPath(at: index + 1, collected: collected)
+        isLoading = true; loadError = nil
+        do {
+            // 1) Firestore prefix search (usernameLower & nameLower)
+            if let fs = try await searchFirestorePrefix(q: q, limit: 20), !fs.isEmpty {
+                await MainActor.run {
+                    results = fs
+                    isLoading = false
+                    sourceNote = "Firestore • \(fs.count) users"
+                }
+                JSONCache.shared.write(cacheKey(for: q), value: fs)
                 return
             }
 
-            var next = collected
-            var added = 0
-            let currentId = Auth.auth().currentUser?.uid
+            // 2) RTDB fallback (usernameLower or nameLower if present)
+            if let r = await searchRTDBPrefix(q: q, limit: 20), !r.isEmpty {
+                await MainActor.run {
+                    results = r
+                    isLoading = false
+                    sourceNote = "Realtime DB • \(r.count) users"
+                }
+                JSONCache.shared.write(cacheKey(for: q), value: r)
+                return
+            }
 
-            var childCount = 0
-            for _ in snapshot.children { childCount += 1 }
-            log("Snapshot exists at /\(path). children=\(childCount)")
+            // 3) Nothing found
+            await MainActor.run {
+                results = []
+                isLoading = false
+                loadError = nil
+                sourceNote = "No matches"
+            }
+        } catch {
+            await MainActor.run {
+                isLoading = false
+                loadError = error.localizedDescription
+            }
+        }
+    }
 
-            for case let child as DataSnapshot in snapshot.children {
-                if var user = UserProfile(snapshot: child) {
-                    if user.id == currentId { continue } // exclude self
-                    if user.username.contains(" ") {
-                        let fixed = user.username.replacingOccurrences(of: " ", with: "")
-                        user = UserProfile(id: user.id,
-                                           name: user.name,
-                                           username: fixed,
-                                           bio: user.bio,
-                                           profileImageURL: user.profileImageURL,
-                                           circleSize: user.circleSize)
+    // Firestore: prefix query on `users`
+    // Requires documents to include `usernameLower` / `nameLower` fields and to be indexed.
+    private func searchFirestorePrefix(q: String, limit: Int) async throws -> [UserProfile]? {
+        let db = Firestore.firestore()
+        var out: [String: UserProfile] = [:]
+
+        func fetch(field: String) async throws {
+            // orderBy(field) + range
+            var query = db.collection("users")
+                .order(by: field)
+                .whereField(field, isGreaterThanOrEqualTo: q)
+                .whereField(field, isLessThan: q + "\u{f8ff}")
+                .limit(to: limit)
+
+            let snap = try await query.getDocuments()
+            for doc in snap.documents {
+                let d = doc.data()
+                let name = (d["name"] as? String) ?? (d["displayName"] as? String) ?? ""
+                guard !name.isEmpty else { continue }
+                let username = (d["username"] as? String) ?? (d["handle"] as? String) ?? deriveUsername(fromName: name, id: doc.documentID)
+                let bio = (d["bio"] as? String) ?? (d["about"] as? String) ?? ""
+                let photo = (d["profileImageURL"] as? String) ?? (d["photoURL"] as? String) ?? (d["avatarUrl"] as? String)
+                let circleSize = (d["circleSize"] as? Int) ?? (d["circleSize"] as? NSNumber)?.intValue
+
+                out[doc.documentID] = UserProfile(
+                    id: doc.documentID,
+                    name: name,
+                    username: username.replacingOccurrences(of: " ", with: ""),
+                    bio: bio,
+                    profileImageURL: photo,
+                    circleSize: circleSize
+                )
+            }
+        }
+
+        do {
+            try await fetch(field: "usernameLower")
+        } catch {
+            // Index may be missing; ignore and try nameLower
+        }
+        if out.count < limit {
+            do { try await fetch(field: "nameLower") } catch { /* ignore */ }
+        }
+
+        let arr = Array(out.values).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return arr
+    }
+
+    // RTDB: prefix query on /users by child key (if fields exist)
+    private func searchRTDBPrefix(q: String, limit: UInt) async -> [UserProfile]? {
+        let ref = Database.database().reference(withPath: "users")
+        var hits: [String: UserProfile] = [:]
+
+        func fetch(childKey: String) async {
+            await withCheckedContinuation { cont in
+                let qRef = ref
+                    .queryOrdered(byChild: childKey)
+                    .queryStarting(atValue: q)
+                    .queryEnding(atValue: q + "\u{f8ff}")
+                    .queryLimited(toFirst: limit)
+
+                qRef.observeSingleEvent(of: .value) { snap in
+                    for case let cs as DataSnapshot in snap.children {
+                        if let u = UserProfile(snapshot: cs) {
+                            hits[u.id] = u
+                        }
                     }
-                    if next[user.id] == nil {
-                        next[user.id] = user
-                        added += 1
-                    }
-                } else {
-                    if let dict = child.value as? [String: Any] {
-                        let keys = dict.keys.sorted().joined(separator: ",")
-                        log("Skipped child \(child.key): missing required fields. Keys present: [\(keys)]")
-                    } else {
-                        log("Skipped child \(child.key): not a dictionary")
-                    }
+                    cont.resume()
                 }
             }
-
-            log("Parsed \(added) users from /\(path).")
-            if added == 0 {
-                tryFetchPath(at: index + 1, collected: next)
-            } else {
-                finalizeFetch(collected: next, usedPath: path)
-            }
-        } withCancel: { error in
-            log("❌ Error at /\(path): \(error.localizedDescription)")
-            tryFetchPath(at: index + 1, collected: collected)
         }
+
+        await fetch(childKey: "usernameLower")
+        if hits.count < Int(limit) { await fetch(childKey: "nameLower") }
+
+        let arr = Array(hits.values).sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return arr
     }
 
-    private func finalizeFetch(collected: [String: UserProfile], usedPath: String) {
-        var list = Array(collected.values)
-        list.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-
-        self.allUsers = list
-        self.filteredUsers = list
-        self.fetchedCount = list.count
-        self.isLoading = false
-        self.loadError = list.isEmpty ? "No users found in any known path." : nil
-
-        if list.isEmpty {
-            log("⚠️ No users found after trying \(candidateUserPaths). Check DB paths & rules.")
-        } else {
-            log("✅ Loaded \(list.count) users from /\(usedPath).")
-        }
-    }
-
+    // MARK: - Connectivity note (lightweight)
     private func observeRTDBConnectivity() {
         let infoRef = Database.database().reference(withPath: ".info/connected")
         infoRef.observe(.value) { snap in
-            if let connected = snap.value as? Bool {
-                log("RTDB connected=\(connected)")
-            }
+            if let connected = snap.value as? Bool { log("RTDB connected=\(connected)") }
         }
     }
 
     // MARK: - Request + thread prep, then open chat
-    private func chatId(_ a: String, _ b: String) -> String {
-        [a, b].sorted().joined(separator: "_")
-    }
-
+    private func chatId(_ a: String, _ b: String) -> String { [a, b].sorted().joined(separator: "_") }
     private func rtdbContactsPath(_ uid: String) -> DatabaseReference {
         Database.database().reference(withPath: "contacts/\(uid)")
     }
 
-    // ---- NEW: Firestore contacts helpers ----
-
-    /// Firestore: users/{uid}/contacts/{otherUid}
     private func fsContactRef(_ uid: String, other: String) -> DocumentReference {
         Firestore.firestore()
             .collection("users").document(uid)
             .collection("contacts").document(other)
     }
 
-    /// Are we contacts? Prefer Firestore (status: active & accepted), fall back to legacy RTDB for compatibility.
     private func areContactsCombined(me: String, other: String) async -> Bool {
         if await areContactsFirestore(me: me, other: other) { return true }
         return await areContactsRTDB(me: me, other: other)
@@ -353,7 +386,6 @@ struct SearchView: View {
         }
     }
 
-    /// Seed Firestore "pending" contacts on both sides if not already active.
     private func ensurePendingContactsInFirestore(me: String, other: String) async {
         let aRef = fsContactRef(me, other: other)
         let bRef = fsContactRef(other, other: me)
@@ -364,10 +396,7 @@ struct SearchView: View {
             let aIsActive = ((a.data()?["status"] as? String) == "active") && ((a.data()?["accepted"] as? Bool) == true)
             let bIsActive = ((b.data()?["status"] as? String) == "active") && ((b.data()?["accepted"] as? Bool) == true)
 
-            if aIsActive && bIsActive {
-                log("Contacts already active in Firestore.")
-                return
-            }
+            if aIsActive && bIsActive { return }
 
             let batch = Firestore.firestore().batch()
             let stamp: [String: Any] = [
@@ -379,13 +408,11 @@ struct SearchView: View {
             batch.setData(stamp, forDocument: aRef, merge: true)
             batch.setData(stamp, forDocument: bRef, merge: true)
             try await batch.commit()
-            log("Seeded Firestore pending contacts (both sides).")
         } catch {
             log("❌ ensurePendingContactsInFirestore error: \(error.localizedDescription)")
         }
     }
 
-    /// Ensure a directChats doc exists. If not contacts yet, it will be created with `pending: true`.
     private func ensureDirectChatDoc(me: String, other: String, isContacts: Bool) async {
         let id = chatId(me, other)
         let doc = Firestore.firestore().collection("directChats").document(id)
@@ -395,29 +422,54 @@ struct SearchView: View {
             if snap.exists {
                 if isContacts, (snap.data()?["pending"] as? Bool) == true {
                     try await doc.updateData(["pending": false, "updatedAt": FieldValue.serverTimestamp()])
-                    log("Upgraded pending=false for chat \(id)")
                 }
                 return
             }
-
             var data: [String: Any] = [
                 "participants": [me, other],
                 "createdAt": FieldValue.serverTimestamp(),
                 "updatedAt": FieldValue.serverTimestamp(),
-                "pending": !isContacts
+                "pending": !isContacts,
+                "userA": me, "userB": other
             ]
-            // Optional user indexes
-            data["userA"] = me
-            data["userB"] = other
-
             try await doc.setData(data)
-            log("Created directChats/\(id) pending=\(!isContacts)")
         } catch {
             log("❌ ensureDirectChatDoc error: \(error.localizedDescription)")
         }
     }
 
-    /// Write dmRequests pair (recipient sees the request; sender has outgoing)
+    private func fetchMyPublicProfileRTDB(_ uid: String) async -> [String: Any] {
+        await withCheckedContinuation { cont in
+            Database.database().reference(withPath: "users/\(uid)")
+                .observeSingleEvent(of: .value) { snap in
+                    cont.resume(returning: (snap.value as? [String: Any]) ?? [:])
+                }
+        }
+    }
+
+    private func prepareDMAndOpen(for user: UserProfile) async {
+        guard let me = Auth.auth().currentUser?.uid else {
+            log("❌ prepareDMAndOpen: no current user")
+            return
+        }
+        showPreview = false
+        guard me != user.id else { return }
+
+        async let contactsCombined = areContactsCombined(me: me, other: user.id)
+        async let myProfile = fetchMyPublicProfileRTDB(me)
+
+        let isContacts = await contactsCombined
+        let profile = await myProfile
+
+        if !isContacts {
+            await ensurePendingContactsInFirestore(me: me, other: user.id)
+            await writeDMRequests(me: me, other: user.id, myProfile: profile, lastText: "")
+        }
+        await ensureDirectChatDoc(me: me, other: user.id, isContacts: isContacts)
+
+        chatTarget = user
+    }
+
     private func writeDMRequests(me: String, other: String, myProfile: [String: Any], lastText: String = "") async {
         let db = Firestore.firestore()
         let now = Date().timeIntervalSince1970
@@ -443,50 +495,9 @@ struct SearchView: View {
         do {
             try await incomingRef.setData(payloadIncoming, merge: true)
             try await outgoingRef.setData(payloadOutgoing, merge: true)
-            log("dmRequests written (incoming/outgoing).")
         } catch {
-            log("❌ dmRequests write failed: \(error.localizedDescription)")
+            log("❌ dmRequests write failed: \(error)")
         }
-    }
-
-    /// Minimal current-user public profile (from RTDB /users/{me})
-    private func fetchMyPublicProfileRTDB(_ uid: String) async -> [String: Any] {
-        await withCheckedContinuation { cont in
-            Database.database().reference(withPath: "users/\(uid)")
-                .observeSingleEvent(of: .value) { snap in
-                    cont.resume(returning: (snap.value as? [String: Any]) ?? [:])
-                }
-        }
-    }
-
-    /// Full flow when user taps "Message" in preview:
-    /// - compute contact status (Firestore first, fallback RTDB),
-    /// - if not contacts → seed Firestore "pending" contacts, write dmRequest,
-    /// - ensure directChats doc (pending if not contacts),
-    /// - open the room (the room can handle pending state as needed).
-    private func prepareDMAndOpen(for user: UserProfile) async {
-        guard let me = Auth.auth().currentUser?.uid else {
-            log("❌ prepareDMAndOpen: no current user")
-            return
-        }
-        showPreview = false
-        guard me != user.id else { return }
-
-        async let contactsCombined = areContactsCombined(me: me, other: user.id)
-        async let myProfile = fetchMyPublicProfileRTDB(me)
-
-        let isContacts = await contactsCombined
-        let profile = await myProfile
-
-        if !isContacts {
-            await ensurePendingContactsInFirestore(me: me, other: user.id)
-            await writeDMRequests(me: me, other: user.id, myProfile: profile, lastText: "")
-        }
-        await ensureDirectChatDoc(me: me, other: user.id, isContacts: isContacts)
-
-        // Open chat sheet
-        chatTarget = user
-        log("Opening chat sheet for \(user.id) (contacts=\(isContacts)).")
     }
 }
 
@@ -500,9 +511,6 @@ private struct ChatLaunchContainer: View {
             Group {
                 if let recipient = makeRecipient(from: target) {
                     DirectChatRoomView(recipient: recipient)
-                        .onAppear {
-                            log("Presenting DirectChatRoomView for \(target.id) @\(target.username) name=\(target.name) avatar=\(target.profileImageURL ?? "nil")")
-                        }
                 } else {
                     VStack(spacing: 12) {
                         Text("Couldn’t prepare chat").foregroundColor(.white).font(.headline)
@@ -513,7 +521,6 @@ private struct ChatLaunchContainer: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black)
-                    .onAppear { log("❌ makeRecipient failed for \(target.id)") }
                 }
             }
             Button(action: { dismiss() }) {
@@ -558,7 +565,7 @@ private struct UserRow: View {
     let user: UserProfile
     var body: some View {
         HStack(spacing: 12) {
-            AsyncAvatar(urlString: user.profileImageURL)
+            CachedAvatar(urlString: user.profileImageURL)
                 .frame(width: 44, height: 44)
                 .clipShape(Circle())
 
@@ -577,25 +584,47 @@ private struct UserRow: View {
     }
 }
 
-private struct AsyncAvatar: View {
+// MARK: - Cached avatar & brand logo (ImageStore-backed)
+private struct CachedAvatar: View {
     let urlString: String?
+    @State private var image: UIImage?
+
     var body: some View {
-        Group {
-            if let s = urlString, let url = URL(string: s) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image): image.resizable().scaledToFill()
-                    case .failure(_):
-                        ZStack { Circle().fill(Color(.systemGray5)); Image(systemName: "person.fill") }
-                    default:
-                        ZStack { Circle().fill(Color(.systemGray5)); ProgressView() }
-                    }
-                }
+        ZStack {
+            if let img = image {
+                Image(uiImage: img).resizable().scaledToFill()
             } else {
-                ZStack { Circle().fill(Color(.systemGray5)); Image(systemName: "person.fill") }
+                Circle().fill(Color(.systemGray5)).overlay(ProgressView())
             }
         }
-        .clipShape(Circle())
+        .task(id: urlString ?? "") {
+            guard let s = urlString, let url = URL(string: s) else { image = nil; return }
+            ImageStore.shared.load(from: url, key: s) { img in
+                withAnimation(.easeOut(duration: 0.15)) { image = img }
+            }
+        }
+    }
+}
+
+private struct CachedBrandLogo: View {
+    let urlString: String?
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let img = image {
+                Image(uiImage: img).resizable().scaledToFill()
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color(.systemGray5)).overlay(Image(systemName: "photo"))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .task(id: urlString ?? "") {
+            guard let s = urlString, let url = URL(string: s) else { image = nil; return }
+            ImageStore.shared.load(from: url, key: s) { img in
+                withAnimation(.easeOut(duration: 0.15)) { image = img }
+            }
+        }
     }
 }
 
@@ -605,17 +634,17 @@ private struct UserPreviewSheet: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            AsyncAvatar(urlString: user.profileImageURL).frame(width: 100, height: 100)
+            CachedAvatar(urlString: user.profileImageURL)
+                .frame(width: 100, height: 100)
+                .clipShape(Circle())
 
             VStack(spacing: 4) {
                 HStack(spacing: 8) {
                     Text(user.name).font(.title2).bold().foregroundColor(.white)
-                    // 🔥 Throbbing star + tap to toggle progress
                     LivePreviewStarBadgeArea(userId: user.id, initial: user.circleSize ?? 0)
                 }
                 Text("@\(user.username)").foregroundColor(.gray)
             }
-
 
             if !user.bio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(user.bio)
@@ -680,10 +709,17 @@ private struct UserBrandsStrip: View {
     }
 
     private func loadBrands() {
+        // cache brands per user for 12h
+        let cacheKey = "brands-\(userId)"
+        if let cached: [BrandSummary] = JSONCache.shared.read(cacheKey, type: [BrandSummary].self, maxAge: 12*3600) {
+            brands = cached; isLoading = false; return
+        }
+
         isLoading = true
         error = nil
         brands.removeAll()
 
+        // Prefer a user-scoped path if you ever add one, else scan /brands (kept tolerant)
         let ref = Database.database().reference(withPath: "brands")
         ref.observeSingleEvent(of: .value) { snap in
             guard snap.exists() else {
@@ -730,6 +766,7 @@ private struct UserBrandsStrip: View {
             found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             self.brands = found
             self.isLoading = false
+            JSONCache.shared.write(cacheKey, value: found)
             log("Brands: scanned \(total) children, found \(found.count) for user \(userId).")
         } withCancel: { err in
             isLoading = false
@@ -743,9 +780,8 @@ private struct BrandChip: View {
     let brand: BrandSummary
     var body: some View {
         HStack(spacing: 8) {
-            BrandLogo(urlString: brand.logoURL)
+            CachedBrandLogo(urlString: brand.logoURL)
                 .frame(width: 28, height: 28)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(brand.name)
@@ -761,31 +797,6 @@ private struct BrandChip: View {
         .padding(.vertical, 6)
         .background(Color.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 10))
-    }
-}
-
-private struct BrandLogo: View {
-    let urlString: String?
-    var body: some View {
-        Group {
-            if let s = urlString, let url = URL(string: s) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let img): img.resizable().scaledToFill()
-                    case .failure(_): placeholder
-                    default: ZStack { RoundedRectangle(cornerRadius: 6).fill(Color(.systemGray5)); ProgressView() }
-                    }
-                }
-            } else {
-                placeholder
-            }
-        }
-    }
-    private var placeholder: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6).fill(Color(.systemGray5))
-            Image(systemName: "photo")
-        }
     }
 }
 
@@ -922,6 +933,8 @@ private struct SearchErrorView: View {
         .background(Color.black)
     }
 }
+
+// LivePreviewStarBadgeArea & helpers (unchanged from your file) -------------
 private struct LivePreviewStarBadgeArea: View {
     let userId: String
     let initial: Int
@@ -972,10 +985,9 @@ private struct PreviewStarBadgeInline: View {
     private var tier: String { previewDeriveTier(from: circleSize) }
     private var level: Int { previewTierOrder(tier) }
 
-    // Baseline throb always on; larger tiers throb a bit more
     private var scaleRange: ClosedRange<CGFloat> {
-        let base: CGFloat = 0.06   // baseline amplitude
-        let step: CGFloat = 0.02   // per-tier increase
+        let base: CGFloat = 0.06
+        let step: CGFloat = 0.02
         let amp = min(base + step * CGFloat(max(0, level)), 0.22)
         return (1.0 - amp)...(1.0 + amp)
     }

@@ -5,6 +5,7 @@ import FirebaseStorage
 import FirebaseDatabase
 import FeedKit
 import WebKit
+import UIKit
 
 // MARK: - EventModel
 
@@ -71,9 +72,203 @@ struct EventModel: Identifiable {
     }
 }
 
-// MARK: - MyEventsView
+// MARK: - EventTabView (compact chrome + toolbar icons + FAB)
 import SwiftUI
 import Firebase
+import FirebaseAuth
+import FirebaseDatabase
+
+struct EventTabView: View {
+    @State private var selectedTab = 0
+    @State private var showCreate = false
+
+    // Hints: preference vs. visibility
+    @AppStorage("toolbarHintsEnabled") private var toolbarHintsEnabled = true
+    @State private var showToolbarHints = false
+    @State private var hintHideWorkItem: DispatchWorkItem?
+    private let hintDuration: TimeInterval = 10 // ~4× longer
+
+    // Promoter Dashboard state
+    @State private var isPromoterUser = false
+    @State private var showPromoterSheet = false
+
+    // Nightlife entry state
+    @State private var showNightlife = false
+
+    // Use a FAB to keep the toolbar clean
+    private let useFAB = true
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                VStack(spacing: 8) {
+                    Picker("View", selection: $selectedTab) {
+                        Text("All Events").tag(0)
+                        Text("My Events").tag(1)
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+
+                    Group {
+                        if selectedTab == 0 {
+                            EventFeedView()
+                        } else {
+                            MyEventsView()
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .overlay(
+                    VStack {
+                        HStack {
+                            Spacer()
+                            if showToolbarHints {
+                                VStack(alignment: .trailing, spacing: 6) {
+                                    if isPromoterUser {
+                                        hintBubble(icon: "star.fill",
+                                                   text: "Promoter Dashboard — manage events, sales & stats")
+                                    }
+                                    hintBubble(icon: "sparkles",
+                                               text: "Nightlife — browse venues, guestlists & reservations")
+                                }
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                                .padding(.trailing, 8)
+                                .padding(.top, 4)
+                            }
+                        }
+                        Spacer()
+                    }
+                )
+
+                if useFAB {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Button(action: { showCreate = true }) {
+                                Image(systemName: "plus")
+                                    .font(.title2)
+                                    .padding()
+                                    .background(Circle().fill(Color.blue))
+                                    .foregroundColor(.white)
+                                    .shadow(radius: 6)
+                            }
+                            .padding(.leading, 16) // left
+                            Spacer()
+                        }
+                        .padding(.bottom, 8)
+                    }
+                }
+            }
+            .navigationBarTitle("Events", displayMode: .inline)
+            .toolbar {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button(action: { showNightlife = true }) {
+                        Image(systemName: "sparkles")
+                    }
+                    .onLongPressGesture { triggerToolbarHints(duration: hintDuration) }
+
+                    if isPromoterUser {
+                        Button(action: { showPromoterSheet = true }) {
+                            Image(systemName: "star.fill")
+                        }
+                        .onLongPressGesture { triggerToolbarHints(duration: hintDuration) }
+                    }
+
+                    if !useFAB {
+                        Button(action: { showCreate = true }) {
+                            Image(systemName: "plus.circle.fill")
+                        }
+                    }
+                }
+            }
+            .sheet(isPresented: $showCreate) { CreateEventView() }
+            .sheet(isPresented: $showPromoterSheet) { PromoterDashboardView() }
+            .sheet(isPresented: $showNightlife) { NightlifeHomeView() }
+        }
+        .onAppear {
+            refreshPromoterFlag()
+            triggerToolbarHints(duration: hintDuration)
+        }
+    }
+
+    // MARK: - Hint UI
+    private func hintBubble(icon: String, text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(text)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+            Button("Never show again") {
+                disableHints()
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.black.opacity(0.65))
+        .clipShape(Capsule())
+        .shadow(color: Color.black.opacity(0.25), radius: 8, x: 0, y: 2)
+    }
+
+    private func triggerToolbarHints(duration: TimeInterval) {
+        guard toolbarHintsEnabled else { return }
+        hintHideWorkItem?.cancel()
+        withAnimation(.easeIn(duration: 0.2)) { showToolbarHints = true }
+        let work = DispatchWorkItem {
+            withAnimation(.easeOut(duration: 0.35)) { showToolbarHints = false }
+        }
+        hintHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
+    private func disableHints() {
+        hintHideWorkItem?.cancel()
+        withAnimation(.easeOut(duration: 0.25)) { showToolbarHints = false }
+        toolbarHintsEnabled = false
+    }
+
+    // MARK: - Promoter check
+    private func refreshPromoterFlag() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            isPromoterUser = false
+            return
+        }
+        let ref = Database.database().reference().child("promoters").child(uid)
+        ref.observeSingleEvent(of: .value) { snap in
+            self.isPromoterUser = snap.exists()
+        }
+    }
+}
+
+// Reusable, subtle hint chip
+private struct HintChip: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.systemGray6).opacity(0.95))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.black.opacity(0.06), lineWidth: 1)
+            )
+            .shadow(radius: 0.5, y: 0.5)
+            .accessibilityHidden(true)
+    }
+}
+
+
+// MARK: - MyEventsView (NO inner NavigationView; tighter spacing)
 
 struct MyEventsView: View {
     @State private var myCreatedEvents: [EventModel] = []
@@ -86,95 +281,99 @@ struct MyEventsView: View {
     @State private var selectedPurchase: PurchaseModel? = nil
 
     var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    Text("Events I've Created")
-                        .font(.headline)
-                        .padding(.horizontal)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Events I’ve Created")
+                    .font(.headline)
+                    .padding(.horizontal)
 
-                    ForEach(myCreatedEvents) { event in
-                        VStack(alignment: .leading) {
-                            EventCardView(event: event)
+                ForEach(myCreatedEvents) { event in
+                    VStack(alignment: .leading, spacing: 10) {
+                        EventCardView(event: event)
 
-                            HStack(spacing: 10) {
-                                Button("Edit") {
-                                    selectedEventToEdit = event
-                                }
-                                .padding(8)
-                                .background(Color.orange)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
-
-                                Button("Delete") {
-                                    deleteEvent(event)
-                                }
-                                .padding(8)
-                                .background(Color.red)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
-
-                                Button("Stats") {
-                                    selectedEventForStats = event
-                                }
-                                .padding(8)
-                                .background(Color.blue)
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
+                        // compact action row
+                        HStack(spacing: 8) {
+                            Button(action: { selectedEventToEdit = event }) {
+                                Label("Edit", systemImage: "pencil")
+                                    .font(.footnote)
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.orange.opacity(0.9))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
                             }
-                            .padding(.horizontal)
-                        }
-                    }
 
-                    Divider().padding(.vertical)
-
-                    Text("Events I've Purchased")
-                        .font(.headline)
-                        .padding(.horizontal)
-
-                    ForEach(myPurchasedEvents) { purchase in
-                        VStack(alignment: .leading, spacing: 10) {
-                            EventImageView(imagePath: purchase.eventImagePath)
-                                .frame(height: 200)
-                                .cornerRadius(10)
-
-                            Text(purchase.eventTitle)
-                                .font(.headline)
-
-                            Text("Date: \(formattedDate(from: purchase.timestamp))")
-                                .font(.subheadline)
-                                .foregroundColor(.gray)
-
-                            Button("View Ticket") {
-                                selectedPurchase = purchase
+                            Button(action: { deleteEvent(event) }) {
+                                Label("Delete", systemImage: "trash")
+                                    .font(.footnote)
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.red.opacity(0.9))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
                             }
-                            .padding(8)
-                            .background(Color.green)
-                            .foregroundColor(.white)
-                            .cornerRadius(8)
+
+                            Button(action: { selectedEventForStats = event }) {
+                                Label("Stats", systemImage: "chart.bar.fill")
+                                    .font(.footnote)
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Color.blue.opacity(0.9))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                            }
                         }
                         .padding(.horizontal)
+                        .padding(.bottom, 4)
+
                     }
                 }
-            }
-            .navigationTitle("My Events")
-            .onAppear {
-                fetchMyEvents()
-                fetchMyPurchasedEvents()
-            }
-            .sheet(item: $selectedEventToEdit) { event in
-                EditEventView(event: event)
-            }
-            .sheet(item: $selectedEventForStats) { event in
-                EventStatsView(event: event)
-            }
-            .sheet(item: $selectedPurchase) { purchase in
-                ShowTicketView(purchase: purchase)
-            }
-            .sheet(isPresented: $showWebView) {
-                if let url = selectedURL {
-                    WebView(url: url).edgesIgnoringSafeArea(.all)
+
+                Divider().padding(.vertical, 6)
+
+                Text("Events I’ve Purchased")
+                    .font(.headline)
+                    .padding(.horizontal)
+
+                ForEach(myPurchasedEvents) { purchase in
+                    VStack(alignment: .leading, spacing: 8) {
+                        EventImageView(imagePath: purchase.eventImagePath)
+                            .frame(height: 200)
+                            .cornerRadius(10)
+
+                        Text(purchase.eventTitle)
+                            .font(.headline)
+
+                        Text("Date: \(formattedDate(from: purchase.timestamp))")
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+
+                        Button("View Ticket") {
+                            selectedPurchase = purchase
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .background(Color.green.opacity(0.9))
+                        .foregroundColor(.white)
+                        .cornerRadius(8)
+                    }
+                    .padding(.horizontal)
                 }
+            }
+            .padding(.top, 4) // closer to segment
+        }
+        .onAppear {
+            fetchMyEvents()
+            fetchMyPurchasedEvents()
+        }
+        .sheet(item: $selectedEventToEdit) { event in
+            EditEventView(event: event)
+        }
+        .sheet(item: $selectedEventForStats) { event in
+            EventStatsView(event: event)
+        }
+        .sheet(item: $selectedPurchase) { purchase in
+            ShowTicketView(purchase: purchase)
+        }
+        .sheet(isPresented: $showWebView) {
+            if let url = selectedURL {
+                WebView(url: url).edgesIgnoringSafeArea(.all)
             }
         }
     }
@@ -248,8 +447,572 @@ struct MyEventsView: View {
     }
 }
 
-import SwiftUI
-import Firebase
+// MARK: - EventImageView (unchanged logic; logs retained)
+
+struct EventImageView: View {
+    let imagePath: String
+    @State private var imageData: Data?
+    @State private var isLoading = true
+    @State private var fetchAttempted = false
+
+    var body: some View {
+        ZStack {
+            if let data = imageData, let uiImage = UIImage(data: data) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFill()
+                    .transition(.opacity)
+            } else if isLoading {
+                ProgressView("Loading...")
+            } else {
+                Rectangle()
+                    .foregroundColor(.gray.opacity(0.3))
+                    .overlay(
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundColor(.white)
+                            .font(.title)
+                    )
+            }
+        }
+        .frame(height: 200)
+        .clipped()
+        .cornerRadius(10)
+        .onAppear {
+            if !fetchAttempted {
+                fetchAttempted = true
+                fetchImage()
+            }
+        }
+    }
+
+    private func fetchImage() {
+        print("🔍 Fetching image URL for path: \(imagePath)")
+        let storageRef = Storage.storage().reference(withPath: imagePath)
+        storageRef.downloadURL { url, error in
+            if let url = url {
+                print("✅ Download URL obtained: \(url.absoluteString)")
+                loadImageData(from: url)
+            } else {
+                print("❌ Failed to fetch image URL: \(error?.localizedDescription ?? "Unknown error")")
+                isLoading = false
+            }
+        }
+    }
+
+    private func loadImageData(from url: URL, retries: Int = 3) {
+        print("📥 Attempting to load image from: \(url.absoluteString), retries left: \(retries)")
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            if let data = data, error == nil {
+                DispatchQueue.main.async {
+                    print("✅ Retried image data loaded successfully")
+                    imageData = data
+                    isLoading = false
+                }
+            } else if retries > 0 {
+                print("🔁 Retrying image download (\(retries - 1) left)...")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    loadImageData(from: url, retries: retries - 1)
+                }
+            } else {
+                print("❌ Final image fetch failed after retries: \(error?.localizedDescription ?? "Unknown error")")
+                DispatchQueue.main.async {
+                    isLoading = false
+                }
+            }
+        }.resume()
+    }
+}
+
+// MARK: - CreateEventView (friendly validation + alerts + disabled overlay)
+
+struct CreateEventView: View {
+    @Environment(\.presentationMode) var presentationMode
+    @State private var title = ""
+    @State private var description = ""
+    @State private var selectedDate = Date()
+    @State private var payoutMethod = "PayPal"   // fixed
+    @State private var payoutDetails = ""        // PayPal email only
+    @State private var ticketPrice: Double = 0.0
+    @State private var ticketQuantity: Int = 0
+    @State private var tablePrice: Double = 0.0
+    @State private var tableQuantity: Int = 0
+    @State private var selectedImage: UIImage?
+    @State private var isUploading = false
+    @State private var showImagePicker = false
+    @State private var location = ""
+
+    // NEW: errors
+    @State private var formErrors: [String] = []
+    @State private var showErrorAlert = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                // 🔴 Inline error banner
+                if !formErrors.isEmpty {
+                    Section {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Please fix the following:")
+                                .font(.subheadline).bold()
+                            ForEach(formErrors, id: \.self) { msg in
+                                Text("• \(msg)").font(.footnote)
+                            }
+                        }
+                        .foregroundColor(.red)
+                    }
+                }
+
+                Section(header: Text("Event Details")) {
+                    TextField("Event Title", text: $title)
+                    TextField("Event Location", text: $location)
+                    TextField("Event Description", text: $description)
+                    DatePicker("Event Date & Time", selection: $selectedDate)
+                }
+
+                Section(header: Text("Event Image")) {
+                    if let image = selectedImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(height: 150)
+                    }
+                    Button("Select Event Image") {
+                        showImagePicker = true
+                    }
+                }
+
+                Section(header: Text("Payout Information")) {
+                    HStack {
+                        Text("Payout Method")
+                        Spacer()
+                        Text("PayPal").foregroundColor(.secondary)
+                    }
+                    TextField("Enter PayPal email", text: $payoutDetails)
+                        .keyboardType(.emailAddress)
+                        .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                }
+
+                Section(header: Text("Ticket Sales")) {
+                    Text("Ticket Price (USD)")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                    TextField("", value: $ticketPrice, format: .number)
+                        .keyboardType(.decimalPad)
+
+                    Text("Number of Tickets")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                    TextField("", value: $ticketQuantity, format: .number)
+                        .keyboardType(.numberPad)
+                }
+
+                Section(header: Text("Table Booking")) {
+                    Text("Table Price (USD)")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                    TextField("", value: $tablePrice, format: .number)
+                        .keyboardType(.decimalPad)
+
+                    Text("Number of Tables")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                    TextField("", value: $tableQuantity, format: .number)
+                        .keyboardType(.numberPad)
+                }
+
+                if isUploading {
+                    ProgressView("Uploading...")
+                        .progressViewStyle(CircularProgressViewStyle())
+                } else {
+                    Button("Create Event") {
+                        createEvent()
+                    }
+                }
+            }
+            .navigationTitle("Create New Event")
+            .sheet(isPresented: $showImagePicker) {
+                ImagePicker(selectedImage: $selectedImage)
+            }
+            .disabled(isUploading)
+            .overlay {
+                if isUploading {
+                    ZStack {
+                        Color.black.opacity(0.05).ignoresSafeArea()
+                        ProgressView("Uploading…")
+                            .padding()
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                    }
+                }
+            }
+            .alert("Can’t Create Event", isPresented: $showErrorAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(formErrors.map { "• \($0)" }.joined(separator: "\n"))
+            }
+        }
+    }
+
+    private func validateForm() -> [String] {
+        var errs: [String] = []
+        if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please enter an event title.")
+        }
+        if location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please enter a location.")
+        }
+        if description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please add a short description.")
+        }
+        if selectedImage == nil {
+            errs.append("Please select a cover image for the event.")
+        }
+
+        // PayPal email (lightweight but solid)
+        let email = payoutDetails.trimmingCharacters(in: .whitespacesAndNewlines)
+        let regex = try! NSRegularExpression(
+            pattern: "^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$",
+            options: [.caseInsensitive]
+        )
+        if regex.firstMatch(in: email, range: NSRange(location: 0, length: email.utf16.count)) == nil {
+            errs.append("Enter a valid PayPal email.")
+        }
+
+        if ticketPrice < 0 || tablePrice < 0 { errs.append("Prices can’t be negative.") }
+        if ticketQuantity < 0 || tableQuantity < 0 { errs.append("Quantities can’t be negative.") }
+        if ticketPrice > 0 && ticketQuantity == 0 { errs.append("Set ticket quantity for paid tickets.") }
+        if tablePrice > 0 && tableQuantity == 0 { errs.append("Set table quantity for paid tables.") }
+
+        return errs
+    }
+
+    private func createEvent() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        let errs = validateForm()
+        guard errs.isEmpty else {
+            formErrors = errs
+            showErrorAlert = true
+            return
+        }
+
+        isUploading = true
+        guard let image = selectedImage else { return }
+
+        uploadEventImage(image) { imagePath in
+            guard let imagePath = imagePath else {
+                self.isUploading = false
+                self.formErrors = ["We couldn’t upload your image. Check your connection and try again."]
+                self.showErrorAlert = true
+                return
+            }
+            saveEventData(imagePath: imagePath, userId: userId)
+        }
+    }
+
+    private func uploadEventImage(_ image: UIImage, completion: @escaping (String?) -> Void) {
+        guard let imageData = image.jpegData(compressionQuality: 0.8) else {
+            formErrors = ["We couldn’t read the selected image. Try another image."]
+            showErrorAlert = true
+            completion(nil)
+            return
+        }
+
+        let imageID = UUID().uuidString
+        let storageRef = Storage.storage().reference().child("eventImages/\(imageID).jpg")
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+
+        storageRef.putData(imageData, metadata: metadata) { _, error in
+            if let error = error {
+                self.formErrors = ["Image upload failed. (\(error.localizedDescription))"]
+                self.showErrorAlert = true
+                completion(nil)
+            } else {
+                completion("eventImages/\(imageID).jpg")
+            }
+        }
+    }
+
+    private func saveEventData(imagePath: String, userId: String) {
+        let ref = Database.database().reference().child("events").childByAutoId()
+        let eventId = ref.key ?? UUID().uuidString
+        let data: [String: Any] = [
+            "id": eventId,
+            "title": title,
+            "description": description,
+            "date": selectedDate.timeIntervalSince1970,
+            "timestamp": Date().timeIntervalSince1970,
+            "payoutMethod": payoutMethod,
+            "payoutDetails": payoutDetails,
+            "location": location,
+            "ticketPrice": ticketPrice,
+            "ticketQuantity": ticketQuantity,
+            "tablePrice": tablePrice,
+            "tableQuantity": tableQuantity,
+            "imagePath": imagePath,
+            "userId": userId,
+            "isFree": (ticketPrice <= 0 && tablePrice <= 0)
+        ]
+
+        ref.setValue(data) { error, _ in
+            isUploading = false
+            if let error = error {
+                self.formErrors = ["We couldn’t save your event. (\(error.localizedDescription))"]
+                self.showErrorAlert = true
+            } else {
+                presentationMode.wrappedValue.dismiss()
+            }
+        }
+    }
+}
+
+// MARK: - EditEventView (same friendly validation pattern)
+
+struct EditEventView: View {
+    @Environment(\.presentationMode) var presentationMode
+    let event: EventModel
+
+    @State private var title: String
+    @State private var description: String
+    @State private var selectedDate: Date
+    @State private var payoutMethod: String
+    @State private var payoutDetails: String
+    @State private var ticketPrice: Double
+    @State private var ticketQuantity: Int
+    @State private var tablePrice: Double
+    @State private var tableQuantity: Int
+    @State private var location: String
+    @State private var selectedImage: UIImage?
+    @State private var showImagePicker = false
+    @State private var isUploading = false
+
+    @State private var formErrors: [String] = []
+    @State private var showErrorAlert = false
+
+    init(event: EventModel) {
+        self.event = event
+        let normalizedMethod = "PayPal"
+        let normalizedDetails = (event.payoutMethod == "PayPal") ? event.payoutDetails : ""
+
+        _title = State(initialValue: event.title)
+        _description = State(initialValue: event.description)
+        _location = State(initialValue: event.location)
+        _selectedDate = State(initialValue: event.date)
+        _payoutMethod = State(initialValue: normalizedMethod)
+        _payoutDetails = State(initialValue: normalizedDetails)
+        _ticketPrice = State(initialValue: event.ticketPrice)
+        _ticketQuantity = State(initialValue: event.ticketQuantity)
+        _tablePrice = State(initialValue: event.tablePrice)
+        _tableQuantity = State(initialValue: event.tableQuantity)
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                if !formErrors.isEmpty {
+                    Section {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Please fix the following:")
+                                .font(.subheadline).bold()
+                            ForEach(formErrors, id: \.self) { msg in
+                                Text("• \(msg)").font(.footnote)
+                            }
+                        }
+                        .foregroundColor(.red)
+                    }
+                }
+
+                Section(header: Text("Event Details")) {
+                    TextField("Event Title", text: $title)
+                    TextField("Event Description", text: $description)
+                    TextField("Event Location", text: $location)
+                    DatePicker("Event Date & Time", selection: $selectedDate)
+                }
+
+                Section(header: Text("Update Image")) {
+                    if let image = selectedImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(height: 150)
+                    }
+                    Button("Select New Image") {
+                        showImagePicker = true
+                    }
+                }
+
+                Section(header: Text("Payout Information")) {
+                    HStack {
+                        Text("Payout Method")
+                        Spacer()
+                        Text("PayPal")
+                            .foregroundColor(.secondary)
+                    }
+
+                    TextField("Enter PayPal Email", text: $payoutDetails)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                }
+
+                Section(header: Text("Ticket Sales")) {
+                    TextField("Ticket Price (USD)", value: $ticketPrice, format: .number)
+                        .keyboardType(.decimalPad)
+                    TextField("Number of Tickets", value: $ticketQuantity, format: .number)
+                        .keyboardType(.numberPad)
+                }
+
+                Section(header: Text("Table Booking")) {
+                    TextField("Table Price (USD)", value: $tablePrice, format: .number)
+                        .keyboardType(.decimalPad)
+                    TextField("Number of Tables", value: $tableQuantity, format: .number)
+                        .keyboardType(.numberPad)
+                }
+
+                if isUploading {
+                    ProgressView("Updating...")
+                        .progressViewStyle(CircularProgressViewStyle())
+                } else {
+                    Button("Save Changes") {
+                        updateEvent()
+                    }
+                }
+            }
+            .navigationTitle("Edit Event")
+            .sheet(isPresented: $showImagePicker) {
+                ImagePicker(selectedImage: $selectedImage)
+            }
+            .disabled(isUploading)
+            .overlay {
+                if isUploading {
+                    ZStack {
+                        Color.black.opacity(0.05).ignoresSafeArea()
+                        ProgressView("Updating…")
+                            .padding()
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                    }
+                }
+            }
+            .alert("Can’t Save Changes", isPresented: $showErrorAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(formErrors.map { "• \($0)" }.joined(separator: "\n"))
+            }
+        }
+    }
+
+    private func validateEditForm() -> [String] {
+        var errs: [String] = []
+        if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please enter an event title.")
+        }
+        if location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please enter a location.")
+        }
+        if description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errs.append("Please add a short description.")
+        }
+        let email = payoutDetails.trimmingCharacters(in: .whitespacesAndNewlines)
+        let regex = try! NSRegularExpression(
+            pattern: "^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$",
+            options: [.caseInsensitive]
+        )
+        if regex.firstMatch(in: email, range: NSRange(location: 0, length: email.utf16.count)) == nil {
+            errs.append("Enter a valid PayPal email.")
+        }
+        if ticketPrice < 0 || tablePrice < 0 { errs.append("Prices can’t be negative.") }
+        if ticketQuantity < 0 || tableQuantity < 0 { errs.append("Quantities can’t be negative.") }
+        if ticketPrice > 0 && ticketQuantity == 0 { errs.append("Set ticket quantity for paid tickets.") }
+        if tablePrice > 0 && tableQuantity == 0 { errs.append("Set table quantity for paid tables.") }
+        return errs
+    }
+
+    private func updateEvent() {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        let errs = validateEditForm()
+        guard errs.isEmpty else {
+            formErrors = errs
+            showErrorAlert = true
+            return
+        }
+
+        isUploading = true
+        if let newImage = selectedImage {
+            uploadNewImage(newImage) { imagePath in
+                guard let path = imagePath else {
+                    isUploading = false
+                    formErrors = ["We couldn’t upload your image. Check your connection and try again."]
+                    showErrorAlert = true
+                    return
+                }
+                saveChanges(imagePath: path, userId: userId)
+            }
+        } else {
+            saveChanges(imagePath: event.imagePath, userId: userId)
+        }
+    }
+
+    private func uploadNewImage(_ image: UIImage, completion: @escaping (String?) -> Void) {
+        guard let imageData = image.jpegData(compressionQuality: 0.8) else {
+            formErrors = ["We couldn’t read the selected image. Try another image."]
+            showErrorAlert = true
+            completion(nil)
+            return
+        }
+
+        let imageID = UUID().uuidString
+        let storageRef = Storage.storage().reference().child("eventImages/\(imageID).jpg")
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+
+        storageRef.putData(imageData, metadata: metadata) { _, error in
+            if let error = error {
+                print("❌ Image upload error: \(error.localizedDescription)")
+                formErrors = ["Image upload failed. (\(error.localizedDescription))"]
+                showErrorAlert = true
+                completion(nil)
+            } else {
+                completion("eventImages/\(imageID).jpg")
+            }
+        }
+    }
+
+    private func saveChanges(imagePath: String, userId: String) {
+        let ref = Database.database().reference().child("events/\(event.id)")
+        let data: [String: Any] = [
+            "title": title,
+            "description": description,
+            "location": location,
+            "date": selectedDate.timeIntervalSince1970,
+            "timestamp": Date().timeIntervalSince1970,
+            "payoutMethod": payoutMethod,
+            "payoutDetails": payoutDetails,
+            "ticketPrice": ticketPrice,
+            "ticketQuantity": ticketQuantity,
+            "tablePrice": tablePrice,
+            "tableQuantity": tableQuantity,
+            "imagePath": imagePath,
+            "userId": userId,
+            "isFree": (ticketPrice <= 0 && tablePrice <= 0)
+        ]
+
+        ref.updateChildValues(data) { error, _ in
+            isUploading = false
+            if let error = error {
+                formErrors = ["We couldn’t save your changes. (\(error.localizedDescription))"]
+                showErrorAlert = true
+            } else {
+                presentationMode.wrappedValue.dismiss()
+            }
+        }
+    }
+}
+
+// MARK: - ShowTicketView (unchanged)
 
 struct ShowTicketView: View {
     let purchase: PurchaseModel
@@ -328,10 +1091,7 @@ struct ShowTicketView: View {
     }
 }
 
-// MARK: - EventStatsView.swift
-
-import SwiftUI
-import Firebase
+// MARK: - EventStatsView (unchanged)
 
 struct EventStatsView: View {
     let event: EventModel
@@ -433,7 +1193,7 @@ struct EventStatsView: View {
     }
 }
 
-// MARK: - UserNameView
+// MARK: - UserNameView (unchanged)
 
 struct UserNameView: View {
     let userId: String
@@ -456,7 +1216,7 @@ struct UserNameView: View {
     }
 }
 
-// MARK: - UserAvatarView
+// MARK: - UserAvatarView (unchanged)
 
 struct UserAvatarView: View {
     let userId: String
@@ -508,578 +1268,8 @@ struct UserAvatarView: View {
     }
 }
 
+// MARK: - RSSCardView (unchanged)
 
-import SwiftUI
-import FirebaseAuth
-import FirebaseDatabase
-
-// MARK: - EventTabView
-struct EventTabView: View {
-    @State private var selectedTab = 0
-    @State private var showCreate = false
-
-    // Promoter Dashboard state
-    @State private var isPromoterUser = false
-    @State private var showPromoterSheet = false
-
-    // Nightlife entry (glowing button) state
-    @State private var showNightlife = false
-
-    var body: some View {
-        VStack(spacing: 12) {
-            // Existing segmented control
-            Picker("View", selection: $selectedTab) {
-                Text("All Events").tag(0)
-                Text("My Events").tag(1)
-            }
-            .pickerStyle(SegmentedPickerStyle())
-            .padding(.horizontal)
-            .padding(.top, 8)
-
-            // Existing content
-            if selectedTab == 0 {
-                EventFeedView()
-            } else {
-                MyEventsView()
-            }
-
-            // NEW: Nightlife entry with a gentle animated glow
-            GlowingNightlifeButton {
-                showNightlife = true
-            }
-            .padding(.horizontal)
-
-            // Promoter-only entry (unchanged behavior)
-            if isPromoterUser {
-                Button {
-                    showPromoterSheet = true
-                } label: {
-                    HStack {
-                        Image(systemName: "star.fill")
-                        Text("Promoter Dashboard")
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(10)
-                }
-                .padding(.horizontal)
-                .sheet(isPresented: $showPromoterSheet) {
-                    PromoterDashboardView()
-                }
-            }
-
-            // Existing "Create Event" button
-            Button(action: { showCreate = true }) {
-                HStack {
-                    Image(systemName: "plus.circle.fill")
-                    Text("Create Event")
-                }
-                .padding()
-                .frame(maxWidth: .infinity)
-                .background(Color.blue)
-                .foregroundColor(.white)
-                .cornerRadius(10)
-            }
-            .padding(.horizontal)
-            .padding(.bottom, 12)
-            .sheet(isPresented: $showCreate) {
-                CreateEventView()
-            }
-        }
-        .onAppear(perform: refreshPromoterFlag)
-        // Nightlife presented as a sheet so we don’t depend on a NavigationStack here
-        .sheet(isPresented: $showNightlife) {
-            // ⬇️ This view is defined in your Nightlife module
-            NightlifeHomeView()
-        }
-    }
-
-    // MARK: - Promoter check (RTDB: /promoters/{uid})
-    private func refreshPromoterFlag() {
-        guard let uid = Auth.auth().currentUser?.uid else {
-            isPromoterUser = false
-            return
-        }
-        let ref = Database.database().reference().child("promoters").child(uid)
-        ref.observeSingleEvent(of: .value) { snap in
-            // Visible only if the promoter profile exists
-            self.isPromoterUser = snap.exists()
-        }
-    }
-}
-
-// MARK: - Glowing Nightlife Button
-private struct GlowingNightlifeButton: View {
-    @State private var glow = false
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: "sparkles")
-                    .font(.headline)
-                Text("Nightlife")
-                    .font(.headline).bold()
-            }
-            .padding()
-            .frame(maxWidth: .infinity)
-            .foregroundColor(.white)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color.purple.opacity(0.88))
-            )
-            .shadow(color: Color.purple.opacity(glow ? 0.9 : 0.4), radius: glow ? 20 : 8)
-            .scaleEffect(glow ? 1.03 : 1.0)
-            .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: glow)
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-            )
-        }
-        .onAppear { glow = true }
-    }
-}
-
-
-
-import SwiftUI
-import FirebaseStorage
-
-struct EventImageView: View {
-    let imagePath: String
-    @State private var imageData: Data?
-    @State private var isLoading = true
-    @State private var fetchAttempted = false
-
-    var body: some View {
-        ZStack {
-            if let data = imageData, let uiImage = UIImage(data: data) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .scaledToFill()
-                    .transition(.opacity)
-            } else if isLoading {
-                ProgressView("Loading...")
-            } else {
-                Rectangle()
-                    .foregroundColor(.gray.opacity(0.3))
-                    .overlay(
-                        Image(systemName: "exclamationmark.triangle")
-                            .foregroundColor(.white)
-                            .font(.title)
-                    )
-            }
-        }
-        .frame(height: 200)
-        .clipped()
-        .cornerRadius(10)
-        .onAppear {
-            if !fetchAttempted {
-                fetchAttempted = true
-                fetchImage()
-            }
-        }
-    }
-
-    private func fetchImage() {
-        print("🔍 Fetching image URL for path: \(imagePath)")
-        let storageRef = Storage.storage().reference(withPath: imagePath)
-        storageRef.downloadURL { url, error in
-            if let url = url {
-                print("✅ Download URL obtained: \(url.absoluteString)")
-                loadImageData(from: url)
-            } else {
-                print("❌ Failed to fetch image URL: \(error?.localizedDescription ?? "Unknown error")")
-                isLoading = false
-            }
-        }
-    }
-
-    private func loadImageData(from url: URL, retries: Int = 3) {
-        print("📥 Attempting to load image from: \(url.absoluteString), retries left: \(retries)")
-        URLSession.shared.dataTask(with: url) { data, response, error in
-            if let data = data, error == nil {
-                DispatchQueue.main.async {
-                    print("✅ Retried image data loaded successfully")
-                    imageData = data
-                    isLoading = false
-                }
-            } else if retries > 0 {
-                print("🔁 Retrying image download (\(retries - 1) left)...")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    loadImageData(from: url, retries: retries - 1)
-                }
-            } else {
-                print("❌ Final image fetch failed after retries: \(error?.localizedDescription ?? "Unknown error")")
-                DispatchQueue.main.async {
-                    isLoading = false
-                }
-            }
-        }.resume()
-    }
-}
-// MARK: - CreateEventView
-import SwiftUI
-import Firebase
-import FirebaseStorage
-
-struct CreateEventView: View {
-    @Environment(\.presentationMode) var presentationMode
-    @State private var title = ""
-    @State private var description = ""
-    @State private var selectedDate = Date()
-    @State private var payoutMethod = "PayPal"   // fixed
-    @State private var payoutDetails = ""        // PayPal email only
-    @State private var ticketPrice: Double = 0.0
-    @State private var ticketQuantity: Int = 0
-    @State private var tablePrice: Double = 0.0
-    @State private var tableQuantity: Int = 0
-    @State private var selectedImage: UIImage?
-    @State private var isUploading = false
-    @State private var showImagePicker = false
-    @State private var location = ""
-
-   
-    var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("Event Details")) {
-                    TextField("Event Title", text: $title)
-                    TextField("Event Location", text: $location)
-                    TextField("Event Description", text: $description)
-                    DatePicker("Event Date & Time", selection: $selectedDate)
-                }
-                
-                Section(header: Text("Event Image")) {
-                    if let image = selectedImage {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(height: 150)
-                    }
-                    Button("Select Event Image") {
-                        showImagePicker = true
-                    }
-                }
-                
-                Section(header: Text("Payout Information")) {
-                    HStack {
-                        Text("Payout Method")
-                        Spacer()
-                        Text("PayPal").foregroundColor(.secondary)
-                    }
-                    TextField("Enter PayPal email", text: $payoutDetails)
-                        .keyboardType(.emailAddress)
-                        .autocapitalization(.none)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                }
-
-
-                Section(header: Text("Ticket Sales")) {
-                    Text("Ticket Price (USD)")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                    TextField("", value: $ticketPrice, format: .number)
-                        .keyboardType(.decimalPad)
-
-                    Text("Number of Tickets")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                    TextField("", value: $ticketQuantity, format: .number)
-                        .keyboardType(.numberPad)
-                }
-
-                Section(header: Text("Table Booking")) {
-                    Text("Table Price (USD)")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                    TextField("", value: $tablePrice, format: .number)
-                        .keyboardType(.decimalPad)
-
-                    Text("Number of Tables")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                    TextField("", value: $tableQuantity, format: .number)
-                        .keyboardType(.numberPad)
-                }
-
-
-                                    if isUploading {
-                                        ProgressView("Uploading...")
-                                            .progressViewStyle(CircularProgressViewStyle())
-                                    } else {
-                                        Button("Create Event") {
-                                            createEvent()
-                                        }
-                                    }
-                                }
-                                .navigationTitle("New Event")
-                                .sheet(isPresented: $showImagePicker) {
-                                    ImagePicker(selectedImage: $selectedImage)
-                                }
-                            }
-                        }
-                
-                func createEvent() {
-                    guard let userId = Auth.auth().currentUser?.uid else { return }
-                    guard !title.isEmpty, !description.isEmpty, selectedImage != nil else { return }
-
-                    // simple PayPal email validation (very light)
-                    let email = payoutDetails.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let validEmail = email.contains("@") && email.contains(".")
-                    guard validEmail else {
-                        print("❌ Invalid PayPal email")
-                        return
-                    }
-
-                    isUploading = true
-
-                    
-                    if let image = selectedImage {
-                        uploadEventImage(image) { imagePath in
-                            guard let imagePath = imagePath else {
-                                isUploading = false
-                                return
-                            }
-                            saveEventData(imagePath: imagePath, userId: userId)
-                        }
-                    }
-                }
-                
-                func uploadEventImage(_ image: UIImage, completion: @escaping (String?) -> Void) {
-                    guard let imageData = image.jpegData(compressionQuality: 0.8) else {
-                        print("❌ Failed to convert image to data")
-                        completion(nil)
-                        return
-                    }
-                    
-                    let imageID = UUID().uuidString
-                    let storageRef = Storage.storage().reference().child("eventImages/\(imageID).jpg")
-                    let metadata = StorageMetadata()
-                    metadata.contentType = "image/jpeg"
-                    
-                    storageRef.putData(imageData, metadata: metadata) { metadata, error in
-                        if let error = error {
-                            print("❌ Image upload failed: \(error.localizedDescription)")
-                            completion(nil)
-                        } else {
-                            print("✅ Image uploaded successfully: \(imageID).jpg")
-                            completion("eventImages/\(imageID).jpg")
-                        }
-                    }
-                }
-                
-                func saveEventData(imagePath: String, userId: String) {
-                    let ref = Database.database().reference().child("events").childByAutoId()
-                    let eventId = ref.key ?? UUID().uuidString
-                    let data: [String: Any] = [
-                        "id": eventId,
-                        "title": title,
-                        "description": description,
-                        "date": selectedDate.timeIntervalSince1970,
-                        "timestamp": Date().timeIntervalSince1970,
-                        "payoutMethod": payoutMethod,
-                        "payoutDetails": payoutDetails,
-                        "location": location,
-                        "ticketPrice": ticketPrice,
-                        "ticketQuantity": ticketQuantity,
-                        "tablePrice": tablePrice,
-                        "tableQuantity": tableQuantity,
-                        "imagePath": imagePath,
-                        "userId": userId
-                    ]
-                    
-                    ref.setValue(data) { error, _ in
-                        isUploading = false
-                        if error == nil {
-                            presentationMode.wrappedValue.dismiss()
-                        } else {
-                            print("❌ Failed to save event: \(error!.localizedDescription)")
-                        }
-                    }
-                }
-            }
-// MARK: - EditEventView
-import SwiftUI
-import Firebase
-import FirebaseStorage
-
-struct EditEventView: View {
-    @Environment(\.presentationMode) var presentationMode
-    let event: EventModel
-
-    @State private var title: String
-    @State private var description: String
-    @State private var selectedDate: Date
-    @State private var payoutMethod: String
-    @State private var payoutDetails: String
-    @State private var ticketPrice: Double
-    @State private var ticketQuantity: Int
-    @State private var tablePrice: Double
-    @State private var tableQuantity: Int
-    @State private var location: String
-    @State private var selectedImage: UIImage?
-    @State private var showImagePicker = false
-    @State private var isUploading = false
-
-    init(event: EventModel) {
-        self.event = event
-
-        // Normalize payout to PayPal only
-        let normalizedMethod = "PayPal"
-        let normalizedDetails = (event.payoutMethod == "PayPal") ? event.payoutDetails : ""
-
-        _title = State(initialValue: event.title)
-        _description = State(initialValue: event.description)
-        _location = State(initialValue: event.location)
-        _selectedDate = State(initialValue: event.date)
-        _payoutMethod = State(initialValue: normalizedMethod)
-        _payoutDetails = State(initialValue: normalizedDetails)
-        _ticketPrice = State(initialValue: event.ticketPrice)
-        _ticketQuantity = State(initialValue: event.ticketQuantity)
-        _tablePrice = State(initialValue: event.tablePrice)
-        _tableQuantity = State(initialValue: event.tableQuantity)
-    }
-
-
-    var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("Event Details")) {
-                    TextField("Event Title", text: $title)
-                    TextField("Event Description", text: $description)
-                    TextField("Event Location", text: $location)
-                    DatePicker("Event Date & Time", selection: $selectedDate)
-                }
-
-                Section(header: Text("Update Image")) {
-                    if let image = selectedImage {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(height: 150)
-                    }
-                    Button("Select New Image") {
-                        showImagePicker = true
-                    }
-                }
-
-                Section(header: Text("Payout Information")) {
-                    HStack {
-                        Text("Payout Method")
-                        Spacer()
-                        Text("PayPal")
-                            .foregroundColor(.secondary)
-                    }
-
-                    TextField("Enter PayPal Email", text: $payoutDetails)
-                        .keyboardType(.emailAddress)
-                        .textInputAutocapitalization(.never)
-                }
-
-
-                Section(header: Text("Ticket Sales")) {
-                    TextField("Ticket Price (USD)", value: $ticketPrice, format: .number)
-                        .keyboardType(.decimalPad)
-                    TextField("Number of Tickets", value: $ticketQuantity, format: .number)
-                        .keyboardType(.numberPad)
-                }
-
-                Section(header: Text("Table Booking")) {
-                    TextField("Table Price (USD)", value: $tablePrice, format: .number)
-                        .keyboardType(.decimalPad)
-                    TextField("Number of Tables", value: $tableQuantity, format: .number)
-                        .keyboardType(.numberPad)
-                }
-
-                if isUploading {
-                    ProgressView("Updating...")
-                        .progressViewStyle(CircularProgressViewStyle())
-                } else {
-                    Button("Save Changes") {
-                        updateEvent()
-                    }
-                }
-            }
-            .navigationTitle("Edit Event")
-            .sheet(isPresented: $showImagePicker) {
-                ImagePicker(selectedImage: $selectedImage)
-            }
-        }
-    }
-
-    func updateEvent() {
-        guard let userId = Auth.auth().currentUser?.uid else { return }
-        isUploading = true
-
-        if let newImage = selectedImage {
-            uploadNewImage(newImage) { imagePath in
-                guard let path = imagePath else {
-                    isUploading = false
-                    return
-                }
-                saveChanges(imagePath: path, userId: userId)
-            }
-        } else {
-            saveChanges(imagePath: event.imagePath, userId: userId)
-        }
-    }
-
-    func uploadNewImage(_ image: UIImage, completion: @escaping (String?) -> Void) {
-        guard let imageData = image.jpegData(compressionQuality: 0.8) else {
-            completion(nil)
-            return
-        }
-
-        let imageID = UUID().uuidString
-        let storageRef = Storage.storage().reference().child("eventImages/\(imageID).jpg")
-        let metadata = StorageMetadata()
-        metadata.contentType = "image/jpeg"
-
-        storageRef.putData(imageData, metadata: metadata) { _, error in
-            if let error = error {
-                print("❌ Image upload error: \(error.localizedDescription)")
-                completion(nil)
-            } else {
-                completion("eventImages/\(imageID).jpg")
-            }
-        }
-    }
-
-    func saveChanges(imagePath: String, userId: String) {
-        let ref = Database.database().reference().child("events/\(event.id)")
-        let data: [String: Any] = [
-            "title": title,
-            "description": description,
-            "location": location,
-            "date": selectedDate.timeIntervalSince1970,
-            "timestamp": Date().timeIntervalSince1970,
-            "payoutMethod": payoutMethod,
-            "payoutDetails": payoutDetails,
-            "ticketPrice": ticketPrice,
-            "ticketQuantity": ticketQuantity,
-            "tablePrice": tablePrice,
-            "tableQuantity": tableQuantity,
-            "imagePath": imagePath,
-            "userId": userId
-        ]
-
-        ref.updateChildValues(data) { error, _ in
-            isUploading = false
-            if error == nil {
-                presentationMode.wrappedValue.dismiss()
-            } else {
-                print("❌ Failed to update event: \(error!.localizedDescription)")
-            }
-        }
-    }
-}
-
-
-
-// MARK: - RSSCardView
 struct RSSCardView: View {
     let article: RSSArticle
     @Binding var selectedURL: URL?
@@ -1142,11 +1332,7 @@ struct RSSCardView: View {
     }
 }
 
-
-import UIKit
-import SwiftUI
-import Firebase
-import FirebaseAuth
+// MARK: - EventDetailView (unchanged core; includes share + checkout)
 
 struct EventDetailView: View {
     let event: EventModel
@@ -1156,7 +1342,6 @@ struct EventDetailView: View {
     @State private var showCheckoutConfirmation = false
     @State private var isSaved = false
 
-    // NEW: Gossip-first share UI
     @State private var showShareOptions = false
 
     var body: some View {
@@ -1204,15 +1389,13 @@ struct EventDetailView: View {
                 }
 
                 HStack {
-                    // NEW: Gossip-first share entry
-                    Button {
-                        showShareOptions = true
-                    } label: {
+                    Button(action: { showShareOptions = true }) {
                         Label("Share", systemImage: "square.and.arrow.up")
                             .padding(8)
                             .background(Color.gray.opacity(0.2))
                             .cornerRadius(8)
                     }
+
                     .confirmationDialog("Share Event", isPresented: $showShareOptions, titleVisibility: .visible) {
                         Button("Share to Gossip (recommended)") {
                             shareToGossip()
@@ -1254,7 +1437,6 @@ struct EventDetailView: View {
                 let baseTotal = Double(ticketQty) * event.ticketPrice + Double(tableQty) * event.tablePrice
                 let totalWithFee = baseTotal * 1.02
 
-                // Preserve your existing hosted flow
                 let urlString = """
                 https://blackappios.web.app/index.html?\
                 eventId=\(event.id)&\
@@ -1282,7 +1464,6 @@ struct EventDetailView: View {
         }
     }
 
-    // MARK: - Save / load
     private func toggleSaveEvent() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
@@ -1310,7 +1491,6 @@ struct EventDetailView: View {
         }
     }
 
-    // MARK: - Gossip-first sharing
     private func shareToGossip() {
         guard let url = buildEventDeepLink() else {
             shareToSystem()
@@ -1318,7 +1498,6 @@ struct EventDetailView: View {
         }
         let caption = makeEventCaption()
         if let top = topMostController() {
-            // Uses your GossipShareKit.swift (already added earlier)
             GossipShareManager.shared.presentShare(from: top, payload: .link(url: url, text: caption))
         } else {
             shareToSystem()
@@ -1331,10 +1510,7 @@ struct EventDetailView: View {
     }
 
     private func buildEventDeepLink() -> URL? {
-        // Keep your current hosted event page
         URL(string: "https://blackappios.web.app/event.html?eventId=\(event.id)")
-        // If/when you move to a canonical path:
-        // URL(string: "https://blackapp.app/e/\(event.id)")
     }
 
     private func makeEventCaption() -> String {
@@ -1356,7 +1532,8 @@ struct EventDetailView: View {
     }
 }
 
-// MARK: - Generic share presenters (safe fallback)
+// MARK: - Generic share presenters (unchanged)
+
 private func presentSystemShare(_ items: [Any]) {
     DispatchQueue.main.async {
         guard let top = topMostController() else { return }
@@ -1383,6 +1560,7 @@ private func topMostController(base: UIViewController? = {
     return base
 }
 
+// MARK: - ShareModalView / ShareIconButton (unchanged)
 
 struct ShareModalView: View {
     let eventId: String

@@ -185,4 +185,3 @@ public struct NightlifeMiniAppIcon: View {
     }
 }
 
-

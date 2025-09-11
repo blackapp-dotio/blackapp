@@ -4,6 +4,11 @@ import FirebaseAuth
 import FirebaseFirestore
 import UIKit
 
+// MARK: - Notification for captured media
+extension Notification.Name {
+    static let inviteOrbCapturedMedia = Notification.Name("inviteOrbCapturedMedia")
+}
+
 // MARK: - Build the invite text (TestFlight + Invite Code)
 enum InviteLinkBuilder {
     /// Final share text: includes TestFlight steps and the inviter's short code.
@@ -20,14 +25,13 @@ enum InviteLinkBuilder {
 
 // MARK: - Fetch the current user's invite code
 fileprivate func fetchInviteCode(for userId: String?, completion: @escaping (String) -> Void) {
-    // Prefer the provided userId, else Auth user
     let targetUid = userId ?? Auth.auth().currentUser?.uid
     guard let uid = targetUid, !uid.isEmpty else {
-        completion("BA-\(UUID().uuidString.prefix(7).uppercased())") // fallback (won't resolve, but share won’t break)
+        completion("BA-\(UUID().uuidString.prefix(7).uppercased())")
         return
     }
     Firestore.firestore().collection("users").document(uid).getDocument { doc, _ in
-        let code = (doc?.data()?["inviteCode"] as? String) ?? uid // fallback to uid if code not present yet
+        let code = (doc?.data()?["inviteCode"] as? String) ?? uid
         completion(code)
     }
 }
@@ -50,14 +54,12 @@ private struct InviteShareSheet: View {
 
     var body: some View {
         Group {
-            if let items { // when ready, present the native share UI
+            if let items {
                 SystemShareSheet(items: items)
             } else {
-                // quick lightweight loader while fetching the code
                 ZStack {
-                    Color.black.opacity(0.001) // keep sheet dimming consistent
-                    ProgressView("Preparing invite…")
-                        .padding()
+                    Color.black.opacity(0.001)
+                    ProgressView("Preparing invite…").padding()
                 }
                 .onAppear(perform: prepare)
             }
@@ -68,9 +70,7 @@ private struct InviteShareSheet: View {
         let next = _InviteOrbBadge.nextTarget(after: circleSize ?? 0)
         fetchInviteCode(for: userId) { code in
             let text = InviteLinkBuilder.shareText(inviteCode: code, circleSize: circleSize, nextTarget: next)
-            // Put the text *once*; iOS auto-linkifies URLs inside the message
             self.items = [text]
-            // TIP: you could also pre-copy the code for convenience:
             UIPasteboard.general.string = code
         }
     }
@@ -110,7 +110,7 @@ struct CoachingBubble: View {
     }
 }
 
-// MARK: - Local badge helper (scoped to this file to avoid conflicts)
+// MARK: - Local badge helper
 fileprivate enum _InviteOrbBadge {
     // 0 = white (new user), then 5/10/20/40/80/160/320/640...
     static let thresholds: [Int] = [0, 5, 10, 20, 40, 80, 160, 320, 640]
@@ -119,16 +119,15 @@ fileprivate enum _InviteOrbBadge {
     }
 }
 
-// MARK: - Liquid, Siri-style animated orb with Blue ↔ Violet color morph
+// MARK: - Futuristic Invite Orb Button (visual only)
 struct FuturisticInviteOrb: View {
     var size: CGFloat = 62
     var action: () -> Void
 
-    // Animation state
     @State private var breathe = false
     @State private var shimmer = false
-    @State private var t: CGFloat = 0          // time phase for liquid wobble
-    @State private var phase: CGFloat = 0.0    // 0→1 color cycle (blue↔violet↔blue)
+    @State private var t: CGFloat = 0
+    @State private var phase: CGFloat = 0.0
     @GestureState private var hover: CGPoint = .zero
 
     var body: some View {
@@ -136,28 +135,25 @@ struct FuturisticInviteOrb: View {
         let tiltX = (hover.x - radius) / radius
         let tiltY = (hover.y - radius) / radius
 
-        let core = interpolatedColor(phase: phase)                // main color
-        let rim  = interpolatedColor(phase: phase * 0.9 + 0.05)   // slightly shifted for depth
+        let core = interpolatedColor(phase: phase)
+        let rim  = interpolatedColor(phase: phase * 0.9 + 0.05)
         let aura = interpolatedColor(phase: phase * 1.1 + 0.1).opacity(0.30)
 
         Button(action: action) {
             ZStack {
-                // Backdrop defocus halo (breathing)
                 Circle()
                     .fill(aura)
                     .blur(radius: 18)
                     .scaleEffect(breathe ? 1.03 : 0.985)
                     .animation(.easeInOut(duration: 4.0).repeatForever(autoreverses: true), value: breathe)
 
-                // === LIQUID CORE (morphing) — color-cycling Blue ↔ Violet
                 LiquidBlob(t: t, wobble: 0.032)
                     .fill(
                         RadialGradient(
                             colors: [
-                                core.opacity(0.95),                       // bright core
-                                core.mix(with: .black, amount: 0.55)      // deepen towards edge
-                                    .opacity(0.92),
-                                Color.black.opacity(0.70)                 // vignette
+                                core.opacity(0.95),
+                                core.mix(with: .black, amount: 0.55).opacity(0.92),
+                                Color.black.opacity(0.70)
                             ],
                             center: .init(x: 0.46 + tiltX * 0.10, y: 0.42 + tiltY * 0.06),
                             startRadius: size * 0.08,
@@ -165,7 +161,6 @@ struct FuturisticInviteOrb: View {
                         )
                     )
 
-                // Subsurface/inner glow
                 LiquidBlob(t: t * 0.65 + 4.0, wobble: 0.16)
                     .fill(
                         RadialGradient(
@@ -177,7 +172,6 @@ struct FuturisticInviteOrb: View {
                     )
                     .blendMode(.screen)
 
-                // Caustic swirl (conic shimmer)
                 Canvas { ctx, size in
                     let g = Gradient(colors: [
                         .white.opacity(0.00),
@@ -195,7 +189,6 @@ struct FuturisticInviteOrb: View {
                 .opacity(0.85)
                 .animation(.linear(duration: 6.0).repeatForever(autoreverses: false), value: shimmer)
 
-                // Rim light (defined edges, tinted with rim color)
                 LiquidBlob(t: t * 0.50, wobble: 0.010)
                     .stroke(
                         AngularGradient(
@@ -211,7 +204,6 @@ struct FuturisticInviteOrb: View {
                     )
                     .blur(radius: 0.35)
 
-                // Specular highlight (floats with tilt)
                 LiquidBlob(t: t * 0.45 + 1.7, wobble: 0.014)
                     .fill(
                         RadialGradient(
@@ -223,7 +215,6 @@ struct FuturisticInviteOrb: View {
                     )
                     .blendMode(.screen)
 
-                // Bottom refraction ring (tinted)
                 LiquidBlob(t: t * 0.40 + 0.9, wobble: 0.008)
                     .stroke(
                         RadialGradient(
@@ -236,14 +227,12 @@ struct FuturisticInviteOrb: View {
                     )
                     .blur(radius: 1.1)
 
-                // Pulse aura (breathing)
                 LiquidBlob(t: t * 0.35 + 5.0, wobble: 0.008)
                     .stroke(Color.white.opacity(0.10), lineWidth: 1)
                     .scaleEffect(breathe ? 1.03 : 0.985)
                     .blur(radius: breathe ? 1.2 : 1.8)
                     .animation(.easeInOut(duration: 4.0).repeatForever(autoreverses: true), value: breathe)
 
-                // Center “+” glyph (glassy)
                 Image(systemName: "plus")
                     .font(.system(size: size * 0.42, weight: .semibold))
                     .foregroundStyle(
@@ -256,15 +245,12 @@ struct FuturisticInviteOrb: View {
             }
             .frame(width: size, height: size)
             .background(
-                Circle()
-                    .fill(.ultraThinMaterial.opacity(0.06))
-                    .blur(radius: 6)
+                Circle().fill(.ultraThinMaterial.opacity(0.06)).blur(radius: 6)
             )
             .shadow(color: core.opacity(0.30), radius: 16, x: 0, y: 9)
             .rotation3DEffect(.degrees(Double(tiltY * 7)), axis: (x: 1, y: 0, z: 0))
             .rotation3DEffect(.degrees(Double(-tiltX * 7)), axis: (x: 0, y: 1, z: 0))
-            .offset(x: sin(t * 0.10) * 0.8, y: cos(t * 0.09) * 0.8) // gentle orbital drift
-            // track hover WITHOUT stealing the button tap
+            .offset(x: sin(t * 0.10) * 0.8, y: cos(t * 0.09) * 0.8)
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .updating($hover) { value, state, _ in
@@ -275,14 +261,8 @@ struct FuturisticInviteOrb: View {
             .onAppear {
                 breathe = true
                 shimmer = true
-                // liquid morph (shape)
-                withAnimation(.linear(duration: 28).repeatForever(autoreverses: false)) {
-                    t = 60
-                }
-                // color cycle blue↔violet↔blue (loop)
-                withAnimation(.linear(duration: 10).repeatForever(autoreverses: false)) {
-                    phase = 1.0
-                }
+                withAnimation(.linear(duration: 28).repeatForever(autoreverses: false)) { t = 60 }
+                withAnimation(.linear(duration: 10).repeatForever(autoreverses: false)) { phase = 1.0 }
             }
         }
         .accessibilityLabel("Invite friends")
@@ -290,7 +270,6 @@ struct FuturisticInviteOrb: View {
         .contentShape(Circle())
     }
 
-    // COLOR INTERPOLATION — Blue ↔ Violet ↔ Blue loop
     private func interpolatedColor(phase: CGFloat) -> Color {
         let t = (sin(phase * .pi * 2) + 1) / 2 // 0…1
         let blue   = SIMD3<Double>(0.20, 0.45, 1.00)
@@ -300,38 +279,28 @@ struct FuturisticInviteOrb: View {
     }
 }
 
-// MARK: - LiquidBlob Shape (slow time multipliers = calmer motion)
+// MARK: - LiquidBlob Shape
 fileprivate struct LiquidBlob: Shape {
-    var t: CGFloat        // time phase (animatable)
-    var wobble: CGFloat   // amplitude of edge perturbation
+    var t: CGFloat
+    var wobble: CGFloat
 
     func path(in rect: CGRect) -> Path {
         let cx = rect.midX, cy = rect.midY
         let R = min(rect.width, rect.height) * 0.5
-
         var p = Path()
         let steps = 140
         let twoPi = CGFloat.pi * 2
-
-        let k1: CGFloat = 0.25
-        let k2: CGFloat = 0.18
-        let k3: CGFloat = 0.12
+        let k1: CGFloat = 0.25, k2: CGFloat = 0.18, k3: CGFloat = 0.12
 
         for i in 0..<steps {
             let a = (CGFloat(i) / CGFloat(steps)) * twoPi
-
-            let r =
-                R
-                * (1
-                   + wobble * 0.90 * sin(a * 3.0 + t * k1)
-                   + wobble * 0.65 * sin(a * 5.0 - t * k2)
-                   + wobble * 0.40 * sin(a * 9.0 + t * k3))
-
+            let r = R * (1
+                         + wobble * 0.90 * sin(a * 3.0 + t * k1)
+                         + wobble * 0.65 * sin(a * 5.0 - t * k2)
+                         + wobble * 0.40 * sin(a * 9.0 + t * k3))
             let x = cx + r * cos(a)
             let y = cy + r * sin(a)
-
-            if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
-            else { p.addLine(to: CGPoint(x: x, y: y)) }
+            if i == 0 { p.move(to: CGPoint(x: x, y: y)) } else { p.addLine(to: CGPoint(x: x, y: y)) }
         }
         p.closeSubpath()
         return p
@@ -347,15 +316,11 @@ fileprivate struct LiquidBlob: Shape {
 fileprivate extension Color {
     func mix(with other: Color, amount: CGFloat) -> Color {
         let a = max(0, min(1, amount))
-        let c1 = UIColor(self)
-        let c2 = UIColor(other)
-
+        let c1 = UIColor(self), c2 = UIColor(other)
         var r1: CGFloat = 0, g1: CGFloat = 0, b1: CGFloat = 0, a1: CGFloat = 0
         var r2: CGFloat = 0, g2: CGFloat = 0, b2: CGFloat = 0, a2: CGFloat = 0
-
         c1.getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
         c2.getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
-
         return Color(
             red: Double(r1 + (r2 - r1) * a),
             green: Double(g1 + (g2 - g1) * a),
@@ -365,18 +330,21 @@ fileprivate extension Color {
     }
 }
 
-// MARK: - Floating Invite Orb (uses FuturisticInviteOrb)
+// MARK: - Floating Invite Orb (presents capture + share)
 public struct InviteOrb: View {
     let userId: String?
-    let circleSize: Int?        // pass when available; otherwise nil
+    let circleSize: Int?
+    
     @State private var showShare = false
-    @State private var showCoach = true // reappears per app relaunch (in-memory only)
-
+    @State private var showCoach = true
+    @State private var showCapture = false
+    @State private var showChooser = false
+    
     public init(userId: String?, circleSize: Int?) {
         self.userId = userId
         self.circleSize = circleSize
     }
-
+    
     private var nextTargetText: String {
         let next = _InviteOrbBadge.nextTarget(after: circleSize ?? 0)
         if let n = next {
@@ -385,10 +353,9 @@ public struct InviteOrb: View {
             return "You’ve reached the ultimate popularity level/badge. 👑"
         }
     }
-
+    
     public var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            // Coaching bubble above orb
             if showCoach {
                 CoachingBubble(text: nextTargetText) { showCoach = false }
                     .transition(.move(edge: .trailing).combined(with: .opacity))
@@ -398,42 +365,55 @@ public struct InviteOrb: View {
 
             FuturisticInviteOrb(size: 64) {
                 UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                showShare = true
-            }
-            .sheet(isPresented: $showShare) {
-                // We fetch the invite code and then present the native share sheet
-                InviteShareSheet(userId: userId, circleSize: circleSize)
+                showChooser = true
             }
         }
+        // Presenters anchored to the ZStack (not inside a ViewBuilder scope)
+        .sheet(isPresented: $showShare) {
+            InviteShareSheet(userId: userId, circleSize: circleSize)
+        }
+        .fullScreenCover(isPresented: $showCapture) {
+            LiveCaptureView()
+                .ignoresSafeArea()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { _ in
+            // Dismiss the camera when it reports a capture (photo or video)
+            showCapture = false
+        }
+        .confirmationDialog("What would you like to do?", isPresented: $showChooser, titleVisibility: .visible) {
+            Button("Capture Nightlife") { showCapture = true }
+            Button("Share Invite") { showShare = true }
+            Button("Cancel", role: .cancel) {}
+        }
     }
-}
+    } // ← end of InviteOrb
 
-// MARK: - Overlay wrapper
-public struct InviteOrbOverlay<Content: View>: View {
-    let userId: String?
-    let circleSize: Int?
-    let content: Content
+    // MARK: - Overlay wrapper (must be top-level, not nested in a ViewBuilder)
+    public struct InviteOrbOverlay<Content: View>: View {
+        let userId: String?
+        let circleSize: Int?
+        let content: Content
 
-    public init(userId: String?, circleSize: Int? = nil, @ViewBuilder content: () -> Content) {
-        self.userId = userId
-        self.circleSize = circleSize
-        self.content = content()
-    }
+        public init(userId: String?, circleSize: Int? = nil, @ViewBuilder content: () -> Content) {
+            self.userId = userId
+            self.circleSize = circleSize
+            self.content = content()
+        }
 
-    public var body: some View {
-        ZStack {
-            content
-            VStack {
-                Spacer()
-                HStack {
+        public var body: some View {
+            ZStack {
+                content
+                VStack {
                     Spacer()
-                    InviteOrb(userId: userId, circleSize: circleSize)
-                        .padding(.trailing, 18)
-                        .padding(.bottom, 86)
-                        .allowsHitTesting(true)
+                    HStack {
+                        Spacer()
+                        InviteOrb(userId: userId, circleSize: circleSize)
+                            .padding(.trailing, 18)
+                            .padding(.bottom, 86)
+                            .allowsHitTesting(true)
+                    }
                 }
+                .ignoresSafeArea(.keyboard)
             }
-            .ignoresSafeArea(.keyboard)
         }
     }
-}

@@ -1,36 +1,72 @@
-// BlackAppIOSApp.swift — Updated with: RTDB caching + hot-path sync, global Invite Orb overlay,
-// referral capture (deep links & universal links), and post-login referral consumption.
-// Refactored to avoid SwiftUI type-checker blowups.
+// BlackAppIOSApp.swift — Stable base + App Check that works on Simulator & Devices
+// Keeps: RTDB caching/keepSynced, OneSignal, deep links, referral capture,
+// Invite Orb overlay, payment success sheet, etc.  Optimized for launch speed.
 
 import SwiftUI
 import Firebase
 import FirebaseAuth
-import FirebaseDatabase   // RTDB caching / keepSynced
-import FirebaseFunctions  // <- needed for ReferralManager callable func
+import FirebaseDatabase            // RTDB caching / keepSynced
+import FirebaseFunctions
+import FirebaseAppCheck            // ✅ App Check providers
+import FirebaseFirestore           // ✅ Firestore settings/persistence
 import GoogleSignIn
 import GoogleSignInSwift
 import OneSignalFramework
+import UserNotifications
 
 // MARK: - AppDelegate
-class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    func application(_ application: UIApplication,
-                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // Firebase setup
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+
+        // ✅ App Check provider factory MUST be set BEFORE FirebaseApp.configure()
+        // Simulator & all DEBUG builds -> Debug provider (easy dev)
+        // Release on device -> App Attest (preferred) else DeviceCheck
+        #if DEBUG
+        AppCheck.setAppCheckProviderFactory(AppCheckDebugProviderFactory())
+
+        print("🛡️ App Check: Debug provider (DEBUG build)")
+        #else
+        if AppAttestProvider.isSupported() {
+            AppCheck.setAppCheckProviderFactory(AppAttestProviderFactory())
+            print("🛡️ App Check: App Attest provider")
+        } else {
+            AppCheck.setAppCheckProviderFactory(DeviceCheckProviderFactory())
+            print("🛡️ App Check: DeviceCheck provider (fallback)")
+        }
+        #endif
+
+        // Firebase
         FirebaseApp.configure()
 
-        // ✅ Local persistence + background sync for hot paths
-        // Must be set BEFORE any Database reference is used elsewhere in the app.
+        // ✅ Firestore: local persistence & bigger cache for snappy suggestive search
+        let fs = Firestore.firestore()
+        let fsSettings = fs.settings
+        fsSettings.isPersistenceEnabled = true
+        // cacheSizeBytes unlimited avoids churn when users scroll around a lot
+        fsSettings.cacheSizeBytes = FirestoreCacheSizeUnlimited
+        fs.settings = fsSettings
+
+        // ✅ RTDB: local persistence + hot-path keepSynced
         Database.database().isPersistenceEnabled = true
-        let hotPaths = ["events", "nights", "reservations", "posts", "feed", "venues"]
+
+        // Keep hot paths synchronized in background so UI is instant when opened.
+        // Includes users & brands to accelerate the Search preview modal.
+        let hotPaths = [
+            "events", "nights", "reservations", "posts", "feed", "venues",
+            "users",            // ✅ Search suggestions, avatars, circleSize
+            "brands"            // ✅ Preview modal brand strip
+        ]
         hotPaths.forEach { Database.database().reference(withPath: $0).keepSynced(true) }
 
-        // ✅ Bigger HTTP cache (helps flyers/thumbnails and general web loads)
-        URLCache.shared = URLCache(
-            memoryCapacity: 64 * 1024 * 1024,   // 64 MB RAM
-            diskCapacity:   512 * 1024 * 1024   // 512 MB disk
-        )
+        // ❌ Remove duplicate URLCache tuning here — it’s installed earlier in App.init()
+        // (PerfBootstrap.installURLCache in @main) to ensure it applies to all sessions.
 
         // OneSignal setup (SDK 3.x+)
+        #if !targetEnvironment(simulator)
         OneSignal.initialize("69366bbb-2d87-44b1-921c-3fd2cba8effc", withLaunchOptions: launchOptions)
 
         // 🔁 Re-prompt for push notification permissions if not yet granted
@@ -45,9 +81,11 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         }
 
         // Deep link + OneSignal handler
-        NotificationCenter.default.addObserver(forName: Notification.Name("ONESIGNAL_NOTIFICATION_OPENED"),
-                                               object: nil,
-                                               queue: .main) { notification in
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name("ONESIGNAL_NOTIFICATION_OPENED"),
+            object: nil,
+            queue: .main
+        ) { notification in
             guard let data = notification.userInfo,
                   let additionalData = data["additionalData"] as? [String: Any] else {
                 print("⚠️ No additionalData found in OneSignal notification payload.")
@@ -73,7 +111,6 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                 if !NotificationRouter.shared.unreadChatIds.contains(chatId) {
                     NotificationRouter.shared.unreadChatIds.append(chatId)
                 }
-
                 NotificationRouter.shared.selectedChatUser = ChatUserProfile(
                     id: senderId,
                     name: senderName,
@@ -88,24 +125,35 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
                 UIApplication.shared.open(url)
             }
         }
+        #else
+        print("📵 OneSignal disabled on Simulator to avoid network churn")
+        #endif
 
         return true
     }
 
-    func application(_ app: UIApplication, open url: URL,
-                     options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
-        return GIDSignIn.sharedInstance.handle(url)
+    func application(
+        _ app: UIApplication,
+        open url: URL,
+        options: [UIApplication.OpenURLOptionsKey : Any] = [:]
+    ) -> Bool {
+        GIDSignIn.sharedInstance.handle(url)
     }
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+    // Push presentation
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
         completionHandler([.banner, .list, .sound])
     }
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
         let userInfo = response.notification.request.content.userInfo
         print("🔔 User tapped native notification: \(userInfo)")
         NotificationCenter.default.post(name: NSNotification.Name("NotificationTapped"), object: nil, userInfo: userInfo)
@@ -126,8 +174,6 @@ fileprivate func storePendingReferrer(from url: URL) {
     UserDefaults.standard.set(ref, forKey: "pendingReferrerUid")
     print("🔗 Stored pending referrer: \(ref)")
 }
-
-
 
 // MARK: - A small container view to avoid type-checker blowups
 private struct AuthedContainerView: View {
@@ -224,11 +270,17 @@ struct BlackAppIOSApp: App {
     @StateObject var authVM = AuthViewModel()
     @State private var paymentSuccess = false
 
+    // ✅ Phase-1 perf bootstrap: enlarge URLCache early (before any networking)
+    init() {
+        PerfBootstrap.installURLCache(memMB: 128, diskMB: 512)
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
                 if authVM.user != nil {
                     AuthedContainerView(authVM: authVM, paymentSuccess: $paymentSuccess)
+                        .environmentObject(authVM) // harmless: keeps AuthVM available to subviews
                 } else {
                     LoginView()
                         .environmentObject(authVM)
