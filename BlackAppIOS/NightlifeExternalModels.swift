@@ -8,6 +8,35 @@ import SwiftUI
 import SafariServices
 import FirebaseDatabase
 
+// MARK: - Small logging helpers
+
+@inline(__always)
+func NLLog(_ msg: @autoclosure () -> String) {
+#if DEBUG
+    print(msg())
+#endif
+}
+
+@inline(__always)
+func bodyPreview(_ data: Data, max: Int = 600) -> String {
+    guard !data.isEmpty else { return "∅" }
+    let s = String(decoding: data, as: UTF8.self)
+    if s.count <= max { return s }
+    return String(s.prefix(max)) + "…(\(s.count - max) more)"
+}
+
+/// If a function responses wraps JSON with any debug text, attempt to recover.
+/// This is conservative; if it can't find an array/object start, returns original.
+@inline(__always)
+func stripDebugEnvelope(_ data: Data) -> Data {
+    guard let s = String(data: data, encoding: .utf8) else { return data }
+    if let i = s.firstIndex(where: { $0 == "[" || $0 == "{" }) {
+        let trimmed = String(s[i...])
+        return trimmed.data(using: .utf8) ?? data
+    }
+    return data
+}
+
 // MARK: - Unified Venue & Price helpers (compat with older call-sites)
 
 public struct ExternalVenue: Hashable, Codable {
@@ -125,7 +154,7 @@ fileprivate struct AnyKey: CodingKey {
     init?(intValue: Int) { self.stringValue = "\(intValue)"; self.intValue = intValue }
 }
 
-// MARK: - ExternalFeedItem (network DTO; avoids conflicts with any existing FeedItem)
+// MARK: - ExternalFeedItem (network DTO; accepts heroImage OR imageURL)
 
 public struct ExternalFeedItem: Codable, Identifiable, Equatable {
     public let id: String
@@ -136,7 +165,75 @@ public struct ExternalFeedItem: Codable, Identifiable, Equatable {
     public let price: Double?
     public let externalURL: String?
     public let source: String              // "ticketmaster" | "eventbrite"
-    public let heroImage: String?
+    public let heroImage: String?          // primary field
+    public let imageURL: String?           // alias/back-compat
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, venueName, address, date, price, externalURL, source, heroImage, imageURL
+        case image = "image"
+        case imageUrl = "imageUrl"
+        case thumbnail = "thumbnail"
+        case poster = "poster"
+        case flyer = "flyer"
+    }
+
+    public init(id: String, title: String, venueName: String, address: String, date: String, price: Double?, externalURL: String?, source: String, heroImage: String?, imageURL: String?) {
+        self.id = id
+        self.title = title
+        self.venueName = venueName
+        self.address = address
+        self.date = date
+        self.price = price
+        self.externalURL = externalURL
+        self.source = source
+        self.heroImage = heroImage
+        self.imageURL = imageURL
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.title = (try? c.decode(String.self, forKey: .title)) ?? "Event"
+        self.venueName = (try? c.decode(String.self, forKey: .venueName)) ?? ""
+        self.address = (try? c.decode(String.self, forKey: .address)) ?? ""
+        self.date = (try? c.decode(String.self, forKey: .date)) ?? ISO8601DateFormatter().string(from: Date())
+        self.price = try? c.decode(Double.self, forKey: .price)
+        self.externalURL = (try? c.decode(String.self, forKey: .externalURL))
+        self.source = (try? c.decode(String.self, forKey: .source)) ?? ""
+
+        let heroRaw = try? c.decode(String.self, forKey: .heroImage)
+
+        var imgURLRaw: String? = nil
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .imageURL) }
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .image) }
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .imageUrl) }
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .thumbnail) }
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .poster) }
+        if imgURLRaw == nil { imgURLRaw = try? c.decode(String.self, forKey: .flyer) }
+
+        func https(_ s: String?) -> String? {
+            guard let s, !s.isEmpty else { return nil }
+            if s.hasPrefix("http:") { return "https:" + s.dropFirst(5) }
+            return s
+        }
+
+        self.heroImage = https(heroRaw)
+        self.imageURL  = https(imgURLRaw)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encode(venueName, forKey: .venueName)
+        try c.encode(address, forKey: .address)
+        try c.encode(date, forKey: .date)
+        try c.encodeIfPresent(price, forKey: .price)
+        try c.encodeIfPresent(externalURL, forKey: .externalURL)
+        try c.encode(source, forKey: .source)
+        try c.encodeIfPresent(heroImage, forKey: .heroImage)
+        try c.encodeIfPresent(imageURL, forKey: .imageURL)
+    }
 }
 
 // MARK: - ExternalEvent (app model)
@@ -151,8 +248,6 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
     public var externalURL: String?
     public var source: String?
     public var heroImage: String?
-
-    // Compatibility:
 
     public var venue: ExternalVenue {
         ExternalVenue(
@@ -193,7 +288,7 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
         self.heroImage = heroImage
     }
 
-    // Convert from network DTO
+    // Convert from network DTO — prefers heroImage then imageURL
     public init(from item: ExternalFeedItem) {
         let iso = ISO8601DateFormatter()
         iso.timeZone = TimeZone(secondsFromGMT: 0)
@@ -207,11 +302,11 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
             price: item.price,
             externalURL: item.externalURL,
             source: item.source,
-            heroImage: item.heroImage
+            heroImage: item.heroImage ?? item.imageURL
         )
     }
 
-    // Flexible Decodable for legacy payloads
+    // Flexible Decodable for legacy payloads — UPDATED
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
 
@@ -228,7 +323,10 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
                 if let i = try? c.decodeIfPresent(Int.self, forKey: AnyKey(k)) { return Double(i) }
                 if let i64 = try? c.decodeIfPresent(Int64.self, forKey: AnyKey(k)) { return Double(i64) }
                 if let s = try? c.decodeIfPresent(String.self, forKey: AnyKey(k)) {
-                    let sanitized = s.replacingOccurrences(of: ",", with: "")
+                    let sanitized = s
+                        .replacingOccurrences(of: ",", with: "")
+                        .replacingOccurrences(of: "$", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                     if let v = Double(sanitized) { return v }
                 }
             }
@@ -241,8 +339,8 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
         let addr = str(["address","address1","formatted_address","venueAddress"]) ?? ""
 
         // Date can be seconds/ms/ISO string
-        let dateSeconds = dbl(["date","startTime","start","timestamp"])
-        let dateString = str(["date","startTime","start","timestamp","isoDate"])
+        let dateSeconds = dbl(["date","startTime","start","timestamp","start_ts","startMillis"])
+        let dateString = str(["date","startTime","start","timestamp","isoDate","when","startISO"])
 
         let parsedDate: Date = {
             if let s = dateSeconds {
@@ -262,10 +360,24 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
             return Date()
         }()
 
+        // break up long alias chain for the type-checker
+        var heroVal: String? = str(["heroImage"])
+        if heroVal == nil { heroVal = str(["image"]) }
+        if heroVal == nil { heroVal = str(["imageUrl"]) }
+        if heroVal == nil { heroVal = str(["imageURL"]) }
+        if heroVal == nil { heroVal = str(["thumbnail"]) }
+        if heroVal == nil { heroVal = str(["poster"]) }
+        if heroVal == nil { heroVal = str(["flyer"]) }
+
         let priceVal = dbl(["price","ticketPrice","minPrice","lowestPrice"])
         let urlVal = str(["url","externalURL","link","purchaseUrl","purchaseURL"])
         let sourceVal = str(["source","provider"])
-        let heroVal = str(["heroImage","image","imageUrl","imageURL","thumbnail"])
+
+        func https(_ s: String?) -> String? {
+            guard let s, !s.isEmpty else { return nil }
+            if s.hasPrefix("http:") { return "https:" + s.dropFirst(5) }
+            return s
+        }
 
         self.init(
             id: fallbackId,
@@ -276,7 +388,7 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
             price: priceVal,
             externalURL: urlVal,
             source: sourceVal,
-            heroImage: heroVal
+            heroImage: https(heroVal)
         )
     }
 
@@ -308,7 +420,19 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
         let price = (v["price"] as? Double) ?? (v["ticketPrice"] as? Double)
         let externalURL = (v["url"] as? String) ?? (v["externalURL"] as? String) ?? (v["link"] as? String)
         let source = (v["source"] as? String) ?? (v["provider"] as? String)
-        let heroImage = (v["heroImage"] as? String) ?? (v["image"] as? String) ?? (v["imageUrl"] as? String) ?? (v["imageURL"] as? String)
+
+        var heroVal: String? =
+            (v["heroImage"] as? String) ??
+            (v["image"] as? String) ??
+            (v["imageUrl"] as? String) ??
+            (v["imageURL"] as? String) ??
+            (v["thumbnail"] as? String) ??
+            (v["poster"] as? String) ??
+            (v["flyer"] as? String)
+
+        if let hv = heroVal, hv.hasPrefix("http:") {
+            heroVal = "https:" + hv.dropFirst(5)
+        }
 
         return ExternalEvent(
             id: id,
@@ -319,7 +443,7 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
             price: price,
             externalURL: externalURL,
             source: source,
-            heroImage: heroImage
+            heroImage: heroVal
         )
     }
 
@@ -345,9 +469,9 @@ public struct ExternalEvent: Identifiable, Hashable, Codable {
         return nil
     }
 
-    private static func extractCity(from address: String?) -> String? {
+    static func extractCity(from address: String?) -> String? {
         guard let address = address, !address.isEmpty else { return nil }
-        let parts = address.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let parts = address.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         if parts.count >= 2 { return parts[parts.count - 2] }
         return parts.last
     }
@@ -361,7 +485,7 @@ extension Array where Element == ExternalEvent {
     }
 }
 
-// MARK: - Image-first sort helper
+// MARK: - Image-first sort helper (for internal use)
 
 fileprivate extension Array where Element == ExternalEvent {
     func sortedImageFirstThenDate() -> [ExternalEvent] {
@@ -375,41 +499,39 @@ fileprivate extension Array where Element == ExternalEvent {
     }
 }
 
-// MARK: - RTDB merged fetch (optional)
+// MARK: - RTDB fallback (top-level; no NightlifeService dependency)
 
-extension NightlifeService {
-    /// Pull from multiple likely RTDB paths and merge/dedupe.
-    public func fetchExternalEventsMerged(
-        paths: [String] = ["externalEvents", "external/events", "feeds/external/events"],
-        completion: @escaping ([ExternalEvent]) -> Void
-    ) {
-        let group = DispatchGroup()
-        var all: [ExternalEvent] = []
+public func fetchExternalEventsMergedFallback(
+    paths: [String] = ["externalEvents", "external/events", "feeds/external/events"],
+    completion: @escaping ([ExternalEvent]) -> Void
+) {
+    let db = Database.database().reference()
+    let group = DispatchGroup()
+    var all: [ExternalEvent] = []
 
-        for p in paths {
-            group.enter()
-            db.child(p).observeSingleEvent(of: .value) { snap in
-                if snap.exists() {
-                    for case let child as DataSnapshot in snap.children {
-                        if let e = ExternalEvent.from(child) { all.append(e) }
-                    }
+    for p in paths {
+        group.enter()
+        db.child(p).observeSingleEvent(of: .value) { snap in
+            if snap.exists() {
+                for case let child as DataSnapshot in snap.children {
+                    if let e = ExternalEvent.from(child) { all.append(e) }
                 }
-                group.leave()
             }
+            group.leave()
         }
+    }
 
-        group.notify(queue: .main) {
-            var seen = Set<String>()
-            let deduped = all.filter { e in
-                let key = "\(e.source ?? "")|\(e.id)|\(e.title)|\(Int(e.date.timeIntervalSince1970))"
-                if seen.contains(key) { return false }
-                seen.insert(key)
-                return true
-            }
-            .sortedImageFirstThenDate()
-
-            completion(deduped)
+    group.notify(queue: .main) {
+        var seen = Set<String>()
+        let deduped = all.filter { e in
+            let key = "\(e.source ?? "")|\(e.id)|\(e.title)|\(Int(e.date.timeIntervalSince1970))"
+            if seen.contains(key) { return false }
+            seen.insert(key)
+            return true
         }
+        .sortedImageFirstThenDate()
+
+        completion(deduped)
     }
 }
 
@@ -426,6 +548,8 @@ public final class FeedsAPI {
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = true
+        cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
         cfg.timeoutIntervalForRequest = 25
         cfg.timeoutIntervalForResource = 35
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -450,38 +574,80 @@ public final class FeedsAPI {
         end: Date,
         requireImage: Bool = true,
         imagesFirst: Bool = true,
-        timeout: TimeInterval = 25
+        timeout: TimeInterval = 25,
+        debug: Bool = false
     ) async throws -> [ExternalFeedItem] {
         var comps = URLComponents(
             url: base.appendingPathComponent(endpoint.rawValue),
             resolvingAgainstBaseURL: false
         )!
 
-        // Ensure city is ALWAYS present
         let cityParam = city.trimmingCharacters(in: .whitespacesAndNewlines)
         let items: [URLQueryItem] = [
             URLQueryItem(name: "city", value: cityParam.isEmpty ? "New York" : cityParam),
             URLQueryItem(name: "start", value: FeedsAPI.iso8601Z(start)),
             URLQueryItem(name: "end",   value: FeedsAPI.iso8601Z(end)),
             URLQueryItem(name: "requireImage", value: requireImage ? "1" : "0"),
-            URLQueryItem(name: "imagesFirst",  value: imagesFirst  ? "1" : "0")
+            URLQueryItem(name: "imagesFirst",  value: imagesFirst  ? "1" : "0"),
+            URLQueryItem(name: "debug", value: debug ? "1" : "0")
         ]
         comps.queryItems = items
 
         var req = URLRequest(url: comps.url!)
-        req.timeoutInterval = timeout
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
+        req.timeoutInterval = max(30, timeout)
+        req.setValue("application/json, text/plain; q=0.8, */*; q=0.1", forHTTPHeaderField: "Accept")
+        req.setValue("utf-8", forHTTPHeaderField: "Accept-Charset")
+        // Do NOT set "Connection: close"—causes HTTP/3 parser weirdness.
 
-        let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.badServerResponse)
-        }
+        NLLog("🔎 [CF:\(endpoint.rawValue)] → \(req.url?.absoluteString ?? "")")
+
         do {
-            return try JSONDecoder().decode([ExternalFeedItem].self, from: data)
+            let (data, resp) = try await session.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+
+            let status = http.statusCode
+            let ct     = http.value(forHTTPHeaderField: "Content-Type") ?? "(nil)"
+            let enc    = http.value(forHTTPHeaderField: "Content-Encoding") ?? "none"
+            let clen   = http.value(forHTTPHeaderField: "Content-Length") ?? "\(data.count)"
+
+            NLLog("🧾 [CF:\(endpoint.rawValue)] status=\(status) ct=\(ct) enc=\(enc) len=\(clen) bytes(rcv=\(data.count))")
+            #if DEBUG
+            NLLog("📦 [CF:\(endpoint.rawValue)] body preview:\n\(bodyPreview(data))")
+            #endif
+
+            // Non-2xx → allow fallback
+            guard (200..<300).contains(status) else {
+                NLLog("🟥 [CF:\(endpoint.rawValue)] non-2xx → returning []")
+                return []
+            }
+
+            // Hosting sometimes returns HTML even with 200.
+            if ct.lowercased().contains("text/html") {
+                NLLog("🟨 [CF:\(endpoint.rawValue)] got HTML instead of JSON → returning []")
+                return []
+            }
+
+            // Try decode; if fails, try after stripping any debug envelope.
+            do {
+                return try JSONDecoder().decode([ExternalFeedItem].self, from: data)
+            } catch {
+                NLLog("🟨 [CF:\(endpoint.rawValue)] JSON decode failed, attempting to strip envelope…")
+                let pruned = stripDebugEnvelope(data)
+                return try JSONDecoder().decode([ExternalFeedItem].self, from: pruned)
+            }
         } catch {
-            // If server sent HTML or anything odd, just propagate empty
-            return []
+            let ns = error as NSError
+            NLLog("🧨 [CF:\(endpoint.rawValue)] network error domain=\(ns.domain) code=\(ns.code) — \(ns.localizedDescription)")
+            if ns.domain == NSURLErrorDomain {
+                switch ns.code {
+                case -1017:
+                    NLLog("ℹ️ NSURLErrorCannotParseResponse (-1017). Often a proxy/transport mismatch or unexpected body.")
+                case -1005:
+                    NLLog("ℹ️ NSURLErrorNetworkConnectionLost (-1005). QUIC/HTTP3 path flakiness; retry/fallback.")
+                default: break
+                }
+            }
+            throw error
         }
     }
 
@@ -494,13 +660,12 @@ public final class FeedsAPI {
     public static func iso8601Z(_ date: Date) -> String { iso8601NoMS.string(from: date) }
 }
 
+// B) Hosting proxy /api fallback HTTP client
 
-// B) Hosting proxy fallback client (tries Hosting /api if you add rewrites)
 fileprivate enum ExternalAPI {
-    /// Direct Cloud Functions base (Express mounted at root)
     static let functionsBase = "https://us-central1-blackappios.cloudfunctions.net"
-    /// Firebase Hosting proxy (rewrite /api/** -> functions) — optional
-    static let hostingBase   = "https://blackappios.web.app/api" // or firebaseapp.com/api
+    static let hostingBase   = "https://blackappios.web.app/api"
+    static let hostingAlt    = "https://blackappios.firebaseapp.com/api"
 }
 
 fileprivate final class ExternalHTTP {
@@ -510,11 +675,12 @@ fileprivate final class ExternalHTTP {
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = true
+        cfg.allowsExpensiveNetworkAccess = true
+        cfg.allowsConstrainedNetworkAccess = true
         cfg.timeoutIntervalForRequest = 25
         cfg.timeoutIntervalForResource = 35
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.httpMaximumConnectionsPerHost = 3
-        // Remove "br" to avoid -1017 when CFNetwork/HTTP3 trips
         cfg.httpAdditionalHeaders = ["Accept": "application/json", "Accept-Encoding": "gzip, deflate"]
         return URLSession(configuration: cfg)
     }()
@@ -525,94 +691,46 @@ fileprivate final class ExternalHTTP {
         var description: String { "HTTP \(status) \(bodySnippet)" }
     }
 
-    /// Fetch JSON array `[ExternalEvent]` from a path like "/feedTicketmaster"
     func fetchEvents(path: String, query: [URLQueryItem], completion: @escaping (Result<[ExternalEvent], Error>) -> Void) {
-        // Try direct CF first, then hosting proxy
-        let bases = [ExternalAPI.functionsBase, ExternalAPI.hostingBase]
+        let bases = [ExternalAPI.functionsBase, ExternalAPI.hostingBase, ExternalAPI.hostingAlt]
 
         func attempt(index: Int, retry: Int) {
             guard index < bases.count else {
                 completion(.failure(NSError(domain: "ExternalHTTP", code: -1, userInfo: [NSLocalizedDescriptionKey: "No base succeeded."])))
                 return
             }
+
             var comps = URLComponents(string: bases[index] + path)!
             comps.queryItems = query.isEmpty ? nil : query
-
             guard let url = comps.url else {
                 completion(.failure(NSError(domain: "ExternalHTTP", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid URL components"])))
                 return
             }
 
-            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 25)
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
             req.setValue("application/json", forHTTPHeaderField: "Accept")
 
-            let task = session.dataTask(with: req) { data, resp, err in
-                if let err = err as? URLError {
-                    #if DEBUG
-                    print("❌ \(path) transport error [base \(index)] \(err.code.rawValue): \(err.localizedDescription)")
-                    #endif
-                    if retry < 2 {
-                        let delay = pow(2.0, Double(retry))
-                        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
-                            attempt(index: index, retry: retry + 1)
-                        }
-                    } else {
-                        attempt(index: index + 1, retry: 0)
-                    }
-                    return
+            let task = session.dataTask(with: req) { data, resp, _ in
+                guard let http = resp as? HTTPURLResponse, let data = data else {
+                    attempt(index: index + 1, retry: 0); return
                 }
 
-                guard let http = resp as? HTTPURLResponse else {
-                    completion(.failure(NSError(domain: "ExternalHTTP", code: -3, userInfo: [NSLocalizedDescriptionKey: "No HTTP response"])))
-                    return
-                }
-
-                let is2xx = (200..<300).contains(http.statusCode)
-                let mime = http.mimeType?.lowercased() ?? ""
-                let looksJSON = mime.contains("application/json") || mime.contains("text/json") || mime.contains("application/octet-stream")
-
-                if !is2xx {
-                    let snippet = data.flatMap { String(data: $0, encoding: .utf8) }?.prefix(180) ?? ""
-                    #if DEBUG
-                    print("❌ \(path) HTTP \(http.statusCode) [base \(index)] \(snippet)")
-                    #endif
+                if let ct = http.value(forHTTPHeaderField: "Content-Type"),
+                   ct.lowercased().contains("text/html") {
                     attempt(index: index + 1, retry: 0)
                     return
                 }
 
-                guard let data = data else {
-                    completion(.success([]))
-                    return
-                }
-
-                guard looksJSON else {
-                    let snippet = String(data: data, encoding: .utf8)?.prefix(180) ?? ""
-                    #if DEBUG
-                    print("❌ \(path) unexpected MIME '\(mime)'. Body: \(snippet)")
-                    #endif
-                    if index + 1 < bases.count {
-                        attempt(index: index + 1, retry: 0)
-                    } else {
-                        completion(.failure(HTTPError(status: http.statusCode, bodySnippet: String(snippet))))
-                    }
-                    return
-                }
-
                 do {
-                    // Decode into ExternalFeedItem (DTO), then map to app model
                     let list = try JSONDecoder().decode([ExternalFeedItem].self, from: data)
-                    let events = list.map(ExternalEvent.init(from:))
-                    completion(.success(events))
+                    completion(.success(list.map(ExternalEvent.init(from:))))
+                    return
                 } catch {
-                    #if DEBUG
-                    let snippet = String(data: data, encoding: .utf8)?.prefix(180) ?? ""
-                    print("❌ \(path) JSON decode failed: \(error). Body: \(snippet)")
-                    #endif
-                    if index + 1 < bases.count {
+                    if !(200..<300).contains(http.statusCode) {
                         attempt(index: index + 1, retry: 0)
-                    } else {
-                        completion(.failure(error))
+                        return
                     }
+                    attempt(index: index + 1, retry: 0)
                 }
             }
             task.resume()
@@ -634,11 +752,7 @@ final class ExternalFeedsClient {
         return f
     }()
 
-    /// Loads external events. Strategy:
-    /// 1) Try **direct Cloud Functions** (FeedsAPI) for both feeds.
-    /// 2) If either fails, **fallback** to the Hosting proxy client (ExternalHTTP).
     func load(city: String?, start: Date?, end: Date?, completion: @escaping ([ExternalEvent]) -> Void) {
-        // Always carry a city; endpoints behave better with it.
         let cityVal: String = {
             let v = (city ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return v.isEmpty ? "New York" : v
@@ -650,33 +764,32 @@ final class ExternalFeedsClient {
         Task {
             // --- Path A: Direct Cloud Functions ---
             do {
-                // First pass: require images
                 async let tm: [ExternalFeedItem] = FeedsAPI.shared.fetch(.ticketmaster, city: cityVal, start: s, end: e, requireImage: true, imagesFirst: true)
                 async let eb: [ExternalFeedItem] = FeedsAPI.shared.fetch(.eventbrite,   city: cityVal, start: s, end: e, requireImage: true, imagesFirst: true)
                 var events = (try await tm + eb).map(ExternalEvent.init(from:))
 
-                // Soft fallback: if strict image filter yields nothing, retry without the filter
                 if events.isEmpty {
                     async let tm2: [ExternalFeedItem] = FeedsAPI.shared.fetch(.ticketmaster, city: cityVal, start: s, end: e, requireImage: false, imagesFirst: true)
                     async let eb2: [ExternalFeedItem] = FeedsAPI.shared.fetch(.eventbrite,   city: cityVal, start: s, end: e, requireImage: false, imagesFirst: true)
                     events = (try await tm2 + eb2).map(ExternalEvent.init(from:))
                 }
 
-                events = ExternalFeedsClient.dedupeAndSortImageFirst(events)
-                await MainActor.run { completion(events) }
+                let final = ExternalFeedsClient.dedupeAndSortImageFirst(events)
+                DispatchQueue.main.async { completion(final) }
                 return
             } catch {
                 #if DEBUG
-                print("ℹ️ Direct CF path failed, falling back to Hosting proxy: \(error)")
+                print("ℹ️ Direct CF path failed, will try Hosting proxy: \(error)")
                 #endif
             }
 
             // --- Path B: Hosting proxy /api fallback ---
             let group = DispatchGroup()
             var all: [ExternalEvent] = []
+            let lock = NSLock()
 
             func qItems(requireImage: Bool) -> [URLQueryItem] {
-                return [
+                [
                     URLQueryItem(name: "city", value: cityVal),
                     URLQueryItem(name: "start", value: iso.string(from: s)),
                     URLQueryItem(name: "end",   value: iso.string(from: e)),
@@ -688,33 +801,52 @@ final class ExternalFeedsClient {
             func fetch(_ path: String, requireImage: Bool) {
                 group.enter()
                 ExternalHTTP.shared.fetchEvents(path: path, query: qItems(requireImage: requireImage)) { result in
-                    if case .success(let list) = result { all.append(contentsOf: list) }
+                    if case .success(let list) = result {
+                        lock.lock(); all.append(contentsOf: list); lock.unlock()
+                    }
                     group.leave()
                 }
             }
 
-            // First pass: image-only
+            // Pass 1: require images
             fetch("/feedTicketmaster", requireImage: true)
             fetch("/feedEventbrite",   requireImage: true)
 
-            group.notify(queue: .main) {
+            group.notify(queue: .global()) {
                 if all.isEmpty {
-                    // Retry once without the strict image gate
+                    // Pass 2: allow entries without images
                     let g2 = DispatchGroup()
                     var again: [ExternalEvent] = []
+                    let lock2 = NSLock()
+
                     func f2(_ path: String) {
                         g2.enter()
                         ExternalHTTP.shared.fetchEvents(path: path, query: qItems(requireImage: false)) { result in
-                            if case .success(let list) = result { again.append(contentsOf: list) }
+                            if case .success(let list) = result {
+                                lock2.lock(); again.append(contentsOf: list); lock2.unlock()
+                            }
                             g2.leave()
                         }
                     }
+
                     f2("/feedTicketmaster"); f2("/feedEventbrite")
+
                     g2.notify(queue: .main) {
-                        completion(ExternalFeedsClient.dedupeAndSortImageFirst(again))
+                        let merged = again
+                        if merged.isEmpty {
+                            // --- Path C: RTDB fallback
+                            fetchExternalEventsMergedFallback { mergedRTDB in
+                                let final = ExternalFeedsClient.dedupeAndSortImageFirst(mergedRTDB)
+                                completion(final)
+                            }
+                        } else {
+                            completion(ExternalFeedsClient.dedupeAndSortImageFirst(merged))
+                        }
                     }
                 } else {
-                    completion(ExternalFeedsClient.dedupeAndSortImageFirst(all))
+                    DispatchQueue.main.async {
+                        completion(ExternalFeedsClient.dedupeAndSortImageFirst(all))
+                    }
                 }
             }
         }
@@ -736,6 +868,54 @@ final class ExternalFeedsClient {
             return a.date < b.date
         }
     }
+}
+
+// MARK: - Client-side image enrichment (OpenGraph/Twitter) + cache
+
+final class OGImageCache {
+    static let shared = OGImageCache()
+    private var mem: [String: String] = [:]
+    private let lock = NSLock()
+
+    func get(_ url: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return mem[url]
+    }
+    func set(_ url: String, image: String) {
+        guard !image.isEmpty else { return }
+        lock.lock(); mem[url] = image; lock.unlock()
+    }
+}
+
+func fetchOGImageIfNeeded(for event: ExternalEvent, completion: @escaping (String?) -> Void) {
+    guard event.heroImage == nil,
+          let link = event.externalURL,
+          OGImageCache.shared.get(link) == nil,
+          let url = URL(string: link) else { completion(nil); return }
+
+    var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+    req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1", forHTTPHeaderField: "Accept")
+
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        guard let data = data, !data.isEmpty,
+              let html = String(data: data, encoding: .utf8) else { completion(nil); return }
+
+        func meta(_ name: String) -> String? {
+            let pattern = "<meta[^>]+(?:property|name)=[\"']\(name)[\"'][^>]+content=[\"']([^\"']+)[\"']"
+            guard let r = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+            guard let m = r.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)) else { return nil }
+            guard let gr = Range(m.range(at: 1), in: html) else { return nil }
+            return String(html[gr])
+        }
+
+        let found = meta("og:image") ?? meta("twitter:image") ?? meta("twitter:image:src")
+        if let img = found, img.lowercased().hasPrefix("http") {
+            OGImageCache.shared.set(link, image: img)
+            completion(img)
+        } else {
+            completion(nil)
+        }
+    }.resume()
 }
 
 // MARK: - Buy sheet
@@ -817,9 +997,11 @@ fileprivate struct ExternalSafariBridge: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
 }
 
-// MARK: - Single-column, big-banner explorer
+// MARK: - Flyer-first explorer (grid by default)
 
 public struct ExternalEventsExplorerView: View {
+    enum LayoutMode: String, CaseIterable, Identifiable { case flyers = "Flyers", list = "List"; var id: String { rawValue } }
+
     @State private var all: [ExternalEvent] = []
     @State private var filtered: [ExternalEvent] = []
     @State private var isLoading = true
@@ -827,7 +1009,8 @@ public struct ExternalEventsExplorerView: View {
     @State private var query = ""
     @State private var useDateFilter = false
     @State private var selectedDate = Date()
-    @State private var onlyWithPhotos = true   // ← default to photos-first
+    @State private var onlyWithPhotos = true   // default to photos-first
+    @State private var layout: LayoutMode = .flyers
 
     @State private var showSafari = false
     @State private var safariURL: URL?
@@ -839,11 +1022,18 @@ public struct ExternalEventsExplorerView: View {
             VStack(spacing: 12) {
                 // Filters
                 VStack(spacing: 8) {
-                    HStack {
+                    HStack(spacing: 10) {
                         TextField("Search city / venue / event", text: $query)
                             .textFieldStyle(.roundedBorder)
                             .onChange(of: query) { _ in applyFilters() }
+
+                        Picker("", selection: $layout) {
+                            ForEach(LayoutMode.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
                     }
+
                     HStack(spacing: 12) {
                         Toggle(isOn: $useDateFilter) { Label("Date", systemImage: "calendar") }
                             .toggleStyle(SwitchToggleStyle(tint: .accentColor))
@@ -878,18 +1068,39 @@ public struct ExternalEventsExplorerView: View {
                     .padding(.top, 24)
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 14) {
-                            ForEach(filtered, id: \.id) { e in
-                                EventBannerRow(e: e) {
-                                    if let u = e.externalURL, let url = URL(string: u) {
-                                        safariURL = url
-                                        showSafari = true
+                        if layout == .flyers {
+                            // 2-column flyer grid
+                            let cols = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+                            LazyVGrid(columns: cols, spacing: 10) {
+                                ForEach(filtered, id: \.id) { e in
+                                    FlyerTile(e: e) {
+                                        if let u = e.externalURL, let url = URL(string: u) {
+                                            safariURL = url
+                                            showSafari = true
+                                        }
                                     }
                                 }
-                                .padding(.horizontal)
                             }
+                            .padding(.horizontal)
+                            .padding(.top, 6)
+                            .padding(.bottom, 12)
+                        } else {
+                            // Compact list (thumb + text)
+                            LazyVStack(spacing: 12) {
+                                ForEach(filtered, id: \.id) { e in
+                                    ExternalEventSearchRow(e: e) {
+                                        if let u = e.externalURL, let url = URL(string: u) {
+                                            safariURL = url
+                                            showSafari = true
+                                        }
+                                    }
+                                    Divider().background(Color(.separator))
+                                }
+                            }
+                            .padding(.horizontal)
+                            .padding(.top, 8)
+                            .padding(.bottom, 12)
                         }
-                        .padding(.bottom, 12)
                     }
                 }
             }
@@ -904,7 +1115,7 @@ public struct ExternalEventsExplorerView: View {
     private func initialLoad() {
         isLoading = true
         ExternalFeedsClient.shared.load(
-            city: "New York", // default city; change or drive by location
+            city: "New York",
             start: Date(),
             end: Calendar.current.date(byAdding: .day, value: 30, to: Date())
         ) { list in
@@ -941,26 +1152,196 @@ public struct ExternalEventsExplorerView: View {
             out = out.filter { $0.date >= dayStart && $0.date < dayEnd }
         }
 
+        var filteredOut = out
         if onlyWithPhotos {
-            out = out.filter { !($0.heroImage?.isEmpty ?? true) }
+            filteredOut = out.filter { !($0.heroImage?.isEmpty ?? true) }
+            // Auto-relax if that killed everything but there *are* events
+            if filteredOut.isEmpty, !out.isEmpty {
+                onlyWithPhotos = false
+                filteredOut = out
+            }
         }
 
-        // Photos first, de-duped, then by date
-        filtered = ExternalFeedsClient.dedupeAndSortImageFirst(out)
+        filtered = ExternalFeedsClient.dedupeAndSortImageFirst(filteredOut)
     }
 }
 
-// MARK: - Full-width banner row
+// MARK: - Flyer tile (grid cell) with OG image enrichment & placeholder
+
+fileprivate struct FlyerTile: View {
+    let e: ExternalEvent
+    var onTap: () -> Void
+    @State private var resolvedImage: String?
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack(alignment: .bottomLeading) {
+                if let hero = resolvedImage ?? e.heroImage, let url = URL(string: hero) {
+                    AsyncImage(url: url, transaction: Transaction(animation: .easeInOut)) { phase in
+                        switch phase {
+                        case .empty:
+                            Color.gray.opacity(0.18).overlay(ProgressView())
+                        case .success(let image):
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .transition(.opacity)
+                        case .failure:
+                            placeholder
+                        @unknown default:
+                            placeholder
+                        }
+                    }
+                } else {
+                    placeholder
+                }
+
+                LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.65)], startPoint: .center, endPoint: .bottom)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(e.title)
+                        .font(.subheadline).bold()
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .shadow(radius: 2)
+
+                    Text(shortMeta)
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.9))
+                        .lineLimit(1)
+                }
+                .padding(10)
+            }
+            .frame(height: 210)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .onAppear {
+            guard resolvedImage == nil else { return }
+            fetchOGImageIfNeeded(for: e) { img in
+                if let img { DispatchQueue.main.async { resolvedImage = img } }
+            }
+        }
+    }
+
+    private var shortMeta: String {
+        let city = cityFromAddress(e.address) ?? ""
+        let when = e.date.formatted(date: .abbreviated, time: .shortened)
+        let venue = e.venueName.isEmpty ? "" : e.venueName
+        return [venue, city, when].filter { !$0.isEmpty }.joined(separator: " • ")
+    }
+
+    private var placeholder: some View {
+        LinearGradient(colors: [.gray.opacity(0.25), .gray.opacity(0.35)],
+                       startPoint: .top, endPoint: .bottom)
+            .overlay(
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "ticket")
+                        Text(e.source?.capitalized ?? "Event").bold()
+                    }
+                    .font(.caption2)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+
+                    Spacer(minLength: 0)
+
+                    Text(e.title).font(.headline).foregroundColor(.white).lineLimit(2)
+                    Text(shortMeta).font(.caption).foregroundColor(.white.opacity(0.9)).lineLimit(1)
+                }
+                .padding(10),
+                alignment: .bottomLeading
+            )
+    }
+
+    private func cityFromAddress(_ address: String?) -> String? {
+        guard let address = address, !address.isEmpty else { return nil }
+        let parts = address.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if parts.count >= 2 { return parts[parts.count - 2] }
+        return parts.last
+    }
+}
+
+// MARK: - Compact list row (thumb + text) with OG fallback
+
+fileprivate struct ExternalEventSearchRow: View {
+    let e: ExternalEvent
+    var onTap: () -> Void
+    @State private var resolvedImage: String?
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 12) {
+                ZStack {
+                    if let hero = resolvedImage ?? e.heroImage, let url = URL(string: hero) {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .empty: Color.gray.opacity(0.2).overlay(ProgressView())
+                            case .success(let image): image.resizable().scaledToFill()
+                            case .failure: thumbPlaceholder
+                            @unknown default: thumbPlaceholder
+                            }
+                        }
+                    } else {
+                        thumbPlaceholder
+                    }
+                }
+                .frame(width: 66, height: 66)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(e.title).font(.headline).lineLimit(2)
+                    Text("\(e.venueName)\(e.venueName.isEmpty ? "" : " • ")\(cityFromAddress(e.address) ?? "")")
+                        .font(.subheadline).foregroundColor(.secondary).lineLimit(1)
+                    HStack(spacing: 8) {
+                        Text(e.date.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption).foregroundColor(.secondary)
+                        if let p = e.price {
+                            Text(String(format: "$%.0f", p)).font(.caption).bold()
+                        }
+                        Spacer()
+                        if let s = e.source {
+                            Text(s.capitalized).font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+            }
+        }
+        .buttonStyle(.plain)
+        .onAppear {
+            guard resolvedImage == nil else { return }
+            fetchOGImageIfNeeded(for: e) { img in
+                if let img { DispatchQueue.main.async { resolvedImage = img } }
+            }
+        }
+    }
+
+    private var thumbPlaceholder: some View {
+        Color.gray.opacity(0.2)
+            .overlay(Image(systemName: "photo").foregroundColor(.white.opacity(0.7)))
+    }
+
+    private func cityFromAddress(_ address: String?) -> String? {
+        guard let address = address, !address.isEmpty else { return nil }
+        let parts = address.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if parts.count >= 2 { return parts[parts.count - 2] }
+        return parts.last
+    }
+}
+
+// MARK: - Full-width banner row (optional)
 
 fileprivate struct EventBannerRow: View {
     let e: ExternalEvent
     var onTap: () -> Void
+    @State private var resolvedImage: String?
 
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 8) {
                 ZStack(alignment: .bottomLeading) {
-                    if let img = e.heroImage, let url = URL(string: img) {
+                    if let hero = resolvedImage ?? e.heroImage, let url = URL(string: hero) {
                         AsyncImage(url: url, transaction: Transaction(animation: .easeInOut)) { phase in
                             switch phase {
                             case .empty:
@@ -1022,6 +1403,12 @@ fileprivate struct EventBannerRow: View {
             }
         }
         .buttonStyle(.plain)
+        .onAppear {
+            guard resolvedImage == nil else { return }
+            fetchOGImageIfNeeded(for: e) { img in
+                if let img { DispatchQueue.main.async { resolvedImage = img } }
+            }
+        }
     }
 
     private func cityFromAddress(_ address: String?) -> String? {

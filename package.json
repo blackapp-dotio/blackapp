@@ -1,4 +1,11 @@
 {
+  "engines": { "node": "20" },
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions"
+ 
   "dependencies": {
     "node-fetch": "^3.3.2"
   }

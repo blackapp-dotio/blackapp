@@ -5,6 +5,12 @@ const braintree = require("braintree");
 const corsMw = require("cors")({ origin: true });
 const functions = require("firebase-functions/v1"); // v1 API (region helper below)
 
+// ---------- NEW (for Gossip feed) ----------
+const RSSParser = require("rss-parser");
+const sharp = require("sharp");
+const { fetch: undiciFetch } = require("undici"); // used by imgThumb
+// -------------------------------------------
+
 // Prefer global fetch (Node 18+), else lazy import node-fetch
 const fetch =
   typeof globalThis.fetch === "function"
@@ -21,7 +27,8 @@ if (!admin.apps.length) {
 
 // --- Regioned functions instance ---
 const fn = functions.region("us-central1");
-const db = admin.database();
+const rtdb = admin.database();
+const firestore = admin.firestore();
 
 // ---------- Runtime config for external feeds ----------
 const cfg = (() => {
@@ -757,7 +764,7 @@ exports.submitNightlifeApplication = fn.https.onCall(async (data, context) => {
     submittedAt: admin.database.ServerValue.TIMESTAMP,
   };
 
-  await db.ref(`${node}/${uid}`).set(payload);
+  await rtdb.ref(`${node}/${uid}`).set(payload);
   return { ok: true };
 });
 
@@ -776,7 +783,7 @@ exports.listNightlifeApplications = fn.https.onCall(async (data) => {
     type === "venue"    ? "venueApplications"    :
                           "entertainerApplications";
 
-  const snap = await db
+  const snap = await rtdb
     .ref(node)
     .orderByChild("status")
     .equalTo(status)
@@ -805,19 +812,17 @@ exports.listNightlifeApplications = fn.https.onCall(async (data) => {
 
   return { items };
 });
+
 // APPROVE / REJECT / SUSPEND / REINSTATE (promoter | venue | entertainer)
-// v1 callable, pinned to us-central1
 exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
   const { HttpsError } = functions.https;
 
   try {
-    // ---- auth ----
     if (!context.auth) {
       throw new HttpsError("unauthenticated", "Login required");
     }
     const adminUid = context.auth.uid || null;
 
-    // ---- args ----
     const { type, uid, action, reason = null, venue = null } = data || {};
     const ALLOWED_TYPES = new Set(["promoter", "venue", "entertainer"]);
     const ALLOWED_ACTIONS = new Set(["approve", "reject", "suspend", "reinstate"]);
@@ -837,7 +842,7 @@ exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
       type === "venue"    ? "venueApplications"    :
                             "entertainerApplications";
 
-    const appRef = db.ref(`${appNode}/${uid}`);
+    const appRef = rtdb.ref(`${appNode}/${uid}`);
     const appSnap = await appRef.get();
     if (!appSnap.exists()) {
       throw new HttpsError("not-found", "Application not found");
@@ -845,7 +850,6 @@ exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
     const app = appSnap.val() || {};
     const now = admin.database.ServerValue.TIMESTAMP;
 
-    // helpers
     const updates = {};
     const set = (path, val) => { updates[path] = val; };
     const markReviewed = () => {
@@ -853,27 +857,23 @@ exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
       if (adminUid) set(`${appNode}/${uid}/reviewedBy`, adminUid);
     };
 
-    // ---------- REJECT ----------
     if (action === "reject") {
       set(`${appNode}/${uid}/status`, "rejected");
       set(`${appNode}/${uid}/approved`, false);
       set(`${appNode}/${uid}/suspended`, false);
       if (reason) set(`${appNode}/${uid}/reason`, String(reason));
       markReviewed();
-      await db.ref().update(updates);
+      await rtdb.ref().update(updates);
       return { ok: true, action, status: "rejected", type };
     }
 
-    // ---------- SUSPEND / REINSTATE ----------
     if (action === "suspend" || action === "reinstate") {
       const suspended = action === "suspend";
 
-      // mirror to application
       set(`${appNode}/${uid}/suspended`, suspended);
       set(`${appNode}/${uid}/moderatedAt`, now);
       if (adminUid) set(`${appNode}/${uid}/moderatedBy`, adminUid);
 
-      // mirror to role node(s)
       if (type === "promoter") {
         set(`promoters/${uid}/suspended`, suspended);
         set(`promoters/${uid}/moderatedAt`, now);
@@ -883,8 +883,7 @@ exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
         set(`entertainers/${uid}/moderatedAt`, now);
         if (adminUid) set(`entertainers/${uid}/moderatedBy`, adminUid);
       } else {
-        // venue: use owner index to find venueId (safe if missing)
-        const ownerSnap = await db.ref(`venueOwners/${uid}`).get();
+        const ownerSnap = await rtdb.ref(`venueOwners/${uid}`).get();
         const owner = ownerSnap.exists() ? ownerSnap.val() || {} : {};
         const venueId = owner.venueId || null;
 
@@ -899,61 +898,51 @@ exports.reviewNightlifeApplication = fn.https.onCall(async (data, context) => {
         }
       }
 
-      await db.ref().update(updates);
+      await rtdb.ref().update(updates);
       return { ok: true, action, suspended, type };
     }
 
-    // ---------- APPROVE ----------
+    // ---------- APPROVE (promoter / entertainer / venue) ----------
     set(`${appNode}/${uid}/status`, "approved");
     set(`${appNode}/${uid}/approved`, true);
     set(`${appNode}/${uid}/suspended`, false);
+    set(`${appNode}/${uid}/approvedAt`, now);
     markReviewed();
 
     if (type === "promoter") {
       set(`promoters/${uid}/approved`, true);
       set(`promoters/${uid}/suspended`, false);
       set(`promoters/${uid}/createdAt`, now);
-      await db.ref().update(updates);
+      await rtdb.ref().update(updates);
       return { ok: true, action: "approve", status: "approved", type };
     }
 
-    // ---------- APPROVE ----------
-set(`${appNode}/${uid}/status`, "approved");
-set(`${appNode}/${uid}/approved`, true);
-set(`${appNode}/${uid}/suspended`, false);
-markReviewed();
-set(`${appNode}/${uid}/approvedAt`, now); // <-- add approvedAt like venue/promoter
+    if (type === "entertainer") {
+      const stageName =
+        (app.stageName && String(app.stageName).trim()) ||
+        (app.businessName && String(app.businessName).trim()) || "";
 
-if (type === "entertainer") {
-  const stageName =
-    (app.stageName && String(app.stageName).trim()) ||
-    (app.businessName && String(app.businessName).trim()) || "";
+      set(`entertainers/${uid}/approved`, true);
+      set(`entertainers/${uid}/approvedAt`, now);
+      set(`entertainers/${uid}/suspended`, false);
+      set(`entertainers/${uid}/createdAt`, now);
 
-  // Create/overwrite entertainers/{uid} to match your other role nodes
-  set(`entertainers/${uid}/approved`, true);
-  set(`entertainers/${uid}/approvedAt`, now);
-  set(`entertainers/${uid}/suspended`, false);
-  set(`entertainers/${uid}/createdAt`, now);
+      set(`entertainers/${uid}/uid`, uid);
+      set(`entertainers/${uid}/sourceApplication`, "entertainerApplications");
 
-  // Keep parity with what you store for venues/promoters
-  set(`entertainers/${uid}/uid`, uid);
-  set(`entertainers/${uid}/sourceApplication`, "entertainerApplications");
+      if (app.fullName)      set(`entertainers/${uid}/fullName`, app.fullName);
+      if (stageName)         set(`entertainers/${uid}/stageName`, stageName);
+      if (app.businessName)  set(`entertainers/${uid}/businessName`, app.businessName);
+      if (app.email)         set(`entertainers/${uid}/email`, app.email);
+      if (app.phone)         set(`entertainers/${uid}/phone`, app.phone);
+      if (app.instagram)     set(`entertainers/${uid}/instagram`, app.instagram);
+      if (app.tiktok)        set(`entertainers/${uid}/tiktok`, app.tiktok);
+      if (app.website)       set(`entertainers/${uid}/website`, app.website);
+      if (app.description)   set(`entertainers/${uid}/description`, app.description);
 
-  // Copy key profile fields so the portal can render without chasing the app node
-  if (app.fullName)      set(`entertainers/${uid}/fullName`, app.fullName);
-  if (stageName)         set(`entertainers/${uid}/stageName`, stageName);
-  if (app.businessName)  set(`entertainers/${uid}/businessName`, app.businessName);
-  if (app.email)         set(`entertainers/${uid}/email`, app.email);
-  if (app.phone)         set(`entertainers/${uid}/phone`, app.phone);
-  if (app.instagram)     set(`entertainers/${uid}/instagram`, app.instagram);
-  if (app.tiktok)        set(`entertainers/${uid}/tiktok`, app.tiktok);
-  if (app.website)       set(`entertainers/${uid}/website`, app.website);
-  if (app.description)   set(`entertainers/${uid}/description`, app.description);
-
-  await db.ref().update(updates);
-  return { ok: true, action: "approve", status: "approved", type };
-}
-
+      await rtdb.ref().update(updates);
+      return { ok: true, action: "approve", status: "approved", type };
+    }
 
     // venue approval
     let venueId =
@@ -962,7 +951,7 @@ if (type === "entertainer") {
         : "";
 
     if (!venueId) {
-      const newRef = db.ref("venues").push();
+      const newRef = rtdb.ref("venues").push();
       venueId = newRef.key;
       await newRef.set({
         name: (venue && venue.name) || app.businessName || "",
@@ -975,7 +964,7 @@ if (type === "entertainer") {
       const vUpdates = { approved: true, suspended: false };
       if (venue?.name && venue.name.trim()) vUpdates.name = venue.name.trim();
       if (venue?.address && venue.address.trim()) vUpdates.address = venue.address.trim();
-      await db.ref(`venues/${venueId}`).update(vUpdates);
+      await rtdb.ref(`venues/${venueId}`).update(vUpdates);
     }
 
     set(`venueAdmins/${venueId}/${uid}`, true);
@@ -985,15 +974,13 @@ if (type === "entertainer") {
     set(`venueOwners/${uid}/linkedAt`, now);
     set(`${appNode}/${uid}/venueId`, venueId);
 
-    await db.ref().update(updates);
+    await rtdb.ref().update(updates);
     return { ok: true, action: "approve", status: "approved", type, venueId };
   } catch (e) {
     console.error("reviewNightlifeApplication error:", e);
 
-    // If it was already an HttpsError (e.g., invalid-argument), keep it.
     if (e instanceof functions.https.HttpsError) throw e;
 
-    // Otherwise surface real info to the client (iOS will log this under FunctionsErrorDetailsKey).
     throw new functions.https.HttpsError(
       "internal",
       "reviewNightlifeApplication failed",
@@ -1065,13 +1052,10 @@ const FEED = {
     const x = Number(n);
     return Number.isFinite(x) ? x : null;
   },
-  // Force JSON array; add robust headers for iOS/HTTP3
   sendArray(res, arr, status = 200, extraHeaders = {}) {
     const payload = Array.isArray(arr) ? arr : [];
     const buf = Buffer.from(JSON.stringify(payload));
     res.status(status);
-
-    // CORS + transport hardening (avoid HTTP/3/QUIC flakiness)
     res.set({
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -1080,18 +1064,16 @@ const FEED = {
       "Cache-Control": "private, max-age=60, no-transform",
       "X-Content-Type-Options": "nosniff",
       "Cross-Origin-Resource-Policy": "cross-origin",
-      "Alt-Svc": "clear", // do not upgrade to h3 on iOS
+      "Alt-Svc": "clear",
       "Connection": "close",
       "Content-Length": String(buf.length),
       ...extraHeaders,
     });
-
     res.end(buf);
   },
   withCors(handler) {
     return async (req, res) => {
       try {
-        // Preflight
         res.set("Access-Control-Allow-Origin", "*");
         res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
         res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -1106,7 +1088,6 @@ const FEED = {
   },
 };
 
-// Read config at runtime (avoid init-time throws)
 function getTmKey() {
   try {
     return (
@@ -1137,54 +1118,123 @@ exports.ping = fn.https.onRequest(
   )
 );
 
-// Ticketmaster Discovery feed (direct endpoint)
+// --- Drop-in upgrade: stronger hero picker (place near your other FEED helpers) ---
+FEED.pickHero = function pickHero(images) {
+  if (!Array.isArray(images)) return null;
+
+  // Normalize and enforce https
+  const norm = images
+    .map(img => ({
+      url: typeof img.url === "string" ? img.url.replace(/^http:/i, "https:") : null,
+      width: Number(img.width || 0),
+      height: Number(img.height || 0),
+      ratio: (img.ratio || "").toLowerCase(),
+    }))
+    .filter(i => !!i.url);
+
+  if (!norm.length) return null;
+
+  // Prefer cinematic/wide flyers (16:9/3:2) at sufficient size
+  const preferred = norm
+    .filter(i =>
+      (i.ratio === "16_9" || i.ratio === "3_2" ||
+        Math.abs(i.width / (i.height || 1) - 16 / 9) < 0.08) &&
+      i.width >= 1000
+    )
+    .sort((a, b) => b.width - a.width);
+  if (preferred.length) return preferred[0].url;
+
+  // Fallback: largest image available
+  const largest = norm.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+  return largest[0]?.url || null;
+};
+
+
+// --- Ticketmaster Discovery feed (updated with robust JSON-only responses + detailed logs) ---
 exports.feedTicketmaster = fn.https.onRequest(
   FEED.withCors(async (req, res) => {
     const TM_KEY = getTmKey();
-    const debug = req.query?.debug === "1";
-    let _debug = [];
-
-    if (!TM_KEY) {
-      console.warn("TM_API_KEY missing → returning empty array");
-      return FEED.sendArray(res, debug ? [{ _debug: [{ error: "TM key missing" }] }] : []);
-    }
+    const debug = String(req.query?.debug || "0") === "1";
+    const rid = Math.random().toString(36).slice(2, 8);
+    const _debug = [];
 
     const city = (req.query.city || "").toString().trim();
     const startRaw = (req.query.start || "").toString().trim();
     const endRaw = (req.query.end || "").toString().trim();
     const { start, end } = FEED.clampWindow(startRaw, endRaw);
 
-    const u = new URL("https://app.ticketmaster.com/discovery/v2/events.json");
-    u.searchParams.set("apikey", TM_KEY);
-    u.searchParams.set("size", "50");
-    u.searchParams.set("sort", "date,asc");
-    u.searchParams.set("countryCode", "US");
-    u.searchParams.set("classificationName", "Music");
-    if (city) u.searchParams.set("city", city);
-    u.searchParams.set("startDateTime", FEED.zISO(start));
-    u.searchParams.set("endDateTime", FEED.zISO(end));
+    console.log(`🎫 [TM][${rid}] ↩︎ query`, {
+      city,
+      start: FEED.zISO(start),
+      end: FEED.zISO(end),
+      requireImage: req.query?.requireImage,
+      imagesFirst: req.query?.imagesFirst,
+      debug,
+    });
+
+    if (!TM_KEY) {
+      console.warn(`🎫 [TM][${rid}] TM_API_KEY missing → returning []`);
+      return FEED.sendArray(res, debug ? [{ _debug: [{ error: "TM key missing" }] }] : []);
+    }
+
+    const url = new URL("https://app.ticketmaster.com/discovery/v2/events.json");
+    url.searchParams.set("apikey", TM_KEY);
+    url.searchParams.set("size", "50");
+    url.searchParams.set("sort", "date,asc");
+    url.searchParams.set("countryCode", "US");
+    url.searchParams.set("classificationName", "Music");
+    if (city) url.searchParams.set("city", city);
+    url.searchParams.set("startDateTime", FEED.zISO(start));
+    url.searchParams.set("endDateTime", FEED.zISO(end));
+
+    console.log(`🎫 [TM][${rid}] → ${url.toString()}`);
 
     let items = [];
     try {
-      const resp = await _fetch(u.toString(), { method: "GET" });
+      const resp = await _fetch(url.toString(), { method: "GET" });
+      const ct = resp.headers.get("content-type") || "";
+      const clen = resp.headers.get("content-length") || "";
+      console.log(`🎫 [TM][${rid}] HTTP ${resp.status} ct=${ct} len=${clen}`);
+
       if (!resp.ok) {
         const t = await resp.text().catch(() => "");
-        console.warn("TM non-200:", resp.status, t.slice(0, 200));
-        if (debug) _debug.push({ status: resp.status, body: t.slice(0, 400) });
+        console.warn(`🎫 [TM][${rid}] non-200 body preview:`, t.slice(0, 200));
+        if (debug) _debug.push({ status: resp.status, ct, preview: t.slice(0, 400) });
         return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
       }
-      const data = await resp.json().catch((e) => {
-        if (debug) _debug.push({ parseError: String(e) });
-        return null;
-      });
+
+      // If upstream sent HTML or something unexpected, guard parse
+      if (!/json/i.test(ct)) {
+        const t = await resp.text().catch(() => "");
+        console.warn(`🎫 [TM][${rid}] unexpected content-type; preview:`, t.slice(0, 200));
+        if (debug) _debug.push({ status: resp.status, ct, preview: t.slice(0, 400) });
+        return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
+      }
+
+      let data;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        const t = await _fetch(url.toString(), { method: "GET" })
+          .then(r => r.text().catch(() => ""))
+          .catch(() => "");
+        console.error(`🎫 [TM][${rid}] JSON parse error`, e);
+        if (debug) _debug.push({ parseError: String(e), fallbackPreview: t.slice(0, 400) });
+        return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
+      }
+
       const list = data?._embedded?.events ?? [];
+      console.log(`🎫 [TM][${rid}] events=${list.length}`);
 
       items = list.map((ev) => {
         const venue = ev?._embedded?.venues?.[0] || {};
+
         const hero =
           FEED.pickHero(ev?.images) ||
           FEED.pickHero(ev?._embedded?.attractions?.[0]?.images) ||
-          (ev?.seatmap?.staticUrl || null);
+          (typeof ev?.seatmap?.staticUrl === "string"
+            ? ev.seatmap.staticUrl.replace(/^http:/i, "https:")
+            : null);
 
         const when =
           ev?.dates?.start?.dateTime ||
@@ -1192,7 +1242,7 @@ exports.feedTicketmaster = fn.https.onRequest(
             ? `${ev.dates.start.localDate}T${ev.dates.start.localTime || "00:00:00"}Z`
             : new Date());
 
-        return {
+        const item = {
           id: String(ev?.id || ev?.url || ev?.name || Math.random()),
           title: String(ev?.name || "Event"),
           venueName: String(venue?.name || ""),
@@ -1208,11 +1258,15 @@ exports.feedTicketmaster = fn.https.onRequest(
           source: "ticketmaster",
           heroImage: hero || null,
         };
+        item.imageURL = item.heroImage; // backward compat
+        return item;
       });
     } catch (e) {
-      console.error("TM fetch/parse error:", e);
+      console.error(`🎫 [TM][${rid}] fetch error`, e);
       if (debug) _debug.push({ error: String(e) });
     }
+
+    const before = items.length;
 
     const requireImage = (req.query?.requireImage ?? "0") === "1";
     if (requireImage) items = items.filter((x) => !!x.heroImage);
@@ -1229,55 +1283,92 @@ exports.feedTicketmaster = fn.https.onRequest(
       items.sort((a, b) => new Date(a.date) - new Date(b.date));
     }
 
+    console.log(`🎫 [TM][${rid}] out=${items.length} (filtered from ${before})`);
     return FEED.sendArray(res, debug ? [{ _debug }, ...items] : items);
   })
 );
 
-// Eventbrite Search feed (direct endpoint)
+// --- Eventbrite Search feed (updated with robust JSON-only responses + detailed logs) ---
 exports.feedEventbrite = fn.https.onRequest(
   FEED.withCors(async (req, res) => {
     const EB_TOKEN = getEbToken();
-    const debug = req.query?.debug === "1";
-    let _debug = [];
-
-    if (!EB_TOKEN) {
-      console.warn("EVENTBRITE_TOKEN missing → returning empty array");
-      return FEED.sendArray(
-        res,
-        debug ? [{ _debug: [{ error: "Eventbrite token missing" }] }] : []
-      );
-    }
+    const debug = String(req.query?.debug || "0") === "1";
+    const rid = Math.random().toString(36).slice(2, 8);
+    const _debug = [];
 
     const city = (req.query.city || "").toString().trim();
     const startRaw = (req.query.start || "").toString().trim();
     const endRaw = (req.query.end || "").toString().trim();
     const { start, end } = FEED.clampWindow(startRaw, endRaw);
 
-    const u = new URL("https://www.eventbriteapi.com/v3/events/search/");
-    u.searchParams.set("sort_by", "date");
-    u.searchParams.set("expand", "venue,logo,organizer");
-    u.searchParams.set("page_size", "50");
-    u.searchParams.set("start_date.range_start", FEED.zISO(start));
-    u.searchParams.set("start_date.range_end", FEED.zISO(end));
-    if (city) u.searchParams.set("location.address", city);
+    console.log(`🟠 [EB][${rid}] ↩︎ query`, {
+      city,
+      start: FEED.zISO(start),
+      end: FEED.zISO(end),
+      requireImage: req.query?.requireImage,
+      imagesFirst: req.query?.imagesFirst,
+      debug,
+    });
+
+    if (!EB_TOKEN) {
+      console.warn(`🟠 [EB][${rid}] EVENTBRITE_TOKEN missing → returning []`);
+      return FEED.sendArray(
+        res,
+        debug ? [{ _debug: [{ error: "Eventbrite token missing" }] }] : []
+      );
+    }
+
+    const url = new URL("https://www.eventbriteapi.com/v3/events/search/");
+    url.searchParams.set("sort_by", "date");
+    url.searchParams.set("expand", "venue,logo,organizer");
+    url.searchParams.set("page_size", "50");
+    url.searchParams.set("start_date.range_start", FEED.zISO(start));
+    url.searchParams.set("start_date.range_end", FEED.zISO(end));
+    if (city) url.searchParams.set("location.address", city);
+
+    console.log(`🟠 [EB][${rid}] → ${url.toString()}`);
 
     let items = [];
     try {
-      const resp = await _fetch(u.toString(), {
+      const resp = await _fetch(url.toString(), {
         method: "GET",
         headers: { Authorization: `Bearer ${EB_TOKEN}` },
       });
+      const ct = resp.headers.get("content-type") || "";
+      const clen = resp.headers.get("content-length") || "";
+      console.log(`🟠 [EB][${rid}] HTTP ${resp.status} ct=${ct} len=${clen}`);
+
       if (!resp.ok) {
         const t = await resp.text().catch(() => "");
-        console.warn("EB non-200:", resp.status, t.slice(0, 200));
-        if (debug) _debug.push({ status: resp.status, body: t.slice(0, 400) });
+        console.warn(`🟠 [EB][${rid}] non-200 body preview:`, t.slice(0, 200));
+        if (debug) _debug.push({ status: resp.status, ct, preview: t.slice(0, 400) });
         return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
       }
-      const data = await resp.json().catch((e) => {
-        if (debug) _debug.push({ parseError: String(e) });
-        return null;
-      });
+
+      if (!/json/i.test(ct)) {
+        const t = await resp.text().catch(() => "");
+        console.warn(`🟠 [EB][${rid}] unexpected content-type; preview:`, t.slice(0, 200));
+        if (debug) _debug.push({ status: resp.status, ct, preview: t.slice(0, 400) });
+        return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
+      }
+
+      let data;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        const t = await _fetch(url.toString(), {
+          method: "GET",
+          headers: { Authorization: `Bearer ${EB_TOKEN}` },
+        })
+          .then(r => r.text().catch(() => ""))
+          .catch(() => "");
+        console.error(`🟠 [EB][${rid}] JSON parse error`, e);
+        if (debug) _debug.push({ parseError: String(e), fallbackPreview: t.slice(0, 400) });
+        return FEED.sendArray(res, debug ? [{ _debug }, ...[]] : []);
+      }
+
       const list = Array.isArray(data?.events) ? data.events : [];
+      console.log(`🟠 [EB][${rid}] events=${list.length}`);
 
       items = list.map((ev) => {
         const v = ev?.venue || {};
@@ -1307,9 +1398,11 @@ exports.feedEventbrite = fn.https.onRequest(
         };
       });
     } catch (e) {
-      console.error("EB fetch/parse error:", e);
+      console.error(`🟠 [EB][${rid}] fetch error`, e);
       if (debug) _debug.push({ error: String(e) });
     }
+
+    const before = items.length;
 
     const requireImage = (req.query?.requireImage ?? "0") === "1";
     if (requireImage) items = items.filter((x) => !!x.heroImage);
@@ -1326,12 +1419,13 @@ exports.feedEventbrite = fn.https.onRequest(
       items.sort((a, b) => new Date(a.date) - new Date(b.date));
     }
 
+    console.log(`🟠 [EB][${rid}] out=${items.length} (filtered from ${before})`);
     return FEED.sendArray(res, debug ? [{ _debug }, ...items] : items);
   })
 );
 
 // =========================
-/* Optional dynamic modules (unchanged) */
+// OPTIONAL dynamic modules (unchanged)
 // =========================
 try {
   const nightlife = require("./nightlife")(fn, admin);
@@ -1354,21 +1448,13 @@ try {
 }
 
 //--------------
-//ACCEPTINVITES
+// ACCEPT INVITES (callable)
 //--------------
-
-
-/**
- * acceptInvite (Callable, v1)
- * data: { inviterId: string, inviteeId: string }
- * auth: required; inviterId must equal context.auth.uid
- */
 exports.acceptInvite = functions.https.onCall(async (data, context) => {
   const auth = context.auth;
   const inviterId = data && data.inviterId;
   const inviteeId = data && data.inviteeId;
 
-  // ---- Validation ----
   if (!auth || !auth.uid) {
     throw new functions.https.HttpsError('unauthenticated', 'You must be signed in to accept an invite.');
   }
@@ -1382,11 +1468,10 @@ exports.acceptInvite = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError('failed-precondition', 'Self-invites are not allowed.');
   }
 
-  const acceptRef = db.ref(`invitesAccepted/${inviteeId}`);
+  const acceptRef = rtdb.ref(`invitesAccepted/${inviteeId}`);
 
-  // ---- Step 1: Idempotent accept via transaction ----
   const acceptTxn = await acceptRef.transaction((current) => {
-    if (current) return; // already accepted -> abort write
+    if (current) return;
     return {
       inviterId,
       inviteeId,
@@ -1396,7 +1481,6 @@ exports.acceptInvite = functions.https.onCall(async (data, context) => {
   }, { applyLocally: false });
 
   if (!acceptTxn.committed) {
-    // Another process already accepted — return current state
     const [circleSize, badgeTier] = await Promise.all([
       getCircleSize(inviterId),
       getBadgeTier(inviterId),
@@ -1409,15 +1493,13 @@ exports.acceptInvite = functions.https.onCall(async (data, context) => {
     };
   }
 
-  // ---- Step 2: Increment inviter's circleSize atomically ----
-  const circleRef = db.ref(`users/${inviterId}/circleSize`);
+  const circleRef = rtdb.ref(`users/${inviterId}/circleSize`);
   const circleTxn = await circleRef.transaction(
     (val) => (typeof val === 'number' ? val + 1 : 1),
     { applyLocally: false }
   );
   const circleSize = circleTxn.snapshot.val() || 1;
 
-  // ---- Step 3: Compute badge tier (white baseline, then rainbow → black) ----
   const tiers = [
     { name: 'white',  threshold: 0 },
     { name: 'red',    threshold: 5 },
@@ -1434,13 +1516,12 @@ exports.acceptInvite = functions.https.onCall(async (data, context) => {
     if (circleSize >= tiers[i].threshold) { badge = tiers[i].name; break; }
   }
 
-  // ---- Step 4: Contacts (both directions) + badge (multi-path update) ----
   const updates = {};
   updates[`users/${inviterId}/badgeTier`] = badge;
   updates[`contacts/${inviterId}/${inviteeId}`] = true;
   updates[`contacts/${inviteeId}/${inviterId}`] = true;
 
-  await db.ref().update(updates);
+  await rtdb.ref().update(updates);
 
   return {
     status: 'accepted',
@@ -1449,51 +1530,41 @@ exports.acceptInvite = functions.https.onCall(async (data, context) => {
   };
 });
 
-// ------- Helpers (v1) -------
 async function getCircleSize(uid) {
-  const snap = await db.ref(`users/${uid}/circleSize`).get();
+  const snap = await rtdb.ref(`users/${uid}/circleSize`).get();
   return snap.exists() ? snap.val() : 0;
 }
 async function getBadgeTier(uid) {
-  const snap = await db.ref(`users/${uid}/badgeTier`).get();
+  const snap = await rtdb.ref(`users/${uid}/badgeTier`).get();
   return snap.exists() ? snap.val() : 'white';
 }
 
-/**
- * OPTIONAL: seed defaults on-demand if your signup flow doesn’t do it.
- * Call from client once after sign-in.
- */
- exports.ensureUserDefaults = functions.https.onCall(async (_, context) => {
-   if (!context.auth || !context.auth.uid) {
-     throw new functions.https.HttpsError('unauthenticated', 'Sign in required.');
-   }
-   const uid = context.auth.uid;
-   const ref = db.ref(`users/${uid}`);
-   const snap = await ref.get();
-   if (!snap.exists()) {
-     await ref.set({ circleSize: 0, badgeTier: 'white' });
-     return { created: true, circleSize: 0, badgeTier: 'white' };
-   }
-   const val = snap.val() || {};
-   const updates = {};
-   if (typeof val.circleSize !== 'number') updates.circleSize = 0;
-   if (typeof val.badgeTier !== 'string') updates.badgeTier = 'white';
-   if (Object.keys(updates).length) await ref.update(updates);
-   return { created: false, ...val, ...updates };
- });
-
+// Seed defaults if signup flow didn’t
+exports.ensureUserDefaults = functions.https.onCall(async (_, context) => {
+  if (!context.auth || !context.auth.uid) {
+    throw new functions.https.HttpsError('unauthenticated', 'Sign in required.');
+  }
+  const uid = context.auth.uid;
+  const ref = rtdb.ref(`users/${uid}`);
+  const snap = await ref.get();
+  if (!snap.exists()) {
+    await ref.set({ circleSize: 0, badgeTier: 'white' });
+    return { created: true, circleSize: 0, badgeTier: 'white' };
+  }
+  const val = snap.val() || {};
+  const updates = {};
+  if (typeof val.circleSize !== 'number') updates.circleSize = 0;
+  if (typeof val.badgeTier !== 'string') updates.badgeTier = 'white';
+  if (Object.keys(updates).length) await ref.update(updates);
+  return { created: false, ...val, ...updates };
+});
 
 const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
-
-const REGION = 'us-central1'; // change if you deploy elsewhere
-
-// ---------- helpers ----------
+const REGION = 'us-central1';
 const chatId = (a, b) => [a, b].sort().join('_');
 
-// human-friendly short codes: BA-7GQ4N9 (no 0/1/O/I)
 const CODE_PREFIX = 'BA-';
 const CODE_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-
 function makeCode(len = 7) {
   let s = CODE_PREFIX;
   for (let i = 0; i < len; i++) {
@@ -1501,11 +1572,10 @@ function makeCode(len = 7) {
   }
   return s;
 }
-
 async function generateUniqueCode() {
   for (let i = 0; i < 8; i++) {
     const code = makeCode();
-    const ref = db.collection('inviteCodes').doc(code);
+    const ref = firestore.collection('inviteCodes').doc(code);
     const snap = await ref.get();
     if (!snap.exists) return code;
   }
@@ -1513,14 +1583,14 @@ async function generateUniqueCode() {
 }
 
 async function ensureMutualContacts(aUid, bUid, status, source) {
-  const aRef = db.collection('users').doc(aUid).collection('contacts').doc(bUid);
-  const bRef = db.collection('users').doc(bUid).collection('contacts').doc(aUid);
-  const dcRef = db.collection('directChats').doc(chatId(aUid, bUid));
+  const aRef = firestore.collection('users').doc(aUid).collection('contacts').doc(bUid);
+  const bRef = firestore.collection('users').doc(bUid).collection('contacts').doc(aUid);
+  const dcRef = firestore.collection('directChats').doc(chatId(aUid, bUid));
 
   const [aSnap, bSnap, dcSnap] = await Promise.all([aRef.get(), bRef.get(), dcRef.get()]);
   const active = status === 'active';
 
-  const batch = db.batch();
+  const batch = firestore.batch();
 
   const up = (ref, cur) => {
     const curStatus = cur?.status;
@@ -1559,28 +1629,26 @@ async function ensureMutualContacts(aUid, bUid, status, source) {
   await batch.commit();
 }
 
-// ---------- TRIGGERS ----------
-
-// 1) Assign short invite code to NEW users (if missing)
+// Assign short invite code to NEW users
 exports.onUserCreated = functions
   .region(REGION)
   .firestore.document('users/{uid}')
   .onCreate(async (snap, ctx) => {
     const uid = ctx.params.uid;
     const data = snap.data() || {};
-    if (data.inviteCode) return; // already has one (idempotent)
+    if (data.inviteCode) return;
 
     const code = await generateUniqueCode();
     await Promise.all([
       snap.ref.set({ inviteCode: code }, { merge: true }),
-      db.collection('inviteCodes').doc(code).set({
+      firestore.collection('inviteCodes').doc(code).set({
         uid,
         createdAt: serverTimestamp(),
       }),
     ]);
   });
 
-// 2) When user doc gets a `referrer`, link both sides + active DM (once)
+// When user doc gets a referrer, link both sides + active DM
 exports.onUserReferrerSet = functions
   .region(REGION)
   .firestore.document('users/{uid}')
@@ -1596,15 +1664,14 @@ exports.onUserReferrerSet = functions
     const processed = after.referralProcessed === true;
 
     if (!referrer || processed) return;
-    if (referrer === uid) return; // ignore self
-    if (prevRef === referrer) return; // no change
+    if (referrer === uid) return;
+    if (prevRef === referrer) return;
 
     await ensureMutualContacts(referrer, uid, 'active', 'invite');
-
     await change.after.ref.set({ referralProcessed: true }, { merge: true });
   });
 
-// 3) If either side activates a pending contact, mirror & clear chat.pending
+// If either side activates a pending contact, mirror & clear chat.pending
 exports.onContactActivated = functions
   .region(REGION)
   .firestore.document('users/{uid}/contacts/{otherUid}')
@@ -1619,12 +1686,12 @@ exports.onContactActivated = functions
     const isActive = after.status === 'active' && after.accepted === true;
     if (!isActive || wasActive) return;
 
-    const mirrorRef = db.collection('users').doc(other).collection('contacts').doc(uid);
-    const dcRef = db.collection('directChats').doc(chatId(uid, other));
+    const mirrorRef = firestore.collection('users').doc(other).collection('contacts').doc(uid);
+    const dcRef = firestore.collection('directChats').doc(chatId(uid, other));
 
     const [mirrorSnap, dcSnap] = await Promise.all([mirrorRef.get(), dcRef.get()]);
 
-    const batch = db.batch();
+    const batch = firestore.batch();
 
     const mirrorIsActive =
       mirrorSnap.exists &&
@@ -1651,9 +1718,7 @@ exports.onContactActivated = functions
     await batch.commit();
   });
 
-// ---------- ONE-TIME BACKFILL ENDPOINT ----------
-// Assign inviteCode to existing users (and ensure mapping), paginated.
-// Protect with an admin key: `firebase functions:config:set backfill.key="YOUR_SECRET"`
+// ---------- ONE-TIME backfill invite codes ----------
 exports.backfillInviteCodes = functions
   .region(REGION)
   .https.onRequest(async (req, res) => {
@@ -1670,11 +1735,10 @@ exports.backfillInviteCodes = functions
         return;
       }
 
-      // pagination
       const limit = Math.min(parseInt(String(req.query.limit || '200'), 10), 500);
       const after = req.query.after ? String(req.query.after) : undefined;
 
-      let q = db.collection('users').orderBy(admin.firestore.FieldPath.documentId()).limit(limit);
+      let q = firestore.collection('users').orderBy(admin.firestore.FieldPath.documentId()).limit(limit);
       if (after) q = q.startAfter(after);
 
       const snap = await q.get();
@@ -1687,7 +1751,7 @@ exports.backfillInviteCodes = functions
       let assigned = 0;
       let fixedMappings = 0;
 
-      const batch = db.batch();
+      const batch = firestore.batch();
 
       for (const doc of snap.docs) {
         processed++;
@@ -1698,10 +1762,10 @@ exports.backfillInviteCodes = functions
         if (!existingCode) {
           const code = await generateUniqueCode();
           batch.set(doc.ref, { inviteCode: code }, { merge: true });
-          batch.set(db.collection('inviteCodes').doc(code), { uid, createdAt: serverTimestamp() });
+          batch.set(firestore.collection('inviteCodes').doc(code), { uid, createdAt: serverTimestamp() });
           assigned++;
         } else {
-          const mapRef = db.collection('inviteCodes').doc(existingCode);
+          const mapRef = firestore.collection('inviteCodes').doc(existingCode);
           const mapSnap = await mapRef.get();
           if (!mapSnap.exists) {
             batch.set(mapRef, { uid, createdAt: serverTimestamp() }, { merge: true });
@@ -1720,664 +1784,168 @@ exports.backfillInviteCodes = functions
     }
   });
 
-// ===== Backfill invite codes for existing users (safe to append) =====
-/*  Usage (after setting config key and deploying):
-      ADMIN_KEY="YOUR_SUPER_SECRET"
-      BASE="https://us-central1-<PROJECT_ID>.cloudfunctions.net/backfillInviteCodes"
-      curl -sS -X POST "$BASE?limit=300" -H "x-admin-key: $ADMIN_KEY"
-*/
+/* ================================
+   NEW: Twitter/X-style RSS pipeline
+   - rssBundle: pre-normalize feed items with thumb + aspect
+   - imgThumb: image resize proxy with sharp
+   ================================ */
 
-// If these paths differ in your project, adjust:
-var USERS_COLL = 'users';
-var INVITE_CODES_COLL = 'inviteCodes';
+// Helpers for rssBundle
+const parser = new RSSParser({
+  timeout: 15000,
+  requestOptions: {
+    headers: {
+      "User-Agent": "BlackApp/1.0 (+https://blackapp.io)",
+      "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9,*/*;q=0.8",
+    },
+  },
+});
+const looksLikeLogo = (u = "") => {
+  const s = String(u).toLowerCase();
+  return (
+    /\.(svg|gif|ico)(\?|#|$)/.test(s) ||
+    /(logo|icon|avatar|placeholder|default|badge|sprite|favicon|brand|masthead)/.test(s)
+  );
+};
+const findImgInHtml = (html = "") => {
+  const m = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
+  return m && m[1] ? m[1] : "";
+};
+const safeHttps = (u = "") => (u.startsWith("http://") ? "https://" + u.slice(7) : u);
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n || 0));
 
-// Local Firestore handle so we don't clash with any existing RTDB `db` var
-function _fs() { return require('firebase-admin').firestore(); }
+exports.imgThumb = fn.https.onRequest(async (req, res) => {
+  try {
+    const url = String(req.query.url || "");
+    if (!/^https?:\/\//i.test(url)) return res.status(400).send("bad url");
 
-// Short code helpers
-var _CODE_PREFIX = 'BA-';
-var _CODE_CHARS = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // no 0,1,O,I
+    const fmt = String(req.query.fmt || "webp").toLowerCase();
+    const w = clamp(parseInt(req.query.w, 10) || 800, 120, 2000);
 
-function _makeCode(len) {
-  len = len || 7;
-  var s = _CODE_PREFIX;
-  for (var i = 0; i < len; i++) {
-    s += _CODE_CHARS[Math.floor(Math.random() * _CODE_CHARS.length)];
+    const resp = await undiciFetch(url, { redirect: "follow" });
+    if (!resp.ok) return res.status(resp.status).send("upstream " + resp.status);
+    const buf = Buffer.from(await resp.arrayBuffer());
+
+    let pipe = sharp(buf).resize({ width: w, withoutEnlargement: true });
+    if (fmt === "jpg" || fmt === "jpeg") pipe = pipe.jpeg({ quality: 78, mozjpeg: true });
+    else pipe = pipe.webp({ quality: 75 });
+
+    const out = await pipe.toBuffer();
+
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
+    res.set("Content-Type", fmt === "jpg" || fmt === "jpeg" ? "image/jpeg" : "image/webp");
+    return res.status(200).send(out);
+  } catch (e) {
+    console.error("imgThumb error", e);
+    return res.status(500).send("thumb error");
   }
-  return s;
-}
+});
 
-async function _generateUniqueCode() {
-  var fs = _fs();
-  for (var i = 0; i < 8; i++) {
-    var code = _makeCode();
-    var ref = fs.collection(INVITE_CODES_COLL).doc(code);
-    var snap = await ref.get();
-    if (!snap.exists) return code;
-  }
-  throw new Error('Could not generate unique invite code');
-}
+exports.rssBundle = fn.https.onRequest(async (req, res) => {
+  if (req.method !== "POST") return res.status(405).send("Use POST JSON");
+  try {
+    const body = req.body || {};
+    const feeds = Array.isArray(body.feeds) ? body.feeds : [];
+    if (!feeds.length) return res.status(400).json({ ok: false, error: "feeds required" });
 
-exports.backfillInviteCodes = require('firebase-functions')
-  .region('us-central1') // <- change if your other functions use a different region
-  .https.onRequest(async function(req, res) {
-    try {
-      if (req.method !== 'POST') {
-        res.status(405).send('Use POST'); return;
-      }
+    const perFeedLimit = clamp(body.perFeedLimit || 6, 1, 20);
+    const thumbWidth = clamp(body.thumbWidth || 800, 200, 1600);
 
-      // Read protected admin key from functions config (v1-safe)
-      var cfg = require('firebase-functions').config();
-      var configured = (cfg && cfg.backfill && cfg.backfill.key) ? cfg.backfill.key : '';
-      var provided = req.header('x-admin-key') || '';
-      if (!configured || provided !== configured) {
-        res.status(403).send('forbidden'); return;
-      }
-
-      // Pagination
-      var limitRaw = String(req.query.limit || '200');
-      var limit = parseInt(limitRaw, 10);
-      if (!limit || limit < 1) limit = 200;
-      if (limit > 500) limit = 500;
-
-      var after = req.query.after ? String(req.query.after) : null;
-
-      var fs = _fs();
-      var q = fs.collection(USERS_COLL)
-                .orderBy(require('firebase-admin').firestore.FieldPath.documentId())
-                .limit(limit);
-      if (after) q = q.startAfter(after);
-
-      var snap = await q.get();
-      if (snap.empty) {
-        res.json({ processed: 0, assigned: 0, fixedMappings: 0, nextAfter: null }); return;
-      }
-
-      var processed = 0, assigned = 0, fixedMappings = 0;
-      var batch = fs.batch();
-      var ts = require('firebase-admin').firestore.FieldValue.serverTimestamp();
-
-      for (var i = 0; i < snap.docs.length; i++) {
-        var doc = snap.docs[i];
-        processed++;
-        var uid = doc.id;
-        var data = doc.data() || {};
-        var existingCode = data.inviteCode;
-
-        if (!existingCode) {
-          var code = await _generateUniqueCode();
-          batch.set(doc.ref, { inviteCode: code }, { merge: true });
-          batch.set(fs.collection(INVITE_CODES_COLL).doc(code), { uid: uid, createdAt: ts }, { merge: true });
-          assigned++;
-        } else {
-          var mapRef = fs.collection(INVITE_CODES_COLL).doc(existingCode);
-          var mapSnap = await mapRef.get();
-          if (!mapSnap.exists) {
-            batch.set(mapRef, { uid: uid, createdAt: ts }, { merge: true });
-            fixedMappings++;
+    const items = (await Promise.all(
+      feeds.map(async (f) => {
+        try {
+          const resp = await fetch(f.url, {
+            redirect: "follow",
+            headers: { "User-Agent": "BlackApp/1.0" },
+          });
+          if (!resp.ok) {
+            console.warn("feed upstream", f.url, resp.status);
+            return [];
           }
+          const xml = await resp.text();
+          const feed = await parser.parseString(xml);
+          const now = Date.now();
+
+          let list = (feed.items || []).map((it) => {
+            const html = it["content:encoded"] || it.content || it.summary || "";
+            let image =
+              it.enclosure?.url ||
+              it["media:content"]?.url ||
+              it["media:thumbnail"]?.url ||
+              it.itunes?.image ||
+              feed.image?.url ||
+              findImgInHtml(html) ||
+              "";
+
+            image = safeHttps(image);
+            if (looksLikeLogo(image)) image = "";
+
+            const link = safeHttps(it.link || "");
+            const title = (it.title || "").trim();
+            const guid = it.guid || link || title || (Math.random() + "");
+
+            return {
+              id: guid,
+              guid,
+              title,
+              link,
+              summary: (it.contentSnippet || it.summary || it.content || "").trim().slice(0, 280),
+              pubDate: it.isoDate ? Date.parse(it.isoDate)
+                                  : (it.pubDate ? Date.parse(it.pubDate) : now),
+              image,
+              kind: f.kind || "nightlife",
+              source: f.url,
+            };
+          });
+
+          list = list.filter((x) => x.image && x.title && x.link);
+          list.sort((a, b) => b.pubDate - a.pubDate);
+          list = list.slice(0, perFeedLimit);
+
+          const project = process.env.GCLOUD_PROJECT || process.env.GCLOUD_PROJECT_NUMBER || "";
+          const thumbBase = `https://us-central1-${project}.cloudfunctions.net/imgThumb`;
+
+          return list.map((x) => ({
+            ...x,
+            thumb: `${thumbBase}?url=${encodeURIComponent(x.image)}&w=${thumbWidth}&fmt=webp`,
+            aspect: 0.5625, // 16:9 default; can refine if you compute real sizes
+          }));
+        } catch (e) {
+          console.error("feed parse error", f.url, e);
+          return [];
         }
-      }
+      })
+    )).flat();
 
-      await batch.commit();
-      var nextAfter = snap.docs[snap.docs.length - 1] ? snap.docs[snap.docs.length - 1].id : null;
-      res.json({ processed: processed, assigned: assigned, fixedMappings: fixedMappings, nextAfter: nextAfter });
-    } catch (e) {
-      console.error('backfillInviteCodes error:', e);
-      res.status(500).send(e && e.message ? e.message : 'error');
-    }
-  });
-
-
-
-
-
-
-
-
-----------------------------------------------------------------------------------
-----------------------------------------------------------------------------------
-
-import SwiftUI
-import AVFoundation
-import AVKit
-import CoreImage
-import CoreImage.CIFilterBuiltins
-
-// MARK: - Filters
-
-enum LCFilterKind: String, CaseIterable, Identifiable {
-    case none, mono, sepia, vivid
-    var id: String { rawValue }
-}
-
-private let ciContext = CIContext()
-
-func applyFilter(_ kind: LCFilterKind, to image: UIImage) -> UIImage {
-    guard kind != .none, let cg = image.cgImage else { return image }
-    let ci = CIImage(cgImage: cg)
-
-    let out: CIImage
-    switch kind {
-    case .mono:
-        let f = CIFilter.photoEffectNoir()
-        f.inputImage = ci
-        out = f.outputImage ?? ci
-    case .sepia:
-        let f = CIFilter.sepiaTone()
-        f.intensity = 0.9
-        f.inputImage = ci
-        out = f.outputImage ?? ci
-    case .vivid:
-        let f = CIFilter.colorControls()
-        f.inputImage = ci
-        f.saturation = 1.4
-        f.contrast   = 1.1
-        f.brightness = 0.05
-        out = f.outputImage ?? ci
-    case .none:
-        out = ci
+    const seen = new Set();
+    const deduped = [];
+    for (const it of items) {
+      const key = it.guid || it.link || it.title;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(it);
     }
 
-    guard let cgOut = ciContext.createCGImage(out, from: out.extent) else { return image }
-    return UIImage(cgImage: cgOut, scale: image.scale, orientation: image.imageOrientation)
-}
+    deduped.sort((a, b) => b.pubDate - a.pubDate);
 
-func makeVideoComposition(for asset: AVAsset, kind: LCFilterKind) -> AVVideoComposition? {
-    guard kind != .none else { return nil }
-    return AVVideoComposition(asset: asset) { request in
-        var img = request.sourceImage.clampedToExtent()
-
-        switch kind {
-        case .mono:
-            let f = CIFilter.photoEffectNoir()
-            f.inputImage = img
-            img = f.outputImage ?? img
-        case .sepia:
-            let f = CIFilter.sepiaTone()
-            f.intensity = 0.9
-            f.inputImage = img
-            img = f.outputImage ?? img
-        case .vivid:
-            let f = CIFilter.colorControls()
-            f.inputImage = img
-            f.saturation = 1.4
-            f.contrast   = 1.1
-            f.brightness = 0.05
-            img = f.outputImage ?? img
-        case .none:
-            break
-        }
-
-        let cropped = img.cropped(to: request.sourceImage.extent)
-        request.finish(with: cropped, context: nil)
-    }
-}
-
-func exportFilteredVideo(asset: AVAsset, kind: LCFilterKind, completion: @escaping (URL?) -> Void) {
-    let outputURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString)
-        .appendingPathExtension("mp4")
-
-    guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetMediumQuality) else {
-        completion(nil); return
-    }
-    exporter.outputURL = outputURL
-    exporter.outputFileType = .mp4
-    exporter.shouldOptimizeForNetworkUse = true
-    exporter.videoComposition = makeVideoComposition(for: asset, kind: kind)
-
-    exporter.exportAsynchronously {
-        guard exporter.status == .completed else { completion(nil); return }
-        completion(outputURL)
-    }
-}
-
-// MARK: - Camera Manager
-
-final class BAICameraManager: NSObject, ObservableObject {
-    let session = AVCaptureSession()
-    private let sessionQueue = DispatchQueue(label: "bai.camera.session")
-    private var videoDeviceInput: AVCaptureDeviceInput?
-
-    private let photoOutput = AVCapturePhotoOutput()
-    private let movieOutput = AVCaptureMovieFileOutput()
-
-    @Published var isRecording = false
-    @Published var usingFrontCamera = false
-
-    // Callbacks to UI
-    var onPhoto: ((UIImage) -> Void)?
-    var onVideo: ((URL) -> Void)?
-
-    override init() {
-        super.init()
-        session.sessionPreset = .high
-    }
-
-    func requestPermissionsAndConfigure() {
-        AVCaptureDevice.requestAccess(for: .video) { [weak self] vGranted in
-            AVCaptureDevice.requestAccess(for: .audio) { aGranted in
-                guard vGranted else { return }
-                self?.sessionQueue.async { self?.configureSession() }
-            }
-        }
-    }
-
-    private func configureSession() {
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
-
-        // Inputs
-        session.inputs.forEach { session.removeInput($0) }
-        let position: AVCaptureDevice.Position = usingFrontCamera ? .front : .back
-        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
-              let videoInput = try? AVCaptureDeviceInput(device: videoDevice),
-              session.canAddInput(videoInput) else { return }
-        session.addInput(videoInput)
-        videoDeviceInput = videoInput
-
-        if let audio = AVCaptureDevice.default(for: .audio),
-           let audioInput = try? AVCaptureDeviceInput(device: audio),
-           session.canAddInput(audioInput) {
-            session.addInput(audioInput)
-        }
-
-        // Outputs
-        session.outputs.forEach { session.removeOutput($0) }
-
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
-            photoOutput.isHighResolutionCaptureEnabled = true
-        }
-        if session.canAddOutput(movieOutput) {
-            session.addOutput(movieOutput)
-        }
-    }
-
-    func startRunning() {
-        sessionQueue.async {
-            if !self.session.isRunning { self.session.startRunning() }
-        }
-    }
-
-    func stopRunning() {
-        sessionQueue.async {
-            if self.session.isRunning { self.session.stopRunning() }
-        }
-    }
-
-    func flipCamera() {
-        usingFrontCamera.toggle()
-        sessionQueue.async { self.configureSession() }
-    }
-
-    // MARK: Photo
-
-    func capturePhoto() {
-        let settings = AVCapturePhotoSettings()
-        settings.flashMode = .off
-        photoOutput.capturePhoto(with: settings, delegate: self)
-    }
-
-    // MARK: Video
-
-    func startRecording() {
-        guard !movieOutput.isRecording else { return }
-
-        if let conn = movieOutput.connection(with: .video),
-           conn.isVideoOrientationSupported {
-            conn.videoOrientation = .portrait
-        }
-
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("mov")
-        movieOutput.startRecording(to: url, recordingDelegate: self)
-        DispatchQueue.main.async {
-            self.isRecording = true
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        }
-    }
-
-    func stopRecording() {
-        guard movieOutput.isRecording else { return }
-        movieOutput.stopRecording()
-    }
-}
-
-extension BAICameraManager: AVCapturePhotoCaptureDelegate {
-    func photoOutput(_ output: AVCapturePhotoOutput,
-                     didFinishProcessingPhoto photo: AVCapturePhoto,
-                     error: Error?) {
-        guard error == nil,
-              let data = photo.fileDataRepresentation(),
-              let image = UIImage(data: data) else { return }
-        DispatchQueue.main.async { self.onPhoto?(image) }
-    }
-}
-
-extension BAICameraManager: AVCaptureFileOutputRecordingDelegate {
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didFinishRecordingTo outputFileURL: URL,
-                    from connections: [AVCaptureConnection],
-                    error: Error?) {
-        DispatchQueue.main.async {
-            self.isRecording = false
-            guard error == nil else { return }
-            self.onVideo?(outputFileURL)
-        }
-    }
-}
-
-// MARK: - Preview Layer Host
-
-struct BAICameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-    func makeUIView(context: Context) -> PreviewView {
-        let v = PreviewView()
-        v.videoPreviewLayer.session = session
-        v.videoPreviewLayer.videoGravity = .resizeAspectFill
-        return v
-    }
-    func updateUIView(_ uiView: PreviewView, context: Context) {}
-}
-
-final class PreviewView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
-}
-
-// MARK: - LiveCaptureView
-
-struct LiveCaptureView: View {
-    @Environment(\.dismiss) private var dismiss
-    @StateObject private var camera = BAICameraManager()
-
-    // Editing / preview state
-    @State private var capturedImage: UIImage? = nil
-    @State private var capturedVideoURL: URL? = nil
-    @State private var selectedFilter: LCFilterKind = .none
-    @State private var isExportingVideo = false
-    @State private var previewPlayer: AVPlayer? = nil
-
-    var body: some View {
-        ZStack {
-            // Live camera when nothing captured yet
-            if capturedImage == nil && capturedVideoURL == nil {
-                BAICameraPreview(session: camera.session)
-                    .ignoresSafeArea()
-            } else {
-                // ===== PREVIEW WITH FILTERS =====
-                Group {
-                    if let img = capturedImage {
-                        AnyView(filteredImageView(img))
-                    } else if let url = capturedVideoURL {
-                        AnyView(filteredVideoView(url))
-                    }
-                }
-                .transition(.opacity)
-                .ignoresSafeArea(edges: .bottom)
-            }
-
-            // Top bar
-            VStack {
-                HStack {
-                    Button {
-                        if capturedImage != nil || capturedVideoURL != nil {
-                            // Exit editor back to camera
-                            capturedImage = nil
-                            capturedVideoURL = nil
-                            selectedFilter = .none
-                            previewPlayer?.pause()
-                            previewPlayer = nil
-                        } else {
-                            dismiss()
-                        }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 16, weight: .semibold))
-                            .padding(10)
-                            .background(Color.black.opacity(0.35))
-                            .clipShape(Circle())
-                            .foregroundColor(.white)
-                    }
-                    Spacer()
-                    Button {
-                        camera.flipCamera()
-                    } label: {
-                        Image(systemName: "arrow.triangle.2.circlepath.camera")
-                            .font(.system(size: 16, weight: .semibold))
-                            .padding(10)
-                            .background(Color.black.opacity(0.35))
-                            .clipShape(Circle())
-                            .foregroundColor(.white)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 48)
-
-                Spacer()
-
-                // Bottom controls (capture vs editor)
-                if capturedImage == nil && capturedVideoURL == nil {
-                    captureControls
-                } else {
-                    editorControls
-                }
-            }
-        }
-        .background(Color.black.ignoresSafeArea())
-        .onAppear {
-            camera.onPhoto = { img in
-                capturedImage = img
-                capturedVideoURL = nil
-                selectedFilter = .none
-            }
-            camera.onVideo = { url in
-                capturedVideoURL = url
-                capturedImage = nil
-                selectedFilter = .none
-            }
-            camera.requestPermissionsAndConfigure()
-            camera.startRunning()
-        }
-        .onDisappear {
-            previewPlayer?.pause()
-            camera.stopRunning()
-        }
-    }
-
-    // MARK: UI blocks
-
-    private var captureControls: some View {
-        VStack(spacing: 18) {
-            if camera.isRecording {
-                Text("Recording…")
-                    .font(.caption)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.red.opacity(0.9))
-                    .cornerRadius(10)
-            }
-
-            HStack {
-                Spacer()
-                // Photo shutter
-                Button {
-                    camera.capturePhoto()
-                } label: {
-                    Circle()
-                        .strokeBorder(Color.white, lineWidth: 6)
-                        .frame(width: 74, height: 74)
-                        .overlay(Circle().fill(Color.white.opacity(0.9)).frame(width: 60, height: 60))
-                }
-                Spacer()
-            }
-
-            // Video button row
-            HStack(spacing: 22) {
-                Button {
-                    camera.isRecording ? camera.stopRecording() : camera.startRecording()
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: camera.isRecording ? "stop.fill" : "record.circle")
-                        Text(camera.isRecording ? "Stop" : "Record")
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(camera.isRecording ? Color.red : Color.white.opacity(0.16))
-                    .foregroundColor(.white)
-                    .cornerRadius(12)
-                }
-            }
-            .padding(.bottom, 36)
-        }
-        .padding(.bottom, 18)
-    }
-
-    private var editorControls: some View {
-        VStack(spacing: 12) {
-            // Filter chips
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(LCFilterKind.allCases) { f in
-                        Button {
-                            selectedFilter = f
-                            if capturedVideoURL != nil {
-                                rebuildPreviewPlayerForCurrentVideo()
-                            }
-                        } label: {
-                            Text(f.rawValue.capitalized)
-                                .font(.caption)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(selectedFilter == f ? Color.blue.opacity(0.9) : Color.white.opacity(0.2))
-                                .foregroundColor(.white)
-                                .cornerRadius(12)
-                        }
-                    }
-                }
-                .padding(.horizontal, 16)
-            }
-
-            // Use -> send to Gossip + dismiss
-            Button {
-                routeToGossip()
-            } label: {
-                HStack {
-                    if isExportingVideo { ProgressView().padding(.trailing, 6) }
-                    Text(isExportingVideo ? "Preparing…" : "Use")
-                        .bold()
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(Color.blue)
-                .foregroundColor(.white)
-                .cornerRadius(14)
-                .padding(.horizontal, 16)
-            }
-            .disabled(isExportingVideo)
-            .padding(.bottom, 28)
-        }
-        .background(
-            LinearGradient(colors: [Color.black.opacity(0.05), Color.black.opacity(0.65)],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .bottom)
-        )
-    }
-
-    // MARK: Helpers (moved logic out of ViewBuilder)
-
-    private func filteredImageView(_ img: UIImage) -> some View {
-        let filtered = applyFilter(selectedFilter, to: img)
-        return Image(uiImage: filtered)
-            .resizable()
-            .scaledToFit()
-            .frame(maxHeight: 360)
-            .cornerRadius(12)
-            .padding(.horizontal, 12)
-    }
-
-    private func filteredVideoView(_ url: URL) -> some View {
-        let asset = AVAsset(url: url)
-        let item  = AVPlayerItem(asset: asset)
-        if let comp = makeVideoComposition(for: asset, kind: selectedFilter) {
-            item.videoComposition = comp
-        }
-        _ = makeOrReusePlayer(with: item)
-        return VideoPlayer(player: previewPlayer)
-            .frame(height: 360)
-            .cornerRadius(12)
-            .padding(.horizontal, 12)
-            .onAppear { previewPlayer?.play() }
-            .onDisappear { previewPlayer?.pause() }
-    }
-
-    private func makeOrReusePlayer(with item: AVPlayerItem) -> AVPlayer {
-        if let p = previewPlayer {
-            p.replaceCurrentItem(with: item)
-            p.isMuted = true
-            return p
-        } else {
-            let p = AVPlayer(playerItem: item)
-            p.isMuted = true
-            previewPlayer = p
-            return p
-        }
-    }
-
-    private func rebuildPreviewPlayerForCurrentVideo() {
-        guard let url = capturedVideoURL else { return }
-        let asset = AVAsset(url: url)
-        let item  = AVPlayerItem(asset: asset)
-        if let comp = makeVideoComposition(for: asset, kind: selectedFilter) {
-            item.videoComposition = comp
-        }
-        _ = makeOrReusePlayer(with: item)
-        previewPlayer?.play()
-    }
-
-    private func routeToGossip() {
-        // Photo path
-        if let img = capturedImage {
-            let filtered = applyFilter(selectedFilter, to: img)
-            let payload: [String: Any] = [
-                "type": "photo",
-                "filter": selectedFilter.rawValue,
-                "hasURL": false,
-                "hasImage": true,
-                "mediaURL": NSNull(),
-                "image": filtered
-            ]
-            NotificationCenter.default.post(name: .inviteOrbCapturedMedia, object: nil, userInfo: payload)
-            dismiss()
-            return
-        }
-
-        // Video path
-        if let url = capturedVideoURL {
-            isExportingVideo = true
-            let asset = AVAsset(url: url)
-            exportFilteredVideo(asset: asset, kind: selectedFilter) { outputURL in
-                DispatchQueue.main.async {
-                    self.isExportingVideo = false
-                    let finalURL = outputURL ?? url
-                    let payload: [String: Any] = [
-                        "type": "video",
-                        "filter": self.selectedFilter.rawValue,
-                        "hasURL": true,
-                        "hasImage": false,
-                        "mediaURL": finalURL,
-                        "image": NSNull()
-                    ]
-                    NotificationCenter.default.post(name: .inviteOrbCapturedMedia, object: nil, userInfo: payload)
-                    self.dismiss()
-                }
-            }
-        }
-    }
-}
-
-
+    res.set("Cache-Control", "public, max-age=120, s-maxage=300");
+    return res.json({
+      ok: true,
+      items: deduped.map((x) => ({
+        id: x.id,
+        title: x.title,
+        link: x.link,
+        summary: x.summary,
+        pubDate: x.pubDate,
+        image: x.image,
+        thumb: x.thumb,
+        aspect: x.aspect,
+        kind: x.kind,
+        source: x.source,
+      })),
+    });
+  } catch (e) {
+    console.error("rssBundle error", e);
+    return res.status(500).json({ ok: false, error: "bundle error" });
+  }
+});

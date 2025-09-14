@@ -120,6 +120,7 @@ fileprivate enum _InviteOrbBadge {
 }
 
 // MARK: - Futuristic Invite Orb Button (visual only)
+// MARK: - Futuristic Invite Orb Button (visual only)
 struct FuturisticInviteOrb: View {
     var size: CGFloat = 62
     var action: () -> Void
@@ -137,45 +138,45 @@ struct FuturisticInviteOrb: View {
 
         let core = interpolatedColor(phase: phase)
         let rim  = interpolatedColor(phase: phase * 0.9 + 0.05)
-        let aura = interpolatedColor(phase: phase * 1.1 + 0.1).opacity(0.30)
+        let aura = interpolatedColor(phase: phase * 1.1 + 0.1).opacity(0.22) // more translucent
 
         Button(action: action) {
             ZStack {
+                // Soft energy aura
                 Circle()
                     .fill(aura)
-                    .blur(radius: 18)
-                    .scaleEffect(breathe ? 1.03 : 0.985)
-                    .animation(.easeInOut(duration: 4.0).repeatForever(autoreverses: true), value: breathe)
+                    .blur(radius: 22)
+                    .scaleEffect(breathe ? 1.035 : 0.975)
+                    .animation(.easeInOut(duration: 3.8).repeatForever(autoreverses: true), value: breathe)
+                    .blendMode(.plusLighter)
 
-                LiquidBlob(t: t, wobble: 0.032)
+                // Core plasma blob (translucent center)
+                LiquidBlob(t: t, wobble: 0.030)
                     .fill(
                         RadialGradient(
                             colors: [
-                                core.opacity(0.95),
-                                core.mix(with: .black, amount: 0.55).opacity(0.92),
-                                Color.black.opacity(0.70)
+                                core.opacity(0.75),
+                                core.mix(with: .black, amount: 0.50).opacity(0.62),
+                                Color.black.opacity(0.35)
                             ],
                             center: .init(x: 0.46 + tiltX * 0.10, y: 0.42 + tiltY * 0.06),
-                            startRadius: size * 0.08,
-                            endRadius: size * 0.88
+                            startRadius: size * 0.06,
+                            endRadius: size * 0.90
                         )
                     )
-
-                LiquidBlob(t: t * 0.65 + 4.0, wobble: 0.16)
-                    .fill(
-                        RadialGradient(
-                            colors: [Color.white.opacity(0.28), Color.white.opacity(0.08), .clear],
-                            center: .init(x: 0.42 - tiltX * 0.10, y: 0.35 - tiltY * 0.10),
-                            startRadius: size * 0.05,
-                            endRadius: size * 0.58
-                        )
+                    .overlay(
+                        // inner whisper glow
+                        LiquidBlob(t: t * 0.95 + 0.8, wobble: 0.020)
+                            .stroke(core.opacity(0.25), lineWidth: 0.8)
+                            .blur(radius: 0.6)
+                            .blendMode(.screen)
                     )
-                    .blendMode(.screen)
 
+                // Moving specular sheen (rotates via shimmer + phase)
                 Canvas { ctx, size in
                     let g = Gradient(colors: [
                         .white.opacity(0.00),
-                        .white.opacity(0.05),
+                        .white.opacity(0.06),
                         .white.opacity(0.00),
                         .white.opacity(0.10),
                         .white.opacity(0.00)
@@ -183,56 +184,64 @@ struct FuturisticInviteOrb: View {
                     let rect = CGRect(origin: .zero, size: size)
                     let center = CGPoint(x: size.width / 2, y: size.height / 2)
                     let path = Path(ellipseIn: rect)
-                    ctx.fill(path, with: .conicGradient(g, center: center, angle: .degrees(shimmer ? 360 : 0)))
+                    // phase drives the conic sweep (continuous revolution)
+                    let angle = Angle(degrees: Double(phase * 360))
+                    ctx.fill(path, with: .conicGradient(g, center: center, angle: angle))
                 }
                 .clipShape(LiquidBlob(t: t * 0.55 + 2.0, wobble: 0.012))
-                .opacity(0.85)
+                .opacity(0.80)
                 .animation(.linear(duration: 6.0).repeatForever(autoreverses: false), value: shimmer)
+                .blendMode(.screen)
 
+                // Subtle rim energy
                 LiquidBlob(t: t * 0.50, wobble: 0.010)
                     .stroke(
                         AngularGradient(
                             colors: [
-                                rim.opacity(0.22),
+                                rim.opacity(0.18),
                                 .white.opacity(0.08),
-                                rim.opacity(0.22),
+                                rim.opacity(0.18),
                                 .white.opacity(0.08)
                             ],
                             center: .center
                         ),
-                        lineWidth: 1.2
+                        lineWidth: 1.1
                     )
                     .blur(radius: 0.35)
 
+                // Highlight flare
                 LiquidBlob(t: t * 0.45 + 1.7, wobble: 0.014)
                     .fill(
                         RadialGradient(
-                            colors: [.white.opacity(0.50), .white.opacity(0.12), .clear],
+                            colors: [.white.opacity(0.45), .white.opacity(0.10), .clear],
                             center: .init(x: 0.30 - tiltX * 0.14, y: 0.26 - tiltY * 0.14),
                             startRadius: size * 0.02,
-                            endRadius: size * 0.28
+                            endRadius: size * 0.30
                         )
                     )
                     .blendMode(.screen)
 
+                // Outer falloff
                 LiquidBlob(t: t * 0.40 + 0.9, wobble: 0.008)
                     .stroke(
                         RadialGradient(
-                            colors: [core.opacity(0.45), .clear],
+                            colors: [core.opacity(0.35), .clear],
                             center: .center,
-                            startRadius: size * 0.52,
-                            endRadius: size * 0.8
+                            startRadius: size * 0.50,
+                            endRadius: size * 0.82
                         ),
-                        lineWidth: 1.1
+                        lineWidth: 1.0
                     )
-                    .blur(radius: 1.1)
+                    .blur(radius: 1.0)
 
+                // Breathing thin rim
                 LiquidBlob(t: t * 0.35 + 5.0, wobble: 0.008)
-                    .stroke(Color.white.opacity(0.10), lineWidth: 1)
-                    .scaleEffect(breathe ? 1.03 : 0.985)
-                    .blur(radius: breathe ? 1.2 : 1.8)
-                    .animation(.easeInOut(duration: 4.0).repeatForever(autoreverses: true), value: breathe)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    .scaleEffect(breathe ? 1.035 : 0.975)
+                    .blur(radius: breathe ? 1.1 : 1.6)
+                    .animation(.easeInOut(duration: 3.8).repeatForever(autoreverses: true), value: breathe)
 
+                // Plus icon
                 Image(systemName: "plus")
                     .font(.system(size: size * 0.42, weight: .semibold))
                     .foregroundStyle(
@@ -245,12 +254,17 @@ struct FuturisticInviteOrb: View {
             }
             .frame(width: size, height: size)
             .background(
-                Circle().fill(.ultraThinMaterial.opacity(0.06)).blur(radius: 6)
+                // thinner material for translucency
+                Circle().fill(.ultraThinMaterial.opacity(0.04)).blur(radius: 6)
             )
-            .shadow(color: core.opacity(0.30), radius: 16, x: 0, y: 9)
+            .shadow(color: core.opacity(0.22), radius: 18, x: 0, y: 10)
+            // Subtle parallax tilt
             .rotation3DEffect(.degrees(Double(tiltY * 7)), axis: (x: 1, y: 0, z: 0))
             .rotation3DEffect(.degrees(Double(-tiltX * 7)), axis: (x: 0, y: 1, z: 0))
-            .offset(x: sin(t * 0.10) * 0.8, y: cos(t * 0.09) * 0.8)
+            // Continuous *self* rotation using existing `phase`
+            .rotationEffect(.degrees(Double(phase * 360)))
+            // Gentle micro-orbit wobble you already had (slightly more visible)
+            .offset(x: sin(t * 0.12) * 1.0, y: cos(t * 0.11) * 1.0)
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .updating($hover) { value, state, _ in
@@ -261,11 +275,14 @@ struct FuturisticInviteOrb: View {
             .onAppear {
                 breathe = true
                 shimmer = true
-                withAnimation(.linear(duration: 28).repeatForever(autoreverses: false)) { t = 60 }
-                withAnimation(.linear(duration: 10).repeatForever(autoreverses: false)) { phase = 1.0 }
+                // Smooth, nonstop motion:
+                // - t drives blob wobble/orbit
+                withAnimation(.linear(duration: 24).repeatForever(autoreverses: false)) { t = 60 }
+                // - phase drives color flow (blue↔purple) AND self-rotation
+                withAnimation(.linear(duration: 8).repeatForever(autoreverses: false)) { phase = 1.0 }
             }
         }
-        .accessibilityLabel("Invite friends")
+        .accessibilityLabel("Invite orb — capture or share")
         .buttonStyle(.plain)
         .contentShape(Circle())
     }
@@ -278,6 +295,7 @@ struct FuturisticInviteOrb: View {
         return Color(red: mix.x, green: mix.y, blue: mix.z)
     }
 }
+
 
 // MARK: - LiquidBlob Shape
 fileprivate struct LiquidBlob: Shape {
@@ -330,6 +348,25 @@ fileprivate extension Color {
     }
 }
 
+// MARK: - Smart copy helpers (time-aware)
+fileprivate enum DayPhase { case day, night }
+
+fileprivate func currentDayPhase(now: Date = Date(), tz: TimeZone = .current) -> DayPhase {
+    // Night = 6pm–5:59am (adjust to taste)
+    var cal = Calendar.current
+    cal.timeZone = tz
+    let hour = cal.component(.hour, from: now)
+    return (hour >= 18 || hour < 6) ? .night : .day
+}
+
+fileprivate func smartCaptureTitle(for phase: DayPhase) -> String {
+    switch phase {
+    case .day:   return "Capture Experiences"
+    case .night: return "Capture Nightlife"
+    }
+}
+
+
 // MARK: - Floating Invite Orb (presents capture + share)
 public struct InviteOrb: View {
     let userId: String?
@@ -338,13 +375,27 @@ public struct InviteOrb: View {
     @State private var showShare = false
     @State private var showCoach = true
     @State private var showCapture = false
-    @State private var showChooser = false
-    
+
+    // NEW: inline menu instead of confirmationDialog
+    @State private var showMenu = false
+
+    // Smart, time-aware copy (label only; NOT used in the coach bubble)
+    private var phase: DayPhase { currentDayPhase() }
+    private var captureCTA: String { smartCaptureTitle(for: phase) }
+
+    // Orbit animation (gentle)
+    @State private var orbitAngle: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var orbitActive: Bool { !showShare && !showCapture && !showMenu }
+    private var orbitRadius: CGFloat { reduceMotion ? 4 : 14 }
+    private var orbitPeriod: Double { reduceMotion ? 18 : 12 }
+
     public init(userId: String?, circleSize: Int?) {
         self.userId = userId
         self.circleSize = circleSize
     }
     
+    // Milestone message ONLY (removed time-aware coaching text)
     private var nextTargetText: String {
         let next = _InviteOrbBadge.nextTarget(after: circleSize ?? 0)
         if let n = next {
@@ -363,12 +414,53 @@ public struct InviteOrb: View {
                     .padding(.trailing, 18)
             }
 
-            FuturisticInviteOrb(size: 64) {
-                UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                showChooser = true
+            // Dismiss area when menu is open
+            if showMenu {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { showMenu = false }
+                    }
             }
+
+            // Orbit offset around the anchor
+            let radians = orbitAngle * .pi / 180
+            let dx = cos(radians) * orbitRadius
+            let dy = sin(radians) * orbitRadius
+
+            // Inline expanding menu (stacks upward along right edge)
+            VStack(alignment: .trailing, spacing: 10) {
+                if showMenu {
+                    // Smart Camera button
+                    MenuPill(icon: "camera.aperture", title: captureCTA) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
+                        showCapture = true
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    
+                    // Share Invite button
+                    MenuPill(icon: "envelope.open.fill", title: "Share Invite") {
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
+                        showShare = true
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+
+                // The orb itself (offset with gentle orbit)
+                FuturisticInviteOrb(size: 64) {
+                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                        showMenu.toggle()
+                    }
+                }
+                .offset(x: dx, y: dy)
+            }
+            .padding(.trailing, 18)
+            .padding(.bottom, 86)
         }
-        // Presenters anchored to the ZStack (not inside a ViewBuilder scope)
+        // Share & Capture flows
         .sheet(isPresented: $showShare) {
             InviteShareSheet(userId: userId, circleSize: circleSize)
         }
@@ -377,43 +469,86 @@ public struct InviteOrb: View {
                 .ignoresSafeArea()
         }
         .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { _ in
-            // Dismiss the camera when it reports a capture (photo or video)
             showCapture = false
         }
-        .confirmationDialog("What would you like to do?", isPresented: $showChooser, titleVisibility: .visible) {
-            Button("Capture Nightlife") { showCapture = true }
-            Button("Share Invite") { showShare = true }
-            Button("Cancel", role: .cancel) {}
+        // Motion lifecycle
+        .onAppear { startOrbitIfNeeded() }
+        .onChange(of: orbitActive) { _ in
+            if orbitActive { startOrbitIfNeeded() } else { stopOrbit() }
         }
     }
-    } // ← end of InviteOrb
 
-    // MARK: - Overlay wrapper (must be top-level, not nested in a ViewBuilder)
-    public struct InviteOrbOverlay<Content: View>: View {
-        let userId: String?
-        let circleSize: Int?
-        let content: Content
-
-        public init(userId: String?, circleSize: Int? = nil, @ViewBuilder content: () -> Content) {
-            self.userId = userId
-            self.circleSize = circleSize
-            self.content = content()
+    // MARK: - Orbit control
+    private func startOrbitIfNeeded() {
+        guard orbitActive else { return }
+        orbitAngle = 0
+        withAnimation(.linear(duration: orbitPeriod).repeatForever(autoreverses: false)) {
+            orbitAngle = 360
         }
+    }
 
-        public var body: some View {
-            ZStack {
-                content
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        InviteOrb(userId: userId, circleSize: circleSize)
-                            .padding(.trailing, 18)
-                            .padding(.bottom, 86)
-                            .allowsHitTesting(true)
-                    }
-                }
-                .ignoresSafeArea(.keyboard)
+    private func stopOrbit() {
+        let normalized = orbitAngle.truncatingRemainder(dividingBy: 360)
+        withAnimation(.none) { orbitAngle = normalized }
+    }
+}
+
+// MARK: - MenuPill (water-drop UI)
+fileprivate struct MenuPill: View {
+    let icon: String
+    let title: String
+    let action: () -> Void
+
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle()
+                            .fill(.ultraThinMaterial.opacity(0.20))
+                            .overlay(Circle().stroke(Color.white.opacity(0.12), lineWidth: 1))
+                    )
+
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.white)
+                    .padding(.trailing, 2)
             }
+            .padding(.vertical, 10)
+            .padding(.leading, 10)
+            .padding(.trailing, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.blue.opacity(0.30),
+                                Color.purple.opacity(0.30)
+                            ],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                    .shadow(color: Color.blue.opacity(0.25), radius: 10, x: 0, y: 6)
+            )
+            .scaleEffect(hover ? 1.03 : 1.0)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: hover)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering in
+            #if os(iOS)
+            // no-op; .onHover not used on iOS, but keep signature for multiplatform
+            #else
+            hover = isHovering
+            #endif
         }
     }
+}
