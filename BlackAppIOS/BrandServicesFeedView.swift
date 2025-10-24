@@ -3,6 +3,7 @@ import Firebase
 import FirebaseDatabase
 import FirebaseStorage
 
+// MARK: - BrandServicesFeedView
 struct BrandServicesFeedView: View {
     var brand: BrandModel
     @State private var services: [BrandService] = []
@@ -18,7 +19,8 @@ struct BrandServicesFeedView: View {
                 }
 
                 if isLoading {
-                    ProgressView().progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
                 } else if services.isEmpty {
                     Text("No services listed yet.")
                         .foregroundColor(.gray)
@@ -37,7 +39,9 @@ struct BrandServicesFeedView: View {
     }
 
     func fetchServices() {
-        let ref = Database.database().reference().child("brands").child(brand.id).child("services")
+        let ref = Database.database().reference()
+            .child("brands").child(brand.id).child("services")
+
         ref.observeSingleEvent(of: .value) { snapshot in
             var temp: [BrandService] = []
             for case let child as DataSnapshot in snapshot.children {
@@ -71,6 +75,60 @@ struct BrandService: Identifiable {
     }
 }
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // if you used a rewrite, keep it as /checkout
+
+    /// Build a URL for any monetized tool (here we use `services`)
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String?,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,   // optional: override where the page fetches Braintree client tokens
+        chargeUrl: String? = nil         // optional: override where the page posts charges
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 // MARK: - Service Card
 struct ServiceCard: View {
     let service: BrandService
@@ -79,12 +137,15 @@ struct ServiceCard: View {
     @State private var imageURL: URL?
     @State private var isSaved = false
     @State private var showShare = false
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let imageURL = imageURL {
                 AsyncImage(url: imageURL) { img in
-                    img.resizable().scaledToFill()
+                    img
+                        .resizable()
+                        .scaledToFill()
                 } placeholder: {
                     Color.gray.opacity(0.2)
                 }
@@ -109,18 +170,7 @@ struct ServiceCard: View {
 
                 Spacer()
 
-                Button(action: {
-                    guard let userId = authVM.currentUser?.uid else { return }
-                    PurchaseManager.shared.startCheckout(
-                        buyerId: userId,
-                        sellerId: brand.ownerId,
-                        basePrice: service.price,
-                        itemType: "service",
-                        itemId: service.id,
-                        itemTitle: service.title,
-                        itemImageURL: service.imagePath ?? ""
-                    )
-                }) {
+                Button(action: openCheckout) {
                     Text("Book Now")
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
@@ -159,19 +209,52 @@ struct ServiceCard: View {
         }
     }
 
-    func loadImage() {
+    // MARK: Actions
+
+    /// Opens the universal checkout with the service pre-filled
+    private func openCheckout() {
+        // If users must be signed in to pay, early-exit when uid is missing.
+        // Otherwise remove this guard to allow guest checkout (the checkout will store under purchases/guest).
+        // Here we keep your original requirement that user is logged in first.
+        guard let userId = authVM.currentUser?.uid else { return }
+
+        let url = Checkout.url(
+            tool: "services",
+            brandId: brand.id,
+            itemId: service.id,
+            title: service.title,
+            price: service.price,
+            currency: "USD",
+            imagePath: service.imagePath,
+            userId: userId,
+            allowQty: false,      // services are typically 1 per order
+            minQty: 1,
+            maxQty: 1,
+            returnUrl: "blackappios://done"
+            // If your token/charge endpoints are not same-origin as blackapp.io, pass overrides:
+            // clientTokenUrl: "https://blackapp.io/api/client_token",
+            // chargeUrl: "https://blackapp.io/api/charge_braintree"
+        )
+
+        if let url { openURL(url) }
+    }
+
+    private func loadImage() {
         guard let path = service.imagePath, !path.isEmpty else { return }
         if path.starts(with: "http") {
             self.imageURL = URL(string: path)
         } else {
             let ref = Storage.storage().reference(withPath: path)
-            ref.downloadURL { url, _ in self.imageURL = url }
+            ref.downloadURL { url, _ in
+                self.imageURL = url
+            }
         }
     }
 
-    func toggleSave() {
+    private func toggleSave() {
         guard let userId = authVM.currentUser?.uid else { return }
-        let ref = Database.database().reference().child("savedServices").child(userId).child(service.id)
+        let ref = Database.database().reference()
+            .child("savedServices").child(userId).child(service.id)
 
         if isSaved {
             ref.removeValue()
@@ -188,9 +271,11 @@ struct ServiceCard: View {
         }
     }
 
-    func checkIfSaved() {
+    private func checkIfSaved() {
         guard let userId = authVM.currentUser?.uid else { return }
-        let ref = Database.database().reference().child("savedServices").child(userId).child(service.id)
+        let ref = Database.database().reference()
+            .child("savedServices").child(userId).child(service.id)
+
         ref.observeSingleEvent(of: .value) { snapshot in
             self.isSaved = snapshot.exists()
         }

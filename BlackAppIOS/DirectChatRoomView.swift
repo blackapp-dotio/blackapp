@@ -8,7 +8,7 @@ import FirebaseStorage
 import OneSignalFramework
 import FirebaseFunctions
 
-// MARK: - DirectChatRoomView with DM gate (requests + block + decline)
+// MARK: - DirectChatRoomView with DM gate (requests + block + decline + report + profanity guard)
 
 struct DirectChatRoomView: View {
     var recipient: ChatUserProfile
@@ -22,6 +22,10 @@ struct DirectChatRoomView: View {
     @State private var showBlockConfirm = false
     @State private var showUnblockConfirm = false
     @State private var infoToast: String? = nil
+
+    // Report state
+    @State private var reportTargetMessage: ChatMessage? = nil
+    @State private var showReportConfirm = false
 
     // Gate (security) state
     @State private var gate: DMGateState = .accepted
@@ -55,6 +59,13 @@ struct DirectChatRoomView: View {
                 onDelete: { msg in
                     guard gate == .accepted else { return }
                     deleteMessage(msg)
+                },
+                onReport: { msg in
+                    reportTargetMessage = msg
+                    showReportConfirm = true
+                },
+                onBlockSender: { _ in
+                    showBlockConfirm = true
                 }
             )
 
@@ -82,6 +93,8 @@ struct DirectChatRoomView: View {
                     default:
                         Button("Block \(recipient.name)", role: .destructive) { showBlockConfirm = true }
                     }
+                    Divider()
+                    Button("Report \(recipient.name)…", role: .destructive) { reportUser() }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                         .foregroundColor(.white)
@@ -100,6 +113,19 @@ struct DirectChatRoomView: View {
         .alert("Unblock \(recipient.name)?", isPresented: $showUnblockConfirm) {
             Button("Unblock") { unblockUser() }
             Button("Cancel", role: .cancel) {}
+        }
+        .alert(
+            "Report message?",
+            isPresented: $showReportConfirm
+        ) {
+            Button("Report", role: .destructive) { if let m = reportTargetMessage { reportMessage(m) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let m = reportTargetMessage {
+                Text(m.text ?? (m.type == "image" ? "Image" : m.type == "video" ? "Video" : "Message"))
+            } else {
+                Text("This will notify moderators. Abusive content is removed and repeat offenders may be banned.")
+            }
         }
         .overlay(alignment: .top) {
             if let toast = infoToast {
@@ -182,7 +208,7 @@ struct DirectChatRoomView: View {
                         likes: data["likes"] as? [String] ?? [],
                         comments: data["comments"] as? [[String: String]] ?? [],
                         reposts: data["reposts"] as? [String] ?? [],
-                        senderName: senderId == uid ? "" : recipient.name
+                        senderName: data["senderName"] as? String ?? (senderId == uid ? "" : recipient.name)
                     )
                 }
 
@@ -234,6 +260,12 @@ struct DirectChatRoomView: View {
                 infoToast = "Couldn’t block."
                 return
             }
+            // ✅ Mirror to RTDB
+            BlockMirror.mirrorBlock(targetUid: recipient.id) { mirrorErr in
+                if let mirrorErr = mirrorErr {
+                    print("⚠️ RTDB block mirror failed: \(mirrorErr.localizedDescription)")
+                }
+            }
             infoToast = "Blocked."
             refreshGate(andAttachListener: false)
         }
@@ -246,16 +278,29 @@ struct DirectChatRoomView: View {
                 infoToast = "Couldn’t unblock."
                 return
             }
+            // ✅ Mirror removal in RTDB
+            BlockMirror.mirrorUnblock(targetUid: recipient.id) { mirrorErr in
+                if let mirrorErr = mirrorErr {
+                    print("⚠️ RTDB unblock mirror failed: \(mirrorErr.localizedDescription)")
+                }
+            }
             infoToast = "Unblocked."
             refreshGate(andAttachListener: true)
         }
     }
 
-    // MARK: - Send (request-aware)
+
+    // MARK: - Send (request-aware + profanity guard)
 
     private func sendTapped(text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        // 🚫 Basic profanity guard (client-side)
+        if ProfanityFilter.containsBanned(trimmed) {
+            infoToast = "Message blocked for violating our content rules."
+            return
+        }
 
         switch gate {
         case .accepted:
@@ -272,6 +317,11 @@ struct DirectChatRoomView: View {
     }
 
     private func sendRequest(_ text: String) {
+        // 🚫 guard here too to prevent request with abusive text
+        if ProfanityFilter.containsBanned(text) {
+            infoToast = "Message blocked for violating our content rules."
+            return
+        }
         guard let me = meProfile else {
             infoToast = "Loading your profile… try again."
             loadMeProfile()
@@ -417,6 +467,51 @@ struct DirectChatRoomView: View {
             .document(docId)
             .delete()
     }
+
+    // MARK: - Reporting (message & user)
+
+    private func reportMessage(_ msg: ChatMessage) {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        var payload: [String: Any] = [
+            "kind": "dm_message",
+            "chatId": chatId,
+            "reporterId": uid,
+            "reportedUserId": msg.isSender ? uid : recipient.id, // if it's my own, still log; usually they report the other side
+            "messageId": msg.documentId ?? msg.id,
+            "timestamp": FieldValue.serverTimestamp()
+        ]
+        if let t = msg.text { payload["text"] = t }
+        if let u = msg.mediaURL { payload["mediaURL"] = u }
+        payload["type"] = msg.type
+
+        Firestore.firestore().collection("reports").addDocument(data: payload) { err in
+            if let err = err {
+                print("❌ reportMessage error: \(err.localizedDescription)")
+                infoToast = "Couldn’t send report."
+            } else {
+                infoToast = "Thanks—our team will review."
+            }
+        }
+    }
+
+    private func reportUser() {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let payload: [String: Any] = [
+            "kind": "user",
+            "reporterId": uid,
+            "reportedUserId": recipient.id,
+            "context": "direct_message",
+            "timestamp": FieldValue.serverTimestamp()
+        ]
+        Firestore.firestore().collection("reports").addDocument(data: payload) { err in
+            if let err = err {
+                print("❌ reportUser error: \(err.localizedDescription)")
+                infoToast = "Couldn’t send report."
+            } else {
+                infoToast = "User reported. Thank you."
+            }
+        }
+    }
 }
 
 // MARK: - Subviews
@@ -483,6 +578,8 @@ private struct MessageListView: View {
     let recipientName: String
     var onEdit: (ChatMessage) -> Void
     var onDelete: (ChatMessage) -> Void
+    var onReport: (ChatMessage) -> Void
+    var onBlockSender: (ChatMessage) -> Void
 
     var body: some View {
         ScrollViewReader { scrollProxy in
@@ -492,7 +589,9 @@ private struct MessageListView: View {
                         DirectMessageBubble(
                             message: message,
                             onEdit: onEdit,
-                            onDelete: onDelete
+                            onDelete: onDelete,
+                            onReport: onReport,
+                            onBlockSender: onBlockSender
                         )
                         .id(message.id)
                         .frame(maxWidth: .infinity, alignment: message.isSender ? .trailing : .leading)
@@ -585,12 +684,14 @@ private struct ComposerView: View {
     }
 }
 
-// MARK: - DirectMessageBubble (simple + fast to compile)
+// MARK: - DirectMessageBubble (context menu: Report / Block)
 
 private struct DirectMessageBubble: View {
     let message: ChatMessage
     var onEdit: (ChatMessage) -> Void
     var onDelete: (ChatMessage) -> Void
+    var onReport: (ChatMessage) -> Void
+    var onBlockSender: (ChatMessage) -> Void
 
     var body: some View {
         VStack(alignment: message.isSender ? .trailing : .leading, spacing: 6) {
@@ -625,5 +726,19 @@ private struct DirectMessageBubble: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: message.isSender ? .trailing : .leading)
+        .contextMenu {
+            Button(role: .destructive) {
+                onReport(message)
+            } label: {
+                Label("Report", systemImage: "flag.fill")
+            }
+            if !message.isSender {
+                Button(role: .destructive) {
+                    onBlockSender(message)
+                } label: {
+                    Label("Block User", systemImage: "person.crop.circle.badge.xmark")
+                }
+            }
+        }
     }
 }

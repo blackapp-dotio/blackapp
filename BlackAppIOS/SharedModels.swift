@@ -67,7 +67,7 @@ struct SupportMessage: Identifiable {
         return formatter.string(from: Date(timeIntervalSince1970: timestamp))
     }
 }
-
+/*
 import SwiftUI
 import FirebaseAuth
 
@@ -138,5 +138,36 @@ struct EmailVerificationBanner: View {
         // acs.dynamicLinkDomain = "blackappios.page.link"
         return acs
     }
-}
+} */
+// BlockMirror.swift
+import Foundation
+import FirebaseAuth
+import FirebaseDatabase
 
+enum BlockMirror {
+    /// Mirror a block to RTDB: blocks/{me}/blocked/{target}
+    static func mirrorBlock(targetUid: String, completion: ((Error?) -> Void)? = nil) {
+        guard let me = Auth.auth().currentUser?.uid else {
+            completion?(NSError(domain: "BlockMirror", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not signed in"]))
+            return
+        }
+        let r = Database.database().reference()
+            .child("blocks").child(me).child("blocked").child(targetUid)
+        let payload: [String: Any] = [
+            "userId": targetUid,
+            "blockedAt": ServerValue.timestamp()
+        ]
+        r.setValue(payload) { error, _ in completion?(error) }
+    }
+
+    /// Remove a block mirror from RTDB
+    static func mirrorUnblock(targetUid: String, completion: ((Error?) -> Void)? = nil) {
+        guard let me = Auth.auth().currentUser?.uid else {
+            completion?(NSError(domain: "BlockMirror", code: 1, userInfo: [NSLocalizedDescriptionKey: "Not signed in"]))
+            return
+        }
+        let r = Database.database().reference()
+            .child("blocks").child(me).child("blocked").child(targetUid)
+        r.removeValue { error, _ in completion?(error) }
+    }
+}

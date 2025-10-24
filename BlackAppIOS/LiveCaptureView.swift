@@ -3,6 +3,7 @@ import AVFoundation
 import AVKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import UIKit
 
 // MARK: - Filters (unchanged)
 
@@ -100,6 +101,15 @@ protocol MediaUploader {
                 completion: @escaping (Result<URL, Error>) -> Void)
 }
 
+// MARK: - Small helper: open Settings
+
+@inline(__always)
+private func openAppSettings() {
+    guard let url = URL(string: UIApplication.openSettingsURLString),
+          UIApplication.shared.canOpenURL(url) else { return }
+    UIApplication.shared.open(url, options: [:], completionHandler: nil)
+}
+
 // MARK: - Camera Manager (Instagram-like pipeline)
 
 final class BAICameraManager: NSObject, ObservableObject {
@@ -134,8 +144,9 @@ final class BAICameraManager: NSObject, ObservableObject {
 
     deinit { removeObservers() }
 
-    // MARK: Permissions + Configure
+    // MARK: Permissions (legacy method kept for compatibility)
 
+    /// Kept for backward compatibility; configures only when camera granted.
     func requestPermissionsAndConfigure() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] vGranted in
             AVCaptureDevice.requestAccess(for: .audio) { _ in
@@ -144,6 +155,55 @@ final class BAICameraManager: NSObject, ObservableObject {
             }
         }
     }
+
+    /// New: Ensures permissions, reports any denial, then configures & optionally starts.
+    /// - Parameters:
+    ///   - start: If true, starts running after configuration.
+    ///   - onDenied: Called with "Camera" or "Microphone" if denied/restricted.
+    func ensurePermissionsThenConfigure(start: Bool = true,
+                                        onDenied: @escaping (String) -> Void) {
+        // Camera first
+        let camStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        let requestCamera: (@escaping () -> Void) -> Void = { proceed in
+            switch camStatus {
+            case .authorized: proceed()
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .video) { granted in
+                    granted ? proceed() : onDenied("Camera")
+                }
+            case .denied, .restricted:
+                onDenied("Camera")
+            @unknown default:
+                onDenied("Camera")
+            }
+        }
+
+        // Microphone (does not block configuration; we still allow silent video/photos)
+        let micPerm = AVAudioSession.sharedInstance().recordPermission
+        let requestMic: (@escaping () -> Void) -> Void = { proceed in
+            switch micPerm {
+            case .granted: proceed()
+            case .undetermined:
+                AVAudioSession.sharedInstance().requestRecordPermission { _ in proceed() }
+            case .denied:
+                onDenied("Microphone"); proceed() // continue; session can run without audio
+            @unknown default:
+                proceed()
+            }
+        }
+
+        requestCamera {
+            requestMic { [weak self] in
+                guard let self = self else { return }
+                self.sessionQueue.async {
+                    self.configureSession()
+                    if start { self.startRunning() }
+                }
+            }
+        }
+    }
+
+    // MARK: Configure
 
     private func configureSession() {
         session.beginConfiguration()
@@ -173,7 +233,7 @@ final class BAICameraManager: NSObject, ObservableObject {
             videoDevice.unlockForConfiguration()
         } catch { /* ignore */ }
 
-        // Audio
+        // Audio (added only if available/granted)
         if let audio = AVCaptureDevice.default(for: .audio),
            let audioInput = try? AVCaptureDeviceInput(device: audio),
            session.canAddInput(audioInput) {
@@ -197,9 +257,8 @@ final class BAICameraManager: NSObject, ObservableObject {
 
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
-            // Limit bit rate / file size growth in a sane way
-            movieOutput.maxRecordedDuration = CMTime.invalid // unlimited
-            movieOutput.movieFragmentInterval = CMTime(value: 1, timescale: 1) // smoother writing
+            movieOutput.maxRecordedDuration = CMTime.invalid
+            movieOutput.movieFragmentInterval = CMTime(value: 1, timescale: 1)
         }
     }
 
@@ -265,7 +324,7 @@ final class BAICameraManager: NSObject, ObservableObject {
             if conn.isVideoOrientationSupported { conn.videoOrientation = .portrait }
             if conn.isVideoMirroringSupported { conn.isVideoMirrored = usingFrontCamera }
             if conn.isVideoStabilizationSupported {
-                conn.preferredVideoStabilizationMode = .cinematic // auto-crop for stability
+                conn.preferredVideoStabilizationMode = .cinematic
             }
         }
 
@@ -273,7 +332,6 @@ final class BAICameraManager: NSObject, ObservableObject {
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("mov")
 
-        // Start writing
         movieOutput.startRecording(to: url, recordingDelegate: self)
 
         DispatchQueue.main.async {
@@ -309,7 +367,6 @@ final class BAICameraManager: NSObject, ObservableObject {
     }
 
     @objc private func sessionInterrupted(_ note: Notification) {
-        // Gracefully stop timers / flags; session will be paused by the system
         DispatchQueue.main.async {
             self.recordTimer?.invalidate()
             self.recordTimer = nil
@@ -347,7 +404,6 @@ extension BAICameraManager: AVCapturePhotoCaptureDelegate {
             self.photoProgress = 1.0
             UINotificationFeedbackGenerator().notificationOccurred(.success)
             self.onPhoto?(image)
-            // Reset progress after a short delay to allow UI to animate
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.photoProgress = 0 }
         }
     }
@@ -419,6 +475,10 @@ struct LiveCaptureView: View {
     // Pulse indicator for recording
     @State private var pulse = false
 
+    // Settings alert
+    @State private var showSettingsAlert = false
+    @State private var deniedPermissionName: String = "Camera"
+
     var body: some View {
         ZStack {
             // Live camera or media preview
@@ -463,7 +523,6 @@ struct LiveCaptureView: View {
                 HStack {
                     Button {
                         if capturedImage != nil || capturedVideoURL != nil || isUploading || isExportingVideo {
-                            // Back to live camera only when safe
                             guard !isUploading, !isExportingVideo else { return }
                             resetToLive()
                         } else {
@@ -531,8 +590,14 @@ struct LiveCaptureView: View {
                 selectedFilter = .none
                 setupVideoPreview(initialUnfiltered: true)
             }
-            camera.requestPermissionsAndConfigure()
-            camera.startRunning()
+
+            // ✅ New permission flow with Settings route if denied
+            camera.ensurePermissionsThenConfigure(start: true) { denied in
+                DispatchQueue.main.async {
+                    self.deniedPermissionName = denied
+                    self.showSettingsAlert = true
+                }
+            }
         }
         .onDisappear {
             itemObserver?.invalidate()
@@ -542,6 +607,13 @@ struct LiveCaptureView: View {
         }
         .onChange(of: selectedFilter) { _ in
             if capturedVideoURL != nil { setupVideoPreview(initialUnfiltered: false) }
+        }
+        .alert("Enable \(deniedPermissionName) Access",
+               isPresented: $showSettingsAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Open Settings") { openAppSettings() }
+        } message: {
+            Text("BlackApp needs \(deniedPermissionName.lowercased()) access to let you record posts. You can enable it anytime in Settings → Privacy.")
         }
     }
 
@@ -681,7 +753,6 @@ struct LiveCaptureView: View {
     private func setupVideoPreview(initialUnfiltered: Bool) {
         guard let url = capturedVideoURL else { return }
 
-        // Step 1: always show unfiltered first (fast path)
         if initialUnfiltered || selectedFilter == .none {
             let asset = AVAsset(url: url)
             let rawItem = AVPlayerItem(asset: asset)
@@ -690,7 +761,6 @@ struct LiveCaptureView: View {
             videoReady = rawItem.status == .readyToPlay
         }
 
-        // Step 2: if a filter is selected, build a filtered item and swap when ready
         guard selectedFilter != .none else { return }
         let asset = AVAsset(url: url)
         let filteredItem = AVPlayerItem(asset: asset)
@@ -724,7 +794,6 @@ struct LiveCaptureView: View {
         if let img = capturedImage {
             let filtered = applyFilter(selectedFilter, to: img)
 
-            // If uploader provided, write image to temp and upload; else notify
             if let uploader = uploader,
                let data = filtered.jpegData(compressionQuality: 0.92) {
                 let tempURL = FileManager.default.temporaryDirectory
@@ -744,7 +813,6 @@ struct LiveCaptureView: View {
                                 postNotification(type: "photo", mediaURL: remoteURL, image: nil)
                                 self.dismiss()
                             case .failure:
-                                // fall back to local route if needed
                                 postNotification(type: "photo", mediaURL: nil, image: filtered)
                                 self.dismiss()
                             }
@@ -757,7 +825,6 @@ struct LiveCaptureView: View {
                 return
             }
 
-            // Original route: post in-memory image
             postNotification(type: "photo", mediaURL: nil, image: filtered)
             dismiss()
             return
@@ -791,7 +858,6 @@ struct LiveCaptureView: View {
                         return
                     }
 
-                    // Original route: notify with local file URL
                     self.postNotification(type: "video", mediaURL: finalURL, image: nil)
                     self.dismiss()
                 }

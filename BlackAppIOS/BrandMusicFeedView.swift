@@ -4,6 +4,57 @@ import FirebaseDatabase
 import FirebaseAuth
 import AVFoundation
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // keep if you rewrote /checkout → /checkout.html
+
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String? = nil,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 struct BrandMusicFeedView: View {
     var brand: BrandModel
     @State private var tracks: [MusicTrack] = []
@@ -17,7 +68,7 @@ struct BrandMusicFeedView: View {
                     MusicTrackCard(
                         track: track,
                         hasPurchased: purchasedTrackIds.contains(track.id),
-                        brandOwnerId: brand.ownerId
+                        brand: brand
                     )
                     .padding(.horizontal)
                 }
@@ -87,14 +138,18 @@ struct BrandMusicFeedView: View {
     }
 
     func fetchPurchasedTracks() {
+        // Updated to universal checkout schema:
+        // purchases/{uid}/{purchaseId} with fields { tool, itemId, ... }
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("purchases").child(uid)
         ref.observeSingleEvent(of: .value) { snapshot in
             var ids = Set<String>()
             for case let child as DataSnapshot in snapshot.children {
                 if let val = child.value as? [String: Any],
-                   val["type"] as? String == "music" {
-                    ids.insert(child.key)
+                   let tool = val["tool"] as? String,
+                   let itemId = val["itemId"] as? String,
+                   tool == "music" {
+                    ids.insert(itemId)
                 }
             }
             self.purchasedTrackIds = ids
@@ -133,12 +188,13 @@ struct MusicTrack: Identifiable {
 struct MusicTrackCard: View {
     let track: MusicTrack
     let hasPurchased: Bool
-    let brandOwnerId: String
+    let brand: BrandModel
 
     @State private var audioPlayer: AVPlayer?
     @State private var isPlaying = false
     @State private var isSaved = false
     @State private var showShareSheet = false
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -153,7 +209,7 @@ struct MusicTrackCard: View {
                 }
                 Button(action: { showShareSheet = true }) {
                     Image(systemName: "square.and.arrow.up")
-                        .foregroundColor(.white)
+                    .foregroundColor(.white)
                 }
             }
 
@@ -163,16 +219,25 @@ struct MusicTrackCard: View {
 
             if track.isPremium && !hasPurchased {
                 Button {
+                    // require login like your original flow; remove this guard for guest checkout
                     guard let uid = Auth.auth().currentUser?.uid else { return }
-                    PurchaseManager.shared.startCheckout(
-                        buyerId: uid,
-                        sellerId: brandOwnerId,
-                        basePrice: track.price,
-                        itemType: "music",
+                    let url = Checkout.url(
+                        tool: "music",
+                        brandId: brand.id,
                         itemId: track.id,
-                        itemTitle: track.title,
-                        itemImageURL: track.imageURL
+                        title: track.title,
+                        price: track.price,
+                        currency: "USD",
+                        imagePath: track.imageURL,
+                        userId: uid,
+                        allowQty: false,
+                        minQty: 1,
+                        maxQty: 1,
+                        returnUrl: "blackappios://done"
+                        // clientTokenUrl: "https://blackapp.io/api/client_token",
+                        // chargeUrl: "https://blackapp.io/api/charge_braintree"
                     )
+                    if let url { openURL(url) }
                 } label: {
                     Label("Buy to Listen - $\(String(format: "%.2f", track.price))", systemImage: "cart.fill")
                         .padding(.horizontal)

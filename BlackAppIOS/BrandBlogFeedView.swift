@@ -3,11 +3,63 @@ import Firebase
 import FirebaseDatabase
 import FirebaseAuth
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // keep if you rewrote /checkout → /checkout.html
+
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String? = nil,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 struct BrandBlogFeedView: View {
     var brand: BrandModel
     @State private var blogPosts: [BrandBlogPost] = []
     @State private var isLoading = true
     @State private var purchasedPostIds: Set<String> = []
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         ScrollView {
@@ -16,18 +68,7 @@ struct BrandBlogFeedView: View {
                     BlogPostCard(
                         post: post,
                         hasPurchased: purchasedPostIds.contains(post.id),
-                        onPurchase: {
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            PurchaseManager.shared.startCheckout(
-                                buyerId: uid,
-                                sellerId: brand.ownerId,
-                                basePrice: post.price,
-                                itemType: "blog",
-                                itemId: post.id,
-                                itemTitle: post.title,
-                                itemImageURL: ""
-                            )
-                        }
+                        onPurchase: { openCheckout(for: post) }
                     )
                     .padding(.horizontal)
                 }
@@ -54,6 +95,30 @@ struct BrandBlogFeedView: View {
             fetchBlogPosts()
             fetchPurchasedBlogPosts()
         }
+    }
+
+    // MARK: - Checkout
+
+    private func openCheckout(for post: BrandBlogPost) {
+        // Require login like your original flow; remove this guard to allow guest checkout
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let url = Checkout.url(
+            tool: "blog",
+            brandId: brand.id,
+            itemId: post.id,
+            title: post.title,
+            price: post.price,
+            currency: "USD",
+            imagePath: nil,
+            userId: uid,
+            allowQty: false,
+            minQty: 1,
+            maxQty: 1,
+            returnUrl: "blackappios://done"
+            // clientTokenUrl: "https://blackapp.io/api/client_token",
+            // chargeUrl: "https://blackapp.io/api/charge_braintree"
+        )
+        if let url { openURL(url) }
     }
 
     // MARK: - Fetchers (with path fallbacks)
@@ -107,6 +172,8 @@ struct BrandBlogFeedView: View {
     }
 
     func fetchPurchasedBlogPosts() {
+        // Updated to universal checkout schema:
+        // purchases/{uid}/{purchaseId} with fields { tool, itemId, ... }
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("purchases").child(uid)
 
@@ -115,8 +182,10 @@ struct BrandBlogFeedView: View {
             for child in snapshot.children {
                 if let snap = child as? DataSnapshot,
                    let val = snap.value as? [String: Any],
-                   val["type"] as? String == "blog" {
-                    ids.insert(snap.key)
+                   let tool = val["tool"] as? String,
+                   let itemId = val["itemId"] as? String,
+                   tool == "blog" {
+                    ids.insert(itemId)
                 }
             }
             self.purchasedPostIds = ids

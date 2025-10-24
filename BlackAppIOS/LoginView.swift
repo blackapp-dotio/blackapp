@@ -6,11 +6,24 @@ import UIKit   // ⬅️ for UIPasteboard
 struct LoginView: View {
     @EnvironmentObject var authVM: AuthViewModel
 
-    // MARK: - UI State
+    // MARK: - Modes
+    private enum AuthMode: String, CaseIterable { case email = "Email", phone = "Phone" }
+    @State private var mode: AuthMode = .email
+
+    // MARK: - Email UI State
     @State private var email = ""
     @State private var password = ""
     @State private var name = ""
     @State private var username = ""
+
+    // MARK: - Phone UI State
+    @State private var countryCode = "+1"
+    @State private var phone = ""
+    @State private var smsCode = ""
+    @State private var verificationID: String?
+    @State private var codeSent = false
+
+    // MARK: - General UI State
     @State private var errorMessage = ""
     @State private var showLogo = false
     @State private var isSignUpMode = false
@@ -23,117 +36,64 @@ struct LoginView: View {
     private enum AgeGateContext: Equatable { case duringSignup, postSignInCapture }
     @State private var ageGateContext: AgeGateContext? = nil
 
+    // Post-phone first-signin profile completion
+    @State private var showCompleteProfileSheet = false
+    @State private var cpName = ""
+    @State private var cpUsername = ""
+    @State private var cpError: String?
+
+    // MARK: - EULA / Guidelines acceptance
+    @State private var acceptedEULA_v1 = false
+    private let eulaVersion = 1
+    private let termsURL = URL(string: "https://blackapp.io/terms")!
+    private let communityURL = URL(string: "https://blackapp.io/community")!
+
     private let db = Firestore.firestore()
 
+    // MARK: - Body (scrollable + pinned action bar)
     var body: some View {
-        VStack(spacing: 16) {
-            if showLogo {
-                Image("blackapp_logo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 120, height: 120)
-                    .opacity(showLogo ? 1 : 0)
-                    .animation(.easeIn(duration: 1.0), value: showLogo)
-            }
-
-            Group {
-                TextField("Email", text: $email)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.emailAddress)
-                    .padding()
-                    .background(Color.gray.opacity(0.1))
-                    .cornerRadius(10)
-
-                SecureField("Password", text: $password)
-                    .padding()
-                    .background(Color.gray.opacity(0.1))
-                    .cornerRadius(10)
-
-                if !isSignUpMode {
-                    Button("Forgot password?") { sendPasswordReset() }
-                        .font(.caption)
-                        .foregroundColor(.blue)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                        .padding(.bottom, 4)
-                }
-            }
-
-            if isSignUpMode {
-                Group {
-                    TextField("Full Name", text: $name)
-                        .textInputAutocapitalization(.words)
-                        .padding()
-                        .background(Color.gray.opacity(0.1))
-                        .cornerRadius(10)
-
-                    TextField("Username", text: $username)
-                        .textInputAutocapitalization(.never)
-                        .padding()
-                        .background(Color.gray.opacity(0.1))
-                        .cornerRadius(10)
-
-                    Text("Usernames are unique. Only letters & numbers; we’ll lowercase it.")
-                        .font(.caption)
-                        .foregroundColor(.gray)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    // ⬇️ NEW: DOB (18+) during signup
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Date of Birth (18+)")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-
-                        DatePicker("Date of Birth",
-                                   selection: $dateOfBirth,
-                                   in: ...Date(),
-                                   displayedComponents: .date)
-                            .datePickerStyle(.wheel)
-                            .labelsHidden()
-
-                        Text("You must be 18 or older to create an account.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+        ZStack {
+            ScrollView {
+                VStack(spacing: 16) {
+                    if showLogo {
+                        Image("blackapp_logo")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 120, height: 120)
+                            .opacity(showLogo ? 1 : 0)
+                            .animation(.easeIn(duration: 1.0), value: showLogo)
                     }
-                    .padding(.top, 4)
-                }
-            }
 
-            if !errorMessage.isEmpty {
-                Text(errorMessage)
-                    .foregroundColor(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            HStack {
-                Button(isSignUpMode ? "Back to Sign In" : "Sign Up") {
-                    if isSignUpMode {
-                        startSignUp()
-                    } else {
-                        isSignUpMode = true
-                    }
-                }
-                .buttonStyle(.bordered)
-                .disabled(isWorking)
-
-                if !isSignUpMode {
-                    Button {
-                        startSignIn()
-                    } label: {
-                        HStack {
-                            if isWorking { ProgressView().tint(.white) }
-                            Text("Sign In")
+                    // Mode toggle
+                    Picker("", selection: $mode) {
+                        ForEach(AuthMode.allCases, id: \.self) { m in
+                            Text(m.rawValue).tag(m)
                         }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isWorking)
+                    .pickerStyle(.segmented)
+
+                    if mode == .email {
+                        emailForm
+                    } else {
+                        phoneForm
+                    }
+
+                    if !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .foregroundColor(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if mode == .email {
+                        Divider().padding(.vertical, 8)
+                    }
                 }
+                .padding()
+                // extra bottom space so content isn't hidden behind the pinned action bar
+                .padding(.bottom, 140)
             }
-
-            Divider().padding(.vertical, 8)
-
-            // (Google sign-in button left commented in your original file)
+            .scrollDismissesKeyboard(.interactively)
         }
-        .padding()
         .onAppear {
             showLogo = true
             InviteAutoLinker.primeInviteCodeCapture()
@@ -161,9 +121,368 @@ struct LoginView: View {
                 onCancel: { cancelAgeGateAfterSignIn() }
             )
         }
+        // ⬇️ Complete Profile sheet (first phone sign-in without name/username)
+        .sheet(isPresented: $showCompleteProfileSheet) {
+            CompleteProfileSheet(
+                name: $cpName,
+                username: $cpUsername,
+                errorText: $cpError,
+                onSave: { finalizePhoneFirstProfile() },
+                onCancel: {
+                    // if they cancel, sign out (cannot use app without profile)
+                    try? Auth.auth().signOut()
+                    showCompleteProfileSheet = false
+                }
+            )
+        }
+        // ⬇️ Pin the action row at the bottom so it never gets covered
+        .safeAreaInset(edge: .bottom) {
+            Group {
+                if mode == .email {
+                    emailActionBarPinned
+                } else {
+                    phoneActionBarPinned
+                }
+            }
+            .background(.ultraThinMaterial)
+            .shadow(color: .black.opacity(0.2), radius: 6, x: 0, y: -2)
+        }
     }
 
-    // MARK: - Auth flows
+    // MARK: - Email UI
+
+    private var emailForm: some View {
+        Group {
+            TextField("Email", text: $email)
+                .textInputAutocapitalization(.never)
+                .keyboardType(.emailAddress)
+                .padding()
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(10)
+
+            SecureField("Password", text: $password)
+                .padding()
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(10)
+
+            if !isSignUpMode {
+                Button("Forgot password?") { sendPasswordReset() }
+                    .font(.caption)
+                    .foregroundColor(.blue)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.bottom, 4)
+            }
+
+            if isSignUpMode {
+                TextField("Full Name", text: $name)
+                    .textInputAutocapitalization(.words)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(10)
+
+                TextField("Username", text: $username)
+                    .textInputAutocapitalization(.never)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(10)
+
+                Text("Usernames are unique. Only letters & numbers; we’ll lowercase it.")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                // ⬇️ DOB (18+) during signup
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Date of Birth (18+)")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
+                    DatePicker("Date of Birth",
+                               selection: $dateOfBirth,
+                               in: ...Date(),
+                               displayedComponents: .date)
+                        .datePickerStyle(.wheel)
+                        .labelsHidden()
+
+                    Text("You must be 18 or older to create an account.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.top, 4)
+
+                // ⬇️ EULA/Guidelines acceptance (required for signup)
+                EULAAcceptanceBlock(
+                    accepted: $acceptedEULA_v1,
+                    termsURL: termsURL,
+                    communityURL: communityURL
+                )
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    // MARK: - Phone UI
+
+    private var phoneForm: some View {
+        Group {
+            HStack(spacing: 10) {
+                TextField("+1", text: $countryCode)
+                    .keyboardType(.phonePad)
+                    .frame(width: 64)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(10)
+
+                TextField("Phone number", text: $phone)
+                    .keyboardType(.phonePad)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(10)
+            }
+
+            if codeSent {
+                TextField("6-digit code", text: $smsCode)
+                    .keyboardType(.numberPad)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(10)
+            }
+
+            // ⬇️ Always show acceptance for phone auth (account may be created on first verify)
+            EULAAcceptanceBlock(
+                accepted: $acceptedEULA_v1,
+                termsURL: termsURL,
+                communityURL: communityURL
+            )
+            .padding(.top, 4)
+        }
+    }
+
+    // MARK: - Pinned action bars (bottom)
+
+    private var emailActionBarPinned: some View {
+        HStack(spacing: 12) {
+            if isSignUpMode {
+                Button("Back") { isSignUpMode = false }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking)
+            } else {
+                Button("Sign Up") { isSignUpMode = true }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking)
+            }
+
+            Spacer(minLength: 8)
+
+            if isSignUpMode {
+                Button {
+                    startSignUp()
+                } label: {
+                    HStack {
+                        if isWorking { ProgressView().tint(.white) }
+                        Text("Create Account")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isWorking || !acceptedEULA_v1)
+            } else {
+                Button {
+                    startSignIn()
+                } label: {
+                    HStack {
+                        if isWorking { ProgressView().tint(.white) }
+                        Text("Sign In")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isWorking)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+    }
+
+    private var phoneActionBarPinned: some View {
+        HStack {
+            Button {
+                if codeSent {
+                    verifySMSCode()
+                } else {
+                    sendSMSCode()
+                }
+            } label: {
+                HStack {
+                    if isWorking { ProgressView().tint(.white) }
+                    Text(codeSent ? "Verify & Sign In" : "Send Code")
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            // ⬇️ Gate ONLY the verify step on acceptance (account creation happens at verify)
+            .disabled(isWorking || !canProceedPhone || (codeSent && !acceptedEULA_v1))
+        }
+        .padding(.horizontal)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+    }
+
+    private var canProceedPhone: Bool {
+        let e164 = normalizePhone(countryCode: countryCode, number: phone)
+        if !codeSent { return !e164.isEmpty }
+        return !smsCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: - Phone Auth Flow
+
+    private func sendSMSCode() {
+        errorMessage = ""
+        let e164 = normalizePhone(countryCode: countryCode, number: phone)
+        guard !e164.isEmpty else {
+            errorMessage = "Enter a valid phone number."
+            return
+        }
+        isWorking = true
+        PhoneAuthProvider.provider().verifyPhoneNumber(e164, uiDelegate: nil) { verificationID, error in
+            isWorking = false
+            if let error = error {
+                errorMessage = error.localizedDescription
+                codeSent = false
+            } else if let verificationID = verificationID {
+                self.verificationID = verificationID
+                self.codeSent = true
+                self.infoToast = "Code sent to \(e164)"
+            } else {
+                errorMessage = "Failed to request code."
+            }
+        }
+    }
+
+    private func verifySMSCode() {
+        errorMessage = ""
+        guard let verID = verificationID else {
+            errorMessage = "Missing verification. Tap ‘Send Code’ again."
+            return
+        }
+        let code = smsCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else {
+            errorMessage = "Enter the SMS code."
+            return
+        }
+        guard acceptedEULA_v1 else {
+            errorMessage = "Please agree to the Terms and Guidelines to continue."
+            return
+        }
+        isWorking = true
+        let credential = PhoneAuthProvider.provider().credential(withVerificationID: verID, verificationCode: code)
+        Auth.auth().signIn(with: credential) { _, err in
+            if let err = err {
+                isWorking = false
+                errorMessage = err.localizedMessageOrDefault()
+                return
+            }
+
+            // Mark phone account appropriately (exempt from email verification if phone-only)
+            self.markPhoneVerifiedAccount {
+                // Persist EULA acceptance immediately after the very first sign-in
+                self.persistEULAAcceptanceIfNeeded(version: self.eulaVersion) {
+                    // Continue bootstrap
+                    self.isWorking = false
+                    self.postPhoneSignInBootstrap()
+                }
+            }
+        }
+    }
+
+    private func postPhoneSignInBootstrap() {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let userRef = db.collection("users").document(uid)
+        userRef.getDocument { snap, err in
+            if let err = err {
+                self.errorMessage = "Couldn’t load profile: \(err.localizedDescription)"
+                try? Auth.auth().signOut()
+                return
+            }
+            let data = snap?.data() ?? [:]
+            let hasName = (data["name"] as? String)?.isEmpty == false
+            let hasUsername = (data["username"] as? String)?.isEmpty == false
+            let hasDOB = (data["dob"] as? Timestamp) != nil
+
+            if !hasName || !hasUsername {
+                // Collect name + username first
+                self.cpName = ""
+                self.cpUsername = ""
+                self.showCompleteProfileSheet = true
+            } else if !hasDOB {
+                // Missing DOB — age gate
+                self.ageGateContext = .postSignInCapture
+                self.dateOfBirth = Calendar.current.date(byAdding: .year, value: -18, to: Date()) ?? Date()
+                self.showAgeGateSheet = true
+            } else {
+                // All good; run invite linker and toast
+                self.infoToast = "Signed in ✅"
+                InviteAutoLinker.linkInviterIfPresentAfterAuth { linked, msg in
+                    if linked { self.infoToast = msg ?? "Invite linked 🎉" }
+                }
+            }
+        }
+    }
+
+    private func finalizePhoneFirstProfile() {
+        cpError = nil
+        let cleanUsername = normalizeUsername(cpUsername)
+        let trimmedName = cpName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { cpError = "Please enter your full name."; return }
+        guard !cleanUsername.isEmpty else { cpError = "Username must have at least 3 letters or numbers."; return }
+
+        isWorking = true
+        let lowerName = trimmedName.lowercased()
+        reserveNames(usernameLower: cleanUsername, nameLower: lowerName) { result in
+            switch result {
+            case .failure(let err):
+                isWorking = false
+                cpError = err.localizedDescription
+            case .success:
+                self.applyFirstPhoneProfile(name: trimmedName, usernameLower: cleanUsername, nameLower: lowerName)
+            }
+        }
+    }
+
+    private func applyFirstPhoneProfile(name: String, usernameLower: String, nameLower: String) {
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let usersRef     = db.collection("users").document(uid)
+        let usernamesRef = db.collection("usernames").document(usernameLower)
+        let displayRef   = db.collection("displaynames").document(nameLower)
+
+        let batch = db.batch()
+        batch.setData([
+            "name": name,
+            "nameLower": nameLower,
+            "username": usernameLower,
+            "usernameLower": usernameLower
+        ], forDocument: usersRef, merge: true)
+        batch.setData(["uid": uid], forDocument: usernamesRef, merge: true)
+        batch.setData(["uid": uid], forDocument: displayRef, merge: true)
+
+        batch.commit { err in
+            self.isWorking = false
+            if let err = err {
+                self.cpError = "Couldn’t save profile: \(err.localizedDescription)"
+            } else {
+                self.showCompleteProfileSheet = false
+                // Next: age gate if needed
+                self.enforceAgeAfterAuth { allowed in
+                    if allowed {
+                        self.infoToast = "Signed in ✅"
+                        InviteAutoLinker.linkInviterIfPresentAfterAuth { linked, msg in
+                            if linked { self.infoToast = msg ?? "Invite linked 🎉" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Email flows
 
     private func startSignIn() {
         errorMessage = ""
@@ -190,6 +509,12 @@ struct LoginView: View {
     private func startSignUp() {
         errorMessage = ""
         guard validateEmailAndPassword() else { return }
+
+        // Must accept EULA/Guidelines before account creation
+        guard acceptedEULA_v1 else {
+            errorMessage = "Please agree to the Terms and Guidelines to continue."
+            return
+        }
 
         // Basic name/username validation
         let cleanUsername = normalizeUsername(username)
@@ -219,7 +544,7 @@ struct LoginView: View {
                 errorMessage = err.localizedDescription
             case .success:
                 // 2) Proceed with sign-up
-                authVM.signUp(email: email, password: password, name: name, username: cleanUsername) { error in
+                authVM.signUp(email: self.email, password: self.password, name: self.name, username: cleanUsername) { error in
                     if let error = error {
                         // 3a) Rollback reservations on failure
                         rollbackReservations(usernameLower: cleanUsername, nameLower: cleanNameLower) {
@@ -308,14 +633,23 @@ struct LoginView: View {
         let usernamesRef = db.collection("usernames").document(usernameLower)
         let displayRef   = db.collection("displaynames").document(nameLower)
 
-        // Store DOB + ageVerified18 at sign-up time (already validated 18+)
+        // Store DOB + ageVerified18 + EULA acceptance at sign-up time
         let userPatch: [String: Any] = [
             "username": usernameLower,
             "usernameLower": usernameLower,
             "name": name,
             "nameLower": nameLower,
             "dob": Timestamp(date: dateOfBirth),
-            "ageVerified18": true
+            "ageVerified18": true,
+            "acceptedEULA_v1": true,
+            "acceptedEULA_version": eulaVersion,
+            "acceptedEULA_at": FieldValue.serverTimestamp(),
+            "acceptedEULA_termsURL": termsURL.absoluteString,
+            "acceptedEULA_guidelinesURL": communityURL.absoluteString,
+            // Email flow defaults — email verification required
+            "requiresEmailVerification": true,
+            "emailVerificationExempt": false,
+            "authProviders.email": true
         ]
 
         let batch = db.batch()
@@ -364,6 +698,15 @@ struct LoginView: View {
     private func isValidEmail(_ str: String) -> Bool {
         let pattern = #"^\S+@\S+\.\S+$"#
         return str.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private func normalizePhone(countryCode: String, number: String) -> String {
+        // naive E.164 normalizer: strips non-digits except leading +
+        var cc = countryCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        var n = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cc.hasPrefix("+") { cc = "+" + cc.replacingOccurrences(of: "+", with: "") }
+        n = n.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        return (cc + n)
     }
 
     // MARK: - Email verification
@@ -489,9 +832,86 @@ struct LoginView: View {
         try? Auth.auth().signOut()
         showAgeGateSheet = false
     }
+
+    // MARK: - EULA persistence helper (phone-first signups)
+
+    /// Ensures EULA acceptance is written to Firestore immediately after first sign-in (phone flow).
+    private func persistEULAAcceptanceIfNeeded(version: Int, completion: @escaping () -> Void) {
+        guard let uid = Auth.auth().currentUser?.uid else { completion(); return }
+        let userRef = db.collection("users").document(uid)
+        userRef.getDocument { snap, _ in
+            let already = (snap?.data()?["acceptedEULA_v1"] as? Bool) == true
+            guard !already else { completion(); return }
+            let patch: [String: Any] = [
+                "acceptedEULA_v1": true,
+                "acceptedEULA_version": version,
+                "acceptedEULA_at": FieldValue.serverTimestamp(),
+                "acceptedEULA_termsURL": termsURL.absoluteString,
+                "acceptedEULA_guidelinesURL": communityURL.absoluteString
+            ]
+            userRef.setData(patch, merge: true) { _ in completion() }
+        }
+    }
+
+    /// For phone-auth accounts, set email verification exemption appropriately.
+    /// If the account is phone-only (no email/password provider), mark as exempt.
+    /// If they also have email/password provider, require email verification.
+    private func markPhoneVerifiedAccount(_ done: (() -> Void)? = nil) {
+        guard let user = Auth.auth().currentUser else { done?(); return }
+        let providers = user.providerData.map { $0.providerID }
+        let hasEmailProvider = providers.contains("password") || providers.contains("email")
+        let uid = user.uid
+
+        var patch: [String: Any] = [
+            "authProviders.phone": true
+        ]
+
+        if hasEmailProvider {
+            patch["requiresEmailVerification"] = true
+            patch["emailVerificationExempt"] = false
+        } else {
+            patch["requiresEmailVerification"] = false
+            patch["emailVerificationExempt"] = true
+        }
+
+        db.collection("users").document(uid).setData(patch, merge: true) { _ in done?() }
+    }
 }
 
-// MARK: - Age Gate Sheet UI
+// MARK: - EULA/Guidelines block
+
+private struct EULAAcceptanceBlock: View {
+    @Binding var accepted: Bool
+    let termsURL: URL
+    let communityURL: URL
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: $accepted) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("I have read and agree to the Terms of Service and Community Guidelines.")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text("BlackApp has zero tolerance for objectionable content or abusive users.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+
+            HStack(spacing: 16) {
+                Link("View Terms", destination: termsURL)
+                Link("Community Guidelines", destination: communityURL)
+            }
+            .font(.footnote)
+        }
+        .padding(12)
+        .background(Color.gray.opacity(0.1))
+        .cornerRadius(10)
+    }
+}
+
+// MARK: - Age Gate Sheet UI (unchanged)
 
 private struct AgeGateSheet: View {
     @Binding var dob: Date
@@ -538,6 +958,53 @@ private struct AgeGateSheet: View {
             }
             .padding()
             .navigationBarHidden(true)
+        }
+        .interactiveDismissDisabled(true)
+    }
+}
+
+// MARK: - Complete Profile Sheet (for first phone sign-in)
+
+private struct CompleteProfileSheet: View {
+    @Binding var name: String
+    @Binding var username: String
+    @Binding var errorText: String?
+
+    var onSave: () -> Void
+    var onCancel: () -> Void
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Profile")) {
+                    TextField("Full Name", text: $name)
+                        .textInputAutocapitalization(.words)
+
+                    TextField("Username", text: $username)
+                        .textInputAutocapitalization(.never)
+
+                    Text("Usernames are unique. Only letters & numbers; we’ll lowercase it.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                if let e = errorText, !e.isEmpty {
+                    Section {
+                        Text(e).foregroundColor(.red)
+                    }
+                }
+
+                Section {
+                    Button(action: onSave) {
+                        Text("Save")
+                    }
+                    Button(role: .destructive, action: onCancel) {
+                        Text("Cancel")
+                    }
+                }
+            }
+            .navigationTitle("Complete Profile")
+            .navigationBarTitleDisplayMode(.inline)
         }
         .interactiveDismissDisabled(true)
     }
@@ -621,5 +1088,13 @@ fileprivate enum InviteAutoLinker {
         ud.removeObject(forKey: kCodeKey)
         ud.removeObject(forKey: kSavedAtKey)
         ud.synchronize()
+    }
+}
+
+// MARK: - Small convenience
+fileprivate extension Error {
+    func localizedMessageOrDefault() -> String {
+        let msg = (self as NSError).userInfo[NSLocalizedDescriptionKey] as? String
+        return msg?.isEmpty == false ? msg! : self.localizedDescription
     }
 }

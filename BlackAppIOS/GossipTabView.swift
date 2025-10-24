@@ -3,26 +3,25 @@ import Firebase
 import FirebaseDatabase
 import FirebaseStorage
 import FirebaseAuth
-import FirebaseAppCheck          // ✅ App Check header for Cloud Function call
+import FirebaseAppCheck
 import WebKit
 import AVKit
 import AVFoundation
 import UniformTypeIdentifiers
 import Combine
+import PhotosUI // ⬅️ NEW
 
 // ===============================================
 // MARK: - Cloud Functions base
 // ===============================================
 private enum CloudFunctions {
-    // Set your GCP project id here (used by index.js): e.g. "blackappios"
     static let projectId = "blackappios"
     static let base = "https://us-central1-\(projectId).cloudfunctions.net"
     static let rssBundle = base + "/rssBundle" // POST
-    // imgThumb is embedded by rssBundle as absolute URLs in `thumb` field
 }
 
 // ===============================================
-// MARK: - Cached remote image (HTTPS only)
+// MARK: - Cached remote image (HTTPS only) – uses ImageStore elsewhere in project
 // ===============================================
 struct CachedRemoteImage: View {
     let urlString: String
@@ -93,6 +92,21 @@ struct AvatarView: View {
 }
 
 // ===============================================
+// MARK: - NEW: Multi-media model (back-compat supported)
+// ===============================================
+struct PostMedia: Identifiable, Codable, Hashable {
+    enum Kind: String, Codable { case image, video }
+    let id: String
+    let url: String
+    let kind: Kind
+    var thumbURL: String?
+    var width: Int?
+    var height: Int?
+    var duration: Double?
+    var order: Int = 0
+}
+
+// ===============================================
 // MARK: - Twitter-like UserPost Model
 // ===============================================
 struct UserPost: Identifiable {
@@ -100,22 +114,22 @@ struct UserPost: Identifiable {
     let text: String
     let timestamp: TimeInterval
     let userId: String
+
+    // Legacy single-media (kept for old posts/clients)
     var mediaURL: String?
     var mediaType: String? // "image", "video"
 
-    // Interactions
+    // NEW: multiple media
+    var media: [PostMedia] = []
+
     var isLikedByCurrentUser: Bool = false
     var hasRepostedByCurrentUser: Bool = false
 
-    // Counters
     var likeCount: Int = 0
     var commentCount: Int = 0
     var repostCount: Int = 0
 
-    // Comments
     var comments: [Comment] = []
-
-    // Repost / Quote
     var originalPostId: String?
     var quoteText: String?
 
@@ -151,7 +165,7 @@ struct BundleItem: Identifiable, Codable {
     let title: String
     let link: String
     let summary: String
-    let pubDate: TimeInterval // milliseconds since epoch
+    let pubDate: TimeInterval // ms since epoch
     let image: String?
     let thumb: String?
     let aspect: Double?
@@ -186,12 +200,22 @@ struct AnyIdentifiablePost: Identifiable {
 }
 
 // ===============================================
-// MARK: - Cache DTOs
+// MARK: - Cache DTOs (now includes media)
 // ===============================================
+private struct CachedPostMedia: Codable {
+    let id: String, url: String, kind: String
+    let thumbURL: String?
+    let width: Int?
+    let height: Int?
+    let duration: Double?
+    let order: Int
+}
+
 private struct CachedUserPost: Codable {
     struct Cmt: Codable { let id: String; let userId: String; let text: String; let timestamp: TimeInterval }
     let id: String, text: String, timestamp: TimeInterval, userId: String
-    let mediaURL: String?, mediaType: String?
+    let mediaURL: String?, mediaType: String?          // legacy
+    let media: [CachedPostMedia]                        // new
     let isLikedByCurrentUser: Bool
     let hasRepostedByCurrentUser: Bool
     let likeCount: Int
@@ -214,6 +238,154 @@ private struct CachedGossipArticle: Codable {
 }
 
 // ===============================================
+// MARK: Email Verification Banner (phone-safe)
+// ===============================================
+import FirebaseAuth
+import FirebaseFirestore
+
+struct EmailVerificationBanner: View {
+    @StateObject private var vm = EmailVerificationBannerVM()
+    var body: some View {
+        Group {
+            if vm.showBanner {
+                HStack(spacing: 12) {
+                    Image(systemName: "envelope.badge")
+                        .imageScale(.large)
+                        .foregroundColor(.yellow)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Verify your email")
+                            .font(.subheadline).bold()
+                            .foregroundColor(.white)
+                        Text("We’ve sent a verification link. Please check your inbox.")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.8))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    if vm.sending {
+                        ProgressView().tint(.white)
+                    } else {
+                        Button("Resend") { vm.resend() }
+                            .font(.caption).bold()
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.9))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                    }
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.25))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.35), lineWidth: 1))
+                .cornerRadius(10)
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .transition(.opacity)
+            }
+        }
+        .onAppear { vm.start() }
+        .onDisappear { vm.stop() }
+    }
+}
+
+final class EmailVerificationBannerVM: ObservableObject {
+    @Published var showBanner: Bool = false
+    @Published var sending: Bool = false
+
+    private let db = Firestore.firestore()
+    private var authHandle: AuthStateDidChangeListenerHandle?
+    private var userListener: ListenerRegistration?
+
+    func start() {
+        authHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            guard let self = self else { return }
+            self.listenUserDoc(for: user)
+            self.compute(user: user, userDoc: nil)  // best-effort immediately
+        }
+    }
+
+    func stop() {
+        if let h = authHandle { Auth.auth().removeStateDidChangeListener(h) }
+        userListener?.remove()
+        authHandle = nil
+        userListener = nil
+    }
+
+    private func listenUserDoc(for user: User?) {
+        userListener?.remove()
+        guard let uid = user?.uid else {
+            compute(user: nil, userDoc: nil)
+            return
+        }
+        userListener = db.collection("users").document(uid)
+            .addSnapshotListener { [weak self] snap, _ in
+                guard let self = self else { return }
+                self.compute(user: Auth.auth().currentUser, userDoc: snap?.data())
+            }
+    }
+
+    /// Core logic:
+    /// - Hide for phone-only accounts (no email/password provider).
+    /// - Hide if Firestore sets `emailVerificationExempt == true`.
+    /// - Show for email signups when `requiresEmailVerification` (or default true for email providers)
+    ///   AND currentUser.isEmailVerified == false.
+    private func compute(user: User?, userDoc: [String: Any]?) {
+        guard let user = user else {
+            showBanner = false
+            return
+        }
+
+        let providers = user.providerData.map { $0.providerID }
+        let hasPhone  = providers.contains("phone")
+        let hasEmailProvider = providers.contains("password") || providers.contains("email")
+        let hasEmailString = !(user.email ?? "").isEmpty
+
+        // Phone-only → never show banner
+        if hasPhone && !hasEmailProvider {
+            showBanner = false
+            return
+        }
+
+        // Firestore flags (optional; default behavior is based on provider)
+        let emailExempt = (userDoc?["emailVerificationExempt"] as? Bool) == true
+        if emailExempt {
+            showBanner = false
+            return
+        }
+
+        let requiresEmailVerification: Bool = {
+            if let v = userDoc?["requiresEmailVerification"] as? Bool { return v }
+            // default: if the account has email/password provider, require email verification
+            return hasEmailProvider
+        }()
+
+        if requiresEmailVerification, hasEmailString {
+            showBanner = !user.isEmailVerified
+        } else {
+            showBanner = false
+        }
+    }
+
+    func resend() {
+        guard let user = Auth.auth().currentUser else { return }
+        guard !user.isEmailVerified else { showBanner = false; return }
+        sending = true
+
+        // Use app language; simple send is sufficient for banner UX.
+        Auth.auth().useAppLanguage()
+        user.sendEmailVerification { [weak self] error in
+            DispatchQueue.main.async {
+                self?.sending = false
+                // We keep the banner visible; if user taps the link later and re-opens app,
+                // `isEmailVerified` will hide it automatically via auth state / listener.
+                if let error = error {
+                    print("❌ resend verify email failed: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+}
+
+// ===============================================
 // MARK: - Gossip Tab
 // ===============================================
 struct GossipTabView: View {
@@ -221,50 +393,61 @@ struct GossipTabView: View {
     @State private var userPosts: [UserPost] = []
     @State private var combinedFeed: [AnyIdentifiablePost] = []
     @State private var rssArticles: [GossipArticle] = []
-    
-    // Composer
+
+    // Composer (UPDATED: multi-pick arrays)
     @State private var newPostText: String = ""
     @State private var editingPostId: String? = nil
+
+    // ⬇️ NEW multi-selection state (replaces single image/video fields)
+    @State private var selectedImages: [UIImage] = []
+    @State private var selectedVideos: [URL] = []
+
+    // Keep these to preserve existing code paths (legacy single-pick UI still works elsewhere)
     @State private var selectedImage: UIImage? = nil
     @State private var selectedVideoURL: URL? = nil
     @State private var selectedMediaType: ImagePicker.MediaType? = nil
+
     @FocusState private var composerFocused: Bool
     @State private var composerVideoPlayer: AVPlayer? = nil
-    
-    // 👇 IG-style post composer (opens when LiveCaptureView posts inviteOrbCapturedMedia)
+
+    // IG-style composer (LiveCapture)
     @State private var showComposer = false
     @State private var composerImage: UIImage? = nil
     @State private var composerVideoURL: URL? = nil
     @State private var composerFilter: String = "none"
-    
+
     // Tags
     @State private var trendingTags: [String] = []
     @State private var showAllTags = false
     @State private var selectedTagFilter: String? = nil
-    
+
     // UI
     @State private var selectedURL: URL? = nil
     @State private var showWebView = false
-    @State private var showImagePicker = false
+    @State private var showImagePicker = false     // legacy flag; re-used for new multi-picker
     @State private var isLoading = true
     @State private var commentTargetPost: UserPost? = nil
     @State private var commentText: String = ""
     @State private var userProfiles: [String: (name: String, imageURL: String?)] = [:]
     @State private var isUploading: Bool = false
     @State private var posting: Bool = false
-    
-    // Paging
-    @State private var loadingMore: Bool = false
+
+    // Refresh tracking (capsule overlay)
+    @State private var loadingBundle = false
+    @State private var loadingPosts = false
+
+    // Paging (Twitter-style: quick first paint)
     @State private var visibleCount: Int = 5
+    @State private var loadingMore: Bool = false
     private let batchSize: Int = 5
     private let throttler = Throttler()
-    
+
     // Cache
     private var cacheDir: URL { FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first! }
     private var postsCacheURL: URL { cacheDir.appendingPathComponent("gossip_user_posts.json") }
     private var rssCacheURL: URL { cacheDir.appendingPathComponent("gossip_rss_articles.json") }
-    
-    // MARK: Sources (we’ll send these to rssBundle; the server does the heavy lifting)
+
+    // MARK: Sources sent to rssBundle
     private var nightlifeFeeds: [FeedSource] = [
         .init(url: "https://www.bellanaija.com/category/events/feed/", kind: .nightlife),
         .init(url: "https://www.dancehallmag.com/feed/", kind: .nightlife),
@@ -283,9 +466,9 @@ struct GossipTabView: View {
         .init(url: "https://www.bellanaija.com/feed/", kind: .news),
         .init(url: "https://www.pulse.ng/entertainment/rss", kind: .news)
     ]
-    
+
+    // Weighted 4:1 ordering helper used by rssBundle request
     private var weightedFeeds: [FeedSource] {
-        // 4x nightlife, 1x news ordering (like your previous mix)
         var ordered: [FeedSource] = []
         var n = nightlifeFeeds, e = newsFeeds
         var ni = 0, ei = 0
@@ -295,70 +478,56 @@ struct GossipTabView: View {
         }
         return ordered
     }
-    
-    private let rssThumbWidth = 900 // tuned for crispness + speed
-    
+    private let rssThumbWidth = 900
+
     // MARK: Body
     var body: some View {
-        VStack(spacing: 0) {
-            EmailVerificationBanner()
-            TopToolbarView(
-                onLogoTap: { reloadContent() },
-                onSearchTap: {
-                    guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                          let root = scene.windows.first?.rootViewController else { return }
-                    root.present(UIHostingController(rootView: SearchView()), animated: true)
-                }
+        ZStack {
+            VStack(spacing: 0) {
+                EmailVerificationBanner()
+                TopToolbarView(
+                    onLogoTap: { reloadContent() },
+                    onSearchTap: {
+                        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                              let root = scene.windows.first?.rootViewController else { return }
+                        root.present(UIHostingController(rootView: SearchView()), animated: true)
+                    }
+                )
+                
+                // Composer
+                composer
+                
+                Divider().background(Color.gray.opacity(0.3))
+                
+                // Trending tags
+                if !trendingTags.isEmpty { trendingTagStrip }
+                
+                // Feed
+                feedSection
+            }
+            .background(
+                LinearGradient(
+                    colors: [Color.black, Color.black.opacity(0.9)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
             )
             
-            // Composer
-            composer
-            
-            Divider().background(Color.gray.opacity(0.3))
-            
-            // Trending tags
-            if !trendingTags.isEmpty { trendingTagStrip }
-            
-            // Feed
-            Group {
-                if isLoading {
-                    VStack {
-                        Spacer()
-                        ProgressView("Loading...")
-                            .foregroundColor(.white)
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
-                            let page: [AnyIdentifiablePost] = Array(pagedSlice(of: combinedFeed))
-                            ForEach(page, id: \.id) { item in
-                                item.view($selectedURL, $showWebView)
-                                    .onAppear {
-                                        if let lastId = page.last?.id, item.id == lastId {
-                                            loadMoreIfNeeded()
-                                        }
-                                    }
-                            }
-                            if loadingMore {
-                                ProgressView().padding(.vertical, 12)
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.top, 8)
-                    }
-                    .scrollDismissesKeyboard(.interactively)
+            // 🔄 Refresh overlay (shows while either source is loading)
+            if loadingBundle || loadingPosts {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Refreshing…")
+                        .foregroundColor(.white.opacity(0.9))
+                        .font(.footnote)
                 }
+                .padding(12)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(.top, 12)
+                .transition(.opacity)
+                .accessibilityLabel("Refreshing")
             }
         }
-        .background(
-            LinearGradient(
-                colors: [Color.black, Color.black.opacity(0.9)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
         .preferredColorScheme(.dark)
         .onAppear {
             loadCache()
@@ -372,15 +541,40 @@ struct GossipTabView: View {
                 composerVideoPlayer = nil
             }
         }
-        .sheet(isPresented: $showWebView) {
-            if let url = selectedURL { GossipWebView(url: url) }
+        .sheet(item: $selectedURL) { url in
+            GossipWebView(url: url)
+                .applySheetStyle()   // keep if you’re using the helper; otherwise remove
         }
+
+
+
+        // ⬇️ REPLACED: use SystemMultiMediaPicker for multi-select
         .sheet(isPresented: $showImagePicker) {
-            ImagePicker(
-                selectedImage: $selectedImage,
-                selectedVideoURL: $selectedVideoURL,
-                selectedMediaType: $selectedMediaType
+            SystemMultiMediaPicker(
+                selectionLimit: 4,
+                onComplete: { imgs, vids in
+                    // cap at 4 total like Twitter
+                    let space = max(0, 4 - min(imgs.count, 4))
+                    let imgsCapped = Array(imgs.prefix(4))
+                    let vidsCapped = Array(vids.prefix(space > 0 ? space : 0)) // keep total ≤ 4
+                    selectedImages = imgsCapped
+                    selectedVideos = vidsCapped
+                    // keep legacy flags coherent (optional)
+                    selectedMediaType = (!imgsCapped.isEmpty ? .image : (!vidsCapped.isEmpty ? .video : nil))
+                }
             )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { note in
+            handleInviteOrbCapture(note.userInfo)
+        }
+        .sheet(isPresented: $showComposer) {
+            IGStylePostComposer(
+                image: composerImage,
+                videoURL: composerVideoURL,
+                filterName: composerFilter
+            ) { caption, mediaURL, image in
+                showComposer = false
+            }
         }
         .sheet(item: $commentTargetPost) { post in
             VStack {
@@ -397,47 +591,46 @@ struct GossipTabView: View {
             .padding()
             .background(Color.black)
         }
-        // ✅ LISTENER lives ON the root View (not outside body)
-        .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { note in
-            handleInviteOrbCapture(note.userInfo)
-        }
-        // ✅ IG-style composer sheet presented from here
-        .sheet(isPresented: $showComposer) {
-            IGStylePostComposer(
-                image: composerImage,
-                videoURL: composerVideoURL,
-                filterName: composerFilter
-            ) { caption, mediaURL, image in
-                // TODO: your existing “create post” logic here.
-                // 1) Start background upload if needed
-                // 2) Optimistically insert into feed
-                // 3) Dismiss composer after you kick off work
-                showComposer = false
+    }
+
+    // ===============================================
+    // MARK: Feed Rendering (split for compiler sanity)
+    // ===============================================
+    private var feedSection: some View {
+        Group {
+            if isLoading {
+                VStack {
+                    Spacer()
+                    ProgressView("Loading...")
+                        .foregroundColor(.white)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 14) {
+                        let page: [AnyIdentifiablePost] = Array(pagedSlice(of: combinedFeed))
+                        ForEach(page, id: \.id) { item in
+                            item.view($selectedURL, $showWebView)
+                                .onAppear {
+                                    let lastTwoIDs = Array(page.suffix(2).map { $0.id })
+                                    if lastTwoIDs.contains(item.id) { loadMoreIfNeeded() }
+                                }
+                        }
+                        if loadingMore {
+                            ProgressView().padding(.vertical, 12)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                }
+                .scrollDismissesKeyboard(.interactively)
             }
         }
     }
-    
-    // Renamed to avoid redeclaration
-    private func handleCapturedMediaNote(_ info: [AnyHashable: Any]?) {
-        let userInfo = info ?? [:]
-        let hasURL   = (userInfo["hasURL"] as? Bool) ?? false
-        let hasImage = (userInfo["hasImage"] as? Bool) ?? false
-        composerFilter = (userInfo["filter"] as? String) ?? "none"
-        
-        if hasImage, let img = userInfo["image"] as? UIImage {
-            composerImage = img
-            composerVideoURL = nil
-            showComposer = true
-        } else if hasURL, let url = userInfo["mediaURL"] as? URL {
-            composerImage = nil
-            composerVideoURL = url
-            showComposer = true
-        }
-    }
-    
-    
+
     // ===============================================
-    // MARK: Composer UI
+    // MARK: Composer UI (UPDATED for multi-media)
     // ===============================================
     @ViewBuilder
     private var composer: some View {
@@ -447,10 +640,10 @@ struct GossipTabView: View {
                     .focused($composerFocused)
                     .frame(
                         minHeight: (composerFocused
-                                    || selectedMediaType != nil
+                                    || (!selectedImages.isEmpty || !selectedVideos.isEmpty)
                                     || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 88 : 36,
                         maxHeight: (composerFocused
-                                    || selectedMediaType != nil
+                                    || (!selectedImages.isEmpty || !selectedVideos.isEmpty)
                                     || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 140 : 36
                     )
                     .padding(8)
@@ -462,9 +655,9 @@ struct GossipTabView: View {
                         newPostText = newVal.trimmingCharacters(in: .newlines)
                         composerFocused = false
                     }
-                
-                if newPostText.isEmpty && selectedMediaType == nil {
-                    Text(editingPostId == nil ? "What’s the gist? (use #tags)" : "Editing post...")
+
+                if newPostText.isEmpty && selectedImages.isEmpty && selectedVideos.isEmpty {
+                    Text(editingPostId == nil ? "What’s the gist? (use #tags)" : "Editing post…")
                         .foregroundColor(.white.opacity(0.6))
                         .padding(.top, 14)
                         .padding(.horizontal, 14)
@@ -472,45 +665,25 @@ struct GossipTabView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.15),
-                       value: composerFocused || selectedMediaType != nil || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            
-            if let type = selectedMediaType {
-                Group {
-                    if type == .image, let img = selectedImage {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxHeight: 220)
-                            .cornerRadius(12)
-                    } else if type == .video, let player = composerVideoPlayer {
-                        VideoPlayer(player: player)
-                            .frame(height: 240)
-                            .cornerRadius(12)
-                            .onAppear {
-                                player.seek(to: .zero)
-                                player.play()
-                            }
+                       value: composerFocused || !selectedImages.isEmpty || !selectedVideos.isEmpty || !newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            // ⬇️ Multi-media preview (Twitter-style: grid/pager)
+            if !selectedImages.isEmpty || !selectedVideos.isEmpty {
+                ComposerSelectedPreview(images: selectedImages, videos: selectedVideos)
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            clearComposerSelection()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundColor(.white)
+                                .shadow(radius: 3)
+                                .padding(8)
+                        }
+                        .accessibilityLabel("Remove attached media")
                     }
-                }
-                .overlay(alignment: .topTrailing) {
-                    Button {
-                        newPostText = ""
-                        selectedImage = nil
-                        selectedVideoURL = nil
-                        selectedMediaType = nil
-                        composerVideoPlayer?.pause()
-                        composerVideoPlayer = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundColor(.white)
-                            .shadow(radius: 3)
-                            .padding(8)
-                    }
-                    .accessibilityLabel("Remove attached media")
-                }
             }
-            
+
             HStack(spacing: 16) {
                 Button(action: { showImagePicker = true }) {
                     Image(systemName: "photo.on.rectangle")
@@ -525,15 +698,11 @@ struct GossipTabView: View {
                         .foregroundColor(.white)
                 }
                 .disabled(isUploading || posting)
-                
+
                 Button(role: .destructive) {
                     newPostText = ""
-                    selectedImage = nil
-                    selectedVideoURL = nil
-                    selectedMediaType = nil
+                    clearComposerSelection()
                     editingPostId = nil
-                    composerVideoPlayer?.pause()
-                    composerVideoPlayer = nil
                 } label: {
                     Image(systemName: "trash")
                         .padding(10)
@@ -544,12 +713,15 @@ struct GossipTabView: View {
                 }
                 .accessibilityLabel("Discard draft")
                 .disabled(isUploading || posting)
-                
+
                 Button(action: {
                     if let id = editingPostId {
                         updatePost(id)
                     } else {
-                        postToFirebase()
+                        // Cap to Twitter/X’s 4-attachment rule
+                        let imgs = Array(selectedImages.prefix(max(0, 4 - selectedVideos.count)))
+                        let vids = Array(selectedVideos.prefix(max(0, 4 - imgs.count)))
+                        postToFirebaseMultiple(caption: newPostText, pickedImages: imgs, pickedVideos: vids)
                     }
                     composerFocused = false
                 }) {
@@ -569,7 +741,8 @@ struct GossipTabView: View {
                 }
                 .disabled(
                     isUploading || posting ||
-                    (newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && selectedMediaType == nil)
+                    (newPostText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                     && selectedImages.isEmpty && selectedVideos.isEmpty)
                 )
             }
         }
@@ -582,9 +755,18 @@ struct GossipTabView: View {
             }
         }
     }
-    
-    
-    
+
+    private func clearComposerSelection() {
+        selectedImages.removeAll()
+        selectedVideos.removeAll()
+        // keep legacy variables synced (optional)
+        selectedImage = nil
+        selectedVideoURL = nil
+        selectedMediaType = nil
+        composerVideoPlayer?.pause()
+        composerVideoPlayer = nil
+    }
+
     // ===============================================
     // MARK: Trending Tags UI
     // ===============================================
@@ -618,7 +800,7 @@ struct GossipTabView: View {
             .padding(.horizontal)
             .padding(.top, 6)
         }
-        
+
         if let tag = selectedTagFilter {
             HStack(spacing: 10) {
                 Text("Filtering by \(tag)")
@@ -634,49 +816,55 @@ struct GossipTabView: View {
             .padding(.top, 4)
         }
     }
-    
+
     // ===============================================
-    // MARK: Reload (fast server bundle + RTDB posts)
+    // MARK: Reload (Parallel) + App Check
     // ===============================================
     private func reloadContent() {
         isLoading = combinedFeed.isEmpty
-        fetchBundleFromCloud()
-        fetchUserPosts()
+        loadingBundle = true
+        loadingPosts  = true
+
+        let group = DispatchGroup()
+
+        group.enter()
+        fetchBundleFromCloud { group.leave() }
+
+        group.enter()
+        fetchUserPostsFast(limit: 180) { group.leave() }
+
+        group.notify(queue: .main) {
+            loadingBundle = false
+            loadingPosts  = false
+            isLoading = false
+            resetPaging()
+        }
     }
-    
-    // ===============================================
-    // MARK: Server bundle fetcher (rssBundle) + App Check header
-    // ===============================================
-    private func fetchBundleFromCloud() {
+
+    private func fetchBundleFromCloud(completion: (() -> Void)? = nil) {
         Task.detached(priority: .userInitiated) {
             do {
-                // Request body
                 let reqBody = try JSONEncoder().encode(
                     BundleRequest(feeds: weightedFeeds, perFeedLimit: 6, thumbWidth: rssThumbWidth)
                 )
-                
-                // Build request
+
                 var req = URLRequest(url: URL(string: CloudFunctions.rssBundle)!)
                 req.httpMethod = "POST"
                 req.timeoutInterval = 15
                 req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
                 req.httpBody = reqBody
-                
-                // ✅ App Check header
+
                 if let t = try? await AppCheck.appCheck().token(forcingRefresh: false) {
                     req.setValue(t.token, forHTTPHeaderField: "X-Firebase-AppCheck")
                 }
-                
-                
-                // Send
+
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 guard let http = resp as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
                     let raw = String(data: data, encoding: .utf8) ?? ""
                     throw NSError(domain: "rssBundle", code: (resp as? HTTPURLResponse)?.statusCode ?? -1,
                                   userInfo: [NSLocalizedDescriptionKey: "Non-200: \(raw)"])
                 }
-                
-                // Decode and map
+
                 let decoded = try JSONDecoder().decode(BundleResponse.self, from: data)
                 let items = decoded.items
                 let arts: [GossipArticle] = items.compactMap { it in
@@ -691,26 +879,25 @@ struct GossipTabView: View {
                         kind: it.kind
                     )
                 }
-                
-                // Keep 80/20 nightlife/news bias just like before
+
                 let enforced = enforceMix(arts)
-                
+
                 await MainActor.run {
                     rssArticles = enforced
                     mergeContent()
                     saveRSSCache()
-                    isLoading = false
                 }
             } catch {
                 print("❌ rssBundle error:", error.localizedDescription)
-                await MainActor.run {
-                    // fall back to cache only
-                    isLoading = false
-                }
+            }
+
+            await MainActor.run {
+                loadingBundle = false
+                completion?()
             }
         }
     }
-    
+
     private struct BundleRequest: Encodable {
         let feeds: [FeedSource]
         let perFeedLimit: Int
@@ -720,7 +907,7 @@ struct GossipTabView: View {
         let ok: Bool
         let items: [BundleItem]
     }
-    
+
     // ===============================================
     // MARK: Enforce 80/20 Mix
     // ===============================================
@@ -734,7 +921,7 @@ struct GossipTabView: View {
         let newsSlice  = Array(news.sorted { $0.pubDate > $1.pubDate }.prefix(maxNews))
         return (nightSlice + newsSlice).sorted { $0.pubDate > $1.pubDate }
     }
-    
+
     // ===============================================
     // MARK: Helpers for media + live capture
     // ===============================================
@@ -746,11 +933,11 @@ struct GossipTabView: View {
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("mp4")
-        
+
         session.outputURL = outURL
         session.outputFileType = .mp4
         session.shouldOptimizeForNetworkUse = true
-        
+
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
             session.exportAsynchronously {
                 switch session.status {
@@ -761,7 +948,7 @@ struct GossipTabView: View {
             }
         }
     }
-    
+
     private func writeImageToTemp(_ image: UIImage, quality: CGFloat = 0.85) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -772,154 +959,296 @@ struct GossipTabView: View {
         try data.write(to: url, options: .atomic)
         return url
     }
-    
+
     private func handleInviteOrbCapture(_ userInfo: [AnyHashable: Any]?) {
         guard let info = userInfo else { return }
         let kind = (info["type"] as? String) ?? "photo"
-        
+
         if kind == "photo", let image = info["image"] as? UIImage {
-            selectedImage = image
-            selectedVideoURL = nil
-            selectedMediaType = .image
-            newPostText = newPostText.isEmpty ? "#nightlife" : newPostText
+            selectedImages = [image]
+            selectedVideos = []
+            if newPostText.isEmpty { newPostText = "#nightlife" }
             composerFocused = true
-            
         } else if kind == "video", let url = info["mediaURL"] as? URL {
-            selectedVideoURL = url
-            selectedImage = nil
-            selectedMediaType = .video
-            newPostText = newPostText.isEmpty ? "#nightlife" : newPostText
+            selectedVideos = [url]
+            selectedImages = []
+            if newPostText.isEmpty { newPostText = "#nightlife" }
             composerFocused = true
         }
     }
+
+    /// Ensure we have a stable, readable local file (outside security-scoped containers)
+    private func copyToTempIfNeeded(_ sourceURL: URL, preferredExtension: String? = nil) throws -> URL {
+        let fm = FileManager.default
+        let ext = preferredExtension ?? sourceURL.pathExtension
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext.isEmpty ? "bin" : ext)
+
+        if sourceURL.isFileURL {
+            // If already under /var/... we still copy to avoid security scope invalidation mid-upload
+            try fm.copyItem(at: sourceURL, to: dest)
+            return dest
+        } else {
+            // Unusual, but just in case
+            let data = try Data(contentsOf: sourceURL)
+            try data.write(to: dest, options: .atomic)
+            return dest
+        }
+    }
     
+    /// Uploads small blobs (e.g., JPEGs) via foreground `putData` to avoid background/resumable quirks.
+    private func uploadData(_ data: Data, path: String, contentType: String) async throws -> String {
+        let ref = Storage.storage().reference().child(path)
+        let meta = StorageMetadata()
+        meta.contentType = contentType
+
+        // Retry on transient network/storage errors (same set we used before)
+        let transientCodes: Set<Int> = [-1001, -1005, -1011, -1017]
+        var attempt = 0, lastError: Error?
+
+        while attempt < 3 {
+            do {
+                return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                    ref.putData(data, metadata: meta) { _, error in
+                        if let error = error { cont.resume(throwing: error); return }
+                        ref.downloadURL { url, err in
+                            if let err = err { cont.resume(throwing: err); return }
+                            cont.resume(returning: url?.absoluteString ?? "")
+                        }
+                    }
+                }
+            } catch {
+                lastError = error
+                let ns = error as NSError
+                print("⚠️ Storage putData attempt \(attempt + 1) failed [\(ns.domain):\(ns.code)] details=\(ns.userInfo) path=\(path)")
+                if transientCodes.contains(ns.code) {
+                    let delay = pow(2.0, Double(attempt)) * 0.6
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? NSError(domain: "Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown upload failure (putData)"])
+    }
+
     private func uploadFileURL(_ localURL: URL, path: String, contentType: String? = nil) async throws -> String {
         let ref = Storage.storage().reference().child(path)
         let meta = StorageMetadata()
         meta.contentType = contentType
-        
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            ref.putFile(from: localURL, metadata: meta) { _, error in
-                if let error = error { return cont.resume(throwing: error) }
-                ref.downloadURL { url, err in
-                    if let err = err { return cont.resume(throwing: err) }
-                    cont.resume(returning: url?.absoluteString ?? "")
+
+        // Retry on common transient network/storage errors
+        let transientCodes: Set<Int> = [
+            -1001, // timed out
+            -1005, // network connection lost
+            -1011, // bad server response
+            -1017  // cannot parse response
+        ]
+
+        var attempt = 0
+        let maxAttempts = 3
+        var lastError: Error?
+
+        while attempt < maxAttempts {
+            do {
+                return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                    ref.putFile(from: localURL, metadata: meta) { _, error in
+                        if let error = error {
+                            cont.resume(throwing: error)
+                            return
+                        }
+                        ref.downloadURL { url, err in
+                            if let err = err { cont.resume(throwing: err); return }
+                            cont.resume(returning: url?.absoluteString ?? "")
+                        }
+                    }
+                }
+            } catch {
+                lastError = error
+                let ns = (error as NSError)
+                let code = ns.code
+                let domain = ns.domain
+                let details = ns.userInfo
+
+                print("⚠️ Storage upload attempt \(attempt + 1) failed [\(domain):\(code)] details=\(details) path=\(path)")
+
+                if transientCodes.contains(code) {
+                    // Exponential backoff
+                    let delay = pow(2.0, Double(attempt)) * 0.6
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    attempt += 1
+                    continue
+                } else {
+                    // Non-transient; bubble up immediately
+                    throw error
                 }
             }
         }
+        throw lastError ?? NSError(domain: "Upload", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown upload failure"])
     }
-    
+
+
     // ===============================================
-    // MARK: User Posts + Profiles (with counters)
+    // MARK: User Posts + Profiles (FAST PARALLEL, multi-media aware)
     // ===============================================
-    private func fetchUserPosts(limit: UInt = 10) {
+    private func fetchUserPostsFast(limit: UInt = 180, done: (() -> Void)? = nil) {
+        loadingPosts = true
+
         let pRef = Database.database().reference().child("posts")
         let lRef = Database.database().reference().child("likes")
         let cRef = Database.database().reference().child("comments")
         let rRef = Database.database().reference().child("reposts")
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        
+        let usersRef = Database.database().reference().child("users")
+        let me = Auth.auth().currentUser?.uid
+
         pRef.queryOrdered(byChild: "timestamp")
             .queryLimited(toLast: limit)
             .observeSingleEvent(of: .value) { snap in
-                var arr: [UserPost] = []
-                
+
+                var posts: [UserPost] = []
+                var uniqueUserIds = Set<String>()
+
                 for case let cs as DataSnapshot in snap.children {
-                    if let d = cs.value as? [String: Any],
-                       let t = d["text"] as? String,
-                       let ts = d["timestamp"] as? TimeInterval,
-                       let u = d["userId"] as? String {
-                        var post = UserPost(
-                            id: cs.key, text: t, timestamp: ts, userId: u,
-                            mediaURL: d["mediaURL"] as? String, mediaType: d["mediaType"] as? String
-                        )
-                        post.originalPostId = d["originalPostId"] as? String
-                        post.quoteText = d["quoteText"] as? String
-                        arr.append(post)
+                    guard let d = cs.value as? [String: Any],
+                          let t = d["text"] as? String,
+                          let ts = d["timestamp"] as? TimeInterval,
+                          let u = d["userId"] as? String else { continue }
+
+                    var post = UserPost(
+                        id: cs.key, text: t, timestamp: ts, userId: u,
+                        mediaURL: d["mediaURL"] as? String,   // legacy
+                        mediaType: d["mediaType"] as? String  // legacy
+                    )
+                    post.originalPostId = d["originalPostId"] as? String
+                    post.quoteText = d["quoteText"] as? String
+
+                    // NEW: parse media map
+                    if let mediaDict = d["media"] as? [String: Any] {
+                        var list: [PostMedia] = []
+                        list.reserveCapacity(mediaDict.count)
+                        for (mid, raw) in mediaDict {
+                            guard let md = raw as? [String: Any],
+                                  let url = md["url"] as? String,
+                                  let kindStr = md["kind"] as? String,
+                                  let kind = PostMedia.Kind(rawValue: kindStr) else { continue }
+                            let m = PostMedia(
+                                id: (md["id"] as? String) ?? mid,
+                                url: url,
+                                kind: kind,
+                                thumbURL: md["thumbURL"] as? String,
+                                width: md["width"] as? Int,
+                                height: md["height"] as? Int,
+                                duration: md["duration"] as? Double,
+                                order: md["order"] as? Int ?? 0
+                            )
+                            list.append(m)
+                        }
+                        post.media = list.sorted { $0.order < $1.order }
+                    }
+
+                    posts.append(post)
+                    uniqueUserIds.insert(u)
+                }
+
+                posts.sort { $0.timestamp > $1.timestamp }
+
+                // Fetch counters in parallel
+                let group = DispatchGroup()
+
+                var likeCounts: [String: Int] = [:]
+                var likedByMe: Set<String> = []
+
+                var commentMap: [String: [UserPost.Comment]] = [:]
+                var commentCounts: [String: Int] = [:]
+
+                var repostCounts: [String: Int] = [:]
+                var repostedByMe: Set<String> = []
+
+                group.enter()
+                lRef.observeSingleEvent(of: .value) { lsnap in
+                    defer { group.leave() }
+                    for case let pSnap as DataSnapshot in lsnap.children {
+                        likeCounts[pSnap.key] = Int(pSnap.childrenCount)
+                        if let me = me, pSnap.hasChild(me) { likedByMe.insert(pSnap.key) }
                     }
                 }
-                
-                lRef.observeSingleEvent(of: .value) { lsnap in
-                    var liked: Set<String> = []
-                    for case let ps as DataSnapshot in lsnap.children {
-                        if ps.hasChild(uid) { liked.insert(ps.key) }
+
+                group.enter()
+                cRef.observeSingleEvent(of: .value) { csnap in
+                    defer { group.leave() }
+                    for case let pSnap as DataSnapshot in csnap.children {
+                        var arr: [UserPost.Comment] = []
+                        arr.reserveCapacity(Int(pSnap.childrenCount))
+                        for case let cSnap as DataSnapshot in pSnap.children {
+                            if let cd = cSnap.value as? [String: Any],
+                               let u = cd["userId"] as? String,
+                               let tx = cd["text"] as? String,
+                               let tm = cd["timestamp"] as? TimeInterval {
+                                arr.append(.init(id: cSnap.key, userId: u, text: tx, timestamp: tm))
+                            }
+                        }
+                        commentMap[pSnap.key] = arr
+                        commentCounts[pSnap.key] = arr.count
                     }
-                    
-                    cRef.observeSingleEvent(of: .value) { csnap in
-                        var cm: [String: [UserPost.Comment]] = [:]
-                        var cmCounts: [String: Int] = [:]
-                        for case let pSnap as DataSnapshot in csnap.children {
-                            var comments: [UserPost.Comment] = []
-                            for case let cSnap as DataSnapshot in pSnap.children {
-                                if let cd = cSnap.value as? [String: Any],
-                                   let u = cd["userId"] as? String,
-                                   let t = cd["text"] as? String,
-                                   let tm = cd["timestamp"] as? TimeInterval {
-                                    comments.append(UserPost.Comment(id: cSnap.key, userId: u, text: t, timestamp: tm))
-                                }
+                }
+
+                group.enter()
+                rRef.observeSingleEvent(of: .value) { rsnap in
+                    defer { group.leave() }
+                    for case let pSnap as DataSnapshot in rsnap.children {
+                        repostCounts[pSnap.key] = Int(pSnap.childrenCount)
+                        if let me = me, pSnap.hasChild(me) { repostedByMe.insert(pSnap.key) }
+                    }
+                }
+
+                group.notify(queue: .main) {
+                    // Merge counters in O(n)
+                    for i in posts.indices {
+                        let pid = posts[i].id
+                        posts[i].isLikedByCurrentUser = likedByMe.contains(pid)
+                        posts[i].hasRepostedByCurrentUser = repostedByMe.contains(pid)
+                        posts[i].likeCount = likeCounts[pid] ?? 0
+                        posts[i].commentCount = commentCounts[pid] ?? 0
+                        posts[i].repostCount = repostCounts[pid] ?? 0
+                        posts[i].comments = commentMap[pid] ?? []
+                    }
+
+                    userPosts = posts
+                    savePostsCache()
+
+                    // Fetch minimal profiles once per uid
+                    let inner = DispatchGroup()
+                    for uid in uniqueUserIds {
+                        inner.enter()
+                        usersRef.child(uid).observeSingleEvent(of: .value) { uSnap in
+                            if let dict = uSnap.value as? [String: Any] {
+                                let name = dict["name"] as? String ?? "User"
+                                let img = dict["profileImageURL"] as? String
+                                userProfiles[uid] = (name, img)
                             }
-                            cm[pSnap.key] = comments
-                            cmCounts[pSnap.key] = comments.count
+                            inner.leave()
                         }
-                        
-                        rRef.observeSingleEvent(of: .value) { rsnap in
-                            var reposted: Set<String> = []
-                            var rpCounts: [String: Int] = [:]
-                            for case let pSnap as DataSnapshot in rsnap.children {
-                                rpCounts[pSnap.key] = Int(pSnap.childrenCount)
-                                if pSnap.hasChild(uid) { reposted.insert(pSnap.key) }
-                            }
-                            
-                            var likeCounts: [String: Int] = [:]
-                            for case let pSnap as DataSnapshot in lsnap.children {
-                                likeCounts[pSnap.key] = Int(pSnap.childrenCount)
-                            }
-                            
-                            for i in arr.indices {
-                                let pid = arr[i].id
-                                arr[i].isLikedByCurrentUser = liked.contains(pid)
-                                arr[i].hasRepostedByCurrentUser = reposted.contains(pid)
-                                arr[i].comments = cm[pid] ?? []
-                                arr[i].commentCount = cmCounts[pid] ?? 0
-                                arr[i].likeCount = likeCounts[pid] ?? 0
-                                arr[i].repostCount = rpCounts[pid] ?? 0
-                            }
-                            
-                            userPosts = arr.sorted { $0.timestamp > $1.timestamp }
-                            
-                            // Profiles
-                            let uniqueUserIds = Set(arr.map { $0.userId })
-                            let usersRef = Database.database().reference().child("users")
-                            for uid in uniqueUserIds {
-                                usersRef.child(uid).observeSingleEvent(of: .value) { snapshot in
-                                    if let dict = snapshot.value as? [String: Any] {
-                                        let name = dict["name"] as? String ?? "User"
-                                        let img = dict["profileImageURL"] as? String
-                                        DispatchQueue.main.async {
-                                            userProfiles[uid] = (name, img)
-                                            mergeContent()
-                                            updateTrendingTags()
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            savePostsCache()
-                        }
+                    }
+
+                    inner.notify(queue: .main) {
+                        // Single recompute rather than per-profile
+                        mergeContent()
+                        updateTrendingTags()
+                        loadingPosts = false
+                        done?()
                     }
                 }
             }
     }
-    
+
     // ===============================================
     // MARK: Combine & Render (strict alternation)
     // ===============================================
     private func mergeContent() {
-        // External cards (from server bundle)
         let rssCards: [AnyIdentifiablePost] = rssArticles
-            .filter { a in
-                matchesSelectedTag("\(a.title) \(a.description)", selected: selectedTagFilter)
-            }
+            .filter { a in matchesSelectedTag("\(a.title) \(a.description)", selected: selectedTagFilter) }
             .sorted { $0.pubDate > $1.pubDate }
             .map { (article: GossipArticle) in
                 AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.id) {
@@ -936,120 +1265,127 @@ struct GossipTabView: View {
                     .buttonStyle(.plain)
                 }
             }
-        
-        // User post cards
+
         let userCards: [AnyIdentifiablePost] = userPosts
             .filter { post in matchesSelectedTag(post.text, selected: selectedTagFilter) }
             .sorted { $0.timestamp > $1.timestamp }
             .map { post in
                 let profile = userProfiles[post.userId]
                 let displayName = profile?.name ?? "User"
-                
+
                 return AnyIdentifiablePost(timestamp: post.timestamp, id: post.id) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        // Header
-                        HStack(alignment: .center, spacing: 10) {
-                            AvatarView(urlString: profile?.imageURL, size: 36)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(displayName)
-                                    .foregroundColor(.white)
-                                    .font(.subheadline).bold()
-                                Text(post.dateFormatted)
-                                    .font(.caption2).foregroundColor(.gray)
-                            }
-                            Spacer()
-                        }
-                        
-                        // Body text
-                        TextWithHashtagsView(text: post.text) { tappedTag in
-                            selectedTagFilter = tappedTag
-                            mergeContent()
-                            resetPaging()
-                        }
-                        .padding(.vertical, 4)
-                        
-                        // User media
-                        if let mediaURL = post.mediaURL, let url = URL(string: mediaURL) {
-                            Group {
-                                if post.mediaType == "video" {
-                                    DynamicVideoPlayer(url: url) // X-style inline video
-                                } else {
-                                    DynamicAsyncImageView(url: url, cornerRadius: 10)
+                    ZStack(alignment: .topTrailing) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            // Header
+                            HStack(alignment: .center, spacing: 10) {
+                                AvatarView(urlString: profile?.imageURL, size: 36)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(displayName)
+                                        .foregroundColor(.white)
+                                        .font(.subheadline).bold()
+                                    Text(post.dateFormatted)
+                                        .font(.caption2).foregroundColor(.gray)
                                 }
+                                Spacer()
                             }
-                        }
-                        
-                        // Quote context
-                        if let originalId = post.originalPostId,
-                           let original = userPosts.first(where: { $0.id == originalId }) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    AvatarView(urlString: userProfiles[original.userId]?.imageURL, size: 24)
-                                    Text(userProfiles[original.userId]?.name ?? "User")
-                                        .font(.caption).foregroundColor(.white)
-                                    Spacer()
-                                }
-                                Text(original.text)
-                                    .font(.caption)
-                                    .foregroundColor(.white.opacity(0.9))
-                                    .lineLimit(4)
-                                if let mediaURL = original.mediaURL, let url = URL(string: mediaURL) {
-                                    Group {
-                                        if original.mediaType == "video" {
-                                            DynamicVideoPlayer(url: url) // sizes itself by aspect
-                                        } else {
-                                            DynamicAsyncImageView(url: url, cornerRadius: 10) // sizes itself
-                                        }
+
+                            // Body text
+                            TextWithHashtagsView(text: post.text) { tappedTag in
+                                selectedTagFilter = tappedTag
+                                mergeContent()
+                                resetPaging()
+                            }
+                            .padding(.vertical, 4)
+
+                            // NEW: Multi-media render
+                            if !post.media.isEmpty {
+                                MediaGalleryView(media: post.media)
+                            } else if let mediaURL = post.mediaURL, let url = URL(string: mediaURL) {
+                                // legacy single-media fallback
+                                Group {
+                                    if post.mediaType == "video" {
+                                        DynamicVideoPlayer(url: url)
+                                    } else {
+                                        DynamicAsyncImageView(url: url, cornerRadius: 10)
                                     }
                                 }
                             }
-                            .padding(10)
-                            .background(Color.white.opacity(0.06))
-                            .cornerRadius(12)
-                        }
-                        
-                        // Footer actions
-                        HStack(spacing: 22) {
-                            Button(action: { toggleLike(for: post.id) }) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: post.isLikedByCurrentUser ? "hand.thumbsup.fill" : "hand.thumbsup")
-                                    Text("\(post.likeCount)")
-                                }.foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
-                            }
-                            Button(action: { commentTargetPost = post }) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "bubble.right")
-                                    Text("\(post.commentCount)")
-                                }.foregroundColor(.gray)
-                            }
-                            Button(action: { toggleRepost(for: post.id) }) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: post.hasRepostedByCurrentUser ? "arrow.2.squarepath.circle.fill" : "arrow.2.squarepath")
-                                    Text("\(post.repostCount)")
-                                }.foregroundColor(post.hasRepostedByCurrentUser ? .green : .gray)
-                            }
-                            Button(action: { presentQuoteComposer(for: post) }) {
-                                Image(systemName: "quote.bubble").foregroundColor(.gray)
-                            }
-                            Button(action: { sharePost(post) }) {
-                                Image(systemName: "square.and.arrow.up").foregroundColor(.gray)
-                            }
-                            if post.userId == Auth.auth().currentUser?.uid {
-                                Button(action: { newPostText = post.text; editingPostId = post.id }) {
-                                    Image(systemName: "pencil").foregroundColor(.yellow)
+
+                            // Quote
+                            if let originalId = post.originalPostId,
+                               let original = userPosts.first(where: { $0.id == originalId }) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 8) {
+                                        AvatarView(urlString: userProfiles[original.userId]?.imageURL, size: 24)
+                                        Text(userProfiles[original.userId]?.name ?? "User")
+                                            .font(.caption).foregroundColor(.white)
+                                        Spacer()
+                                    }
+                                    Text(original.text)
+                                        .font(.caption)
+                                        .foregroundColor(.white.opacity(0.9))
+                                        .lineLimit(4)
+                                    if !original.media.isEmpty {
+                                        MediaGalleryView(media: original.media)
+                                    } else if let m = original.mediaURL, let url = URL(string: m) {
+                                        if original.mediaType == "video" { DynamicVideoPlayer(url: url) }
+                                        else { DynamicAsyncImageView(url: url, cornerRadius: 10) }
+                                    }
                                 }
-                                Button(role: .destructive, action: { deletePost(post) }) {
-                                    Image(systemName: "trash").foregroundColor(.red)
+                                .padding(10)
+                                .background(Color.white.opacity(0.06))
+                                .cornerRadius(12)
+                            }
+
+                            // Footer actions
+                            HStack(spacing: 22) {
+                                Button(action: { toggleLike(for: post.id) }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: post.isLikedByCurrentUser ? "hand.thumbsup.fill" : "hand.thumbsup")
+                                        Text("\(post.likeCount)")
+                                    }.foregroundColor(post.isLikedByCurrentUser ? .blue : .gray)
+                                }
+                                Button(action: { commentTargetPost = post }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "bubble.right")
+                                        Text("\(post.commentCount)")
+                                    }.foregroundColor(.gray)
+                                }
+                                Button(action: { toggleRepost(for: post.id) }) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: post.hasRepostedByCurrentUser ? "arrow.2.squarepath.circle.fill" : "arrow.2.squarepath")
+                                        Text("\(post.repostCount)")
+                                    }.foregroundColor(post.hasRepostedByCurrentUser ? .green : .gray)
+                                }
+                                Button(action: { presentQuoteComposer(for: post) }) {
+                                    Image(systemName: "quote.bubble").foregroundColor(.gray)
+                                }
+                                Button(action: { sharePost(post) }) {
+                                    Image(systemName: "square.and.arrow.up").foregroundColor(.gray)
+                                }
+                                if post.userId == Auth.auth().currentUser?.uid {
+                                    Button(action: { newPostText = post.text; editingPostId = post.id }) {
+                                        Image(systemName: "pencil").foregroundColor(.yellow)
+                                    }
+                                    Button(role: .destructive, action: { deletePost(post) }) {
+                                        Image(systemName: "trash").foregroundColor(.red)
+                                    }
                                 }
                             }
+                            .padding(.top, 6)
+                            .font(.callout)
                         }
-                        .padding(.top, 6)
-                        .font(.callout)
+
+                        // Moderation overlay (component provided elsewhere)
+                        PostModerationOverlay(
+                            authorUid: post.userId,
+                            targetId: post.id,
+                            targetType: .post
+                        )
                     }
                 }
             }
-        
-        // Strict alternation
+
         let alternated = buildAlternating(user: userCards, external: rssCards)
         withAnimation {
             combinedFeed = alternated
@@ -1057,19 +1393,19 @@ struct GossipTabView: View {
             if !combinedFeed.isEmpty { isLoading = false }
         }
     }
-    
+
     private enum NextPick { case user, external }
     private func buildAlternating(user: [AnyIdentifiablePost], external: [AnyIdentifiablePost]) -> [AnyIdentifiablePost] {
         var i = 0, j = 0
         var out: [AnyIdentifiablePost] = []
         guard !(user.isEmpty && external.isEmpty) else { return out }
-        
+
         let nextStart: NextPick = {
             let uTs = user.first?.timestamp ?? -1
             let eTs = external.first?.timestamp ?? -1
             return (uTs >= eTs) ? .user : .external
         }()
-        
+
         var next = nextStart
         while i < user.count && j < external.count {
             switch next {
@@ -1081,7 +1417,7 @@ struct GossipTabView: View {
         if j < external.count { out.append(contentsOf: external[j...]) }
         return out
     }
-    
+
     // ===============================================
     // MARK: Paging
     // ===============================================
@@ -1100,49 +1436,52 @@ struct GossipTabView: View {
             }
         }
     }
-    
+
     // ===============================================
-    // MARK: Cache
+    // MARK: Cache (now includes media)
     // ===============================================
     private func savePostsCache() {
         let toCache: [CachedUserPost] = userPosts.map { p in
-                .init(
-                    id: p.id, text: p.text, timestamp: p.timestamp, userId: p.userId,
-                    mediaURL: p.mediaURL, mediaType: p.mediaType,
-                    isLikedByCurrentUser: p.isLikedByCurrentUser,
-                    hasRepostedByCurrentUser: p.hasRepostedByCurrentUser,
-                    likeCount: p.likeCount, commentCount: p.commentCount, repostCount: p.repostCount,
-                    originalPostId: p.originalPostId, quoteText: p.quoteText,
-                    comments: p.comments.map { .init(id: $0.id, userId: $0.userId, text: $0.text, timestamp: $0.timestamp) }
-                )
+            .init(
+                id: p.id, text: p.text, timestamp: p.timestamp, userId: p.userId,
+                mediaURL: p.mediaURL, mediaType: p.mediaType,
+                media: p.media.map { m in
+                    .init(id: m.id, url: m.url, kind: m.kind.rawValue, thumbURL: m.thumbURL, width: m.width, height: m.height, duration: m.duration, order: m.order)
+                },
+                isLikedByCurrentUser: p.isLikedByCurrentUser,
+                hasRepostedByCurrentUser: p.hasRepostedByCurrentUser,
+                likeCount: p.likeCount, commentCount: p.commentCount, repostCount: p.repostCount,
+                originalPostId: p.originalPostId, quoteText: p.quoteText,
+                comments: p.comments.map { .init(id: $0.id, userId: $0.userId, text: $0.text, timestamp: $0.timestamp) }
+            )
         }
         do {
             let data = try JSONEncoder().encode(toCache)
             try data.write(to: postsCacheURL, options: .atomic)
         } catch { print("❌ Failed to save posts cache:", error.localizedDescription) }
     }
-    
+
     private func saveRSSCache() {
         let toCache: [CachedGossipArticle] = rssArticles.map { a in
-                .init(
-                    id: a.id,
-                    title: a.title, link: a.link, description: a.description,
-                    pubDate: a.pubDate.timeIntervalSince1970,
-                    thumbURL: a.thumbURL?.absoluteString,
-                    imageURL: a.imageURL?.absoluteString,
-                    kind: a.kind.rawValue
-                )
+            .init(
+                id: a.id,
+                title: a.title, link: a.link, description: a.description,
+                pubDate: a.pubDate.timeIntervalSince1970,
+                thumbURL: a.thumbURL?.absoluteString,
+                imageURL: a.imageURL?.absoluteString,
+                kind: a.kind.rawValue
+            )
         }
         do {
             let data = try JSONEncoder().encode(toCache)
             try data.write(to: rssCacheURL, options: .atomic)
         } catch { print("❌ Failed to save RSS cache:", error.localizedDescription) }
     }
-    
+
     private func loadCache() {
         var cachedRSS: [GossipArticle] = []
         var cachedPosts: [UserPost] = []
-        
+
         if let data = try? Data(contentsOf: rssCacheURL),
            let arr = try? JSONDecoder().decode([CachedGossipArticle].self, from: data) {
             cachedRSS = arr.map {
@@ -1158,7 +1497,7 @@ struct GossipTabView: View {
                 )
             }
         }
-        
+
         if let data = try? Data(contentsOf: postsCacheURL),
            let arr = try? JSONDecoder().decode([CachedUserPost].self, from: data) {
             cachedPosts = arr.map { c in
@@ -1166,6 +1505,10 @@ struct GossipTabView: View {
                     id: c.id, text: c.text, timestamp: c.timestamp, userId: c.userId,
                     mediaURL: c.mediaURL, mediaType: c.mediaType
                 )
+                p.media = c.media.map { m in
+                    PostMedia(id: m.id, url: m.url, kind: PostMedia.Kind(rawValue: m.kind) ?? .image,
+                              thumbURL: m.thumbURL, width: m.width, height: m.height, duration: m.duration, order: m.order)
+                }.sorted { $0.order < $1.order }
                 p.isLikedByCurrentUser = c.isLikedByCurrentUser
                 p.hasRepostedByCurrentUser = c.hasRepostedByCurrentUser
                 p.likeCount = c.likeCount
@@ -1177,7 +1520,7 @@ struct GossipTabView: View {
                 return p
             }
         }
-        
+
         if !cachedRSS.isEmpty || !cachedPosts.isEmpty {
             rssArticles = enforceMix(cachedRSS)
             userPosts = cachedPosts
@@ -1186,25 +1529,20 @@ struct GossipTabView: View {
             isLoading = false
         }
     }
-    
+
     // ===============================================
     // MARK: Tag utils
     // ===============================================
     private func updateTrendingTags() {
         var tagCount: [String: Int] = [:]
-        for post in userPosts {
-            for tag in extractHashtags(from: post.text) { tagCount[tag, default: 0] += 1 }
-        }
+        for post in userPosts { for tag in extractHashtags(from: post.text) { tagCount[tag, default: 0] += 1 } }
         for article in rssArticles {
             let combined = "\(article.title) \(article.description)"
             for tag in extractHashtags(from: combined) { tagCount[tag, default: 0] += 1 }
         }
         trendingTags = Array(tagCount.sorted { $0.value > $1.value }.prefix(showAllTags ? 24 : 10).map { "#\($0.key)" })
     }
-    
-    // ===============================================
-    // MARK: Helpers
-    // ===============================================
+
     private func extractPlainText(from html: String) -> String {
         guard let data = html.data(using: .utf8) else {
             return html.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1219,7 +1557,7 @@ struct GossipTabView: View {
             return html.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
-    
+
     // ===============================================
     // MARK: Hashtags
     // ===============================================
@@ -1235,7 +1573,7 @@ struct GossipTabView: View {
             return ns.substring(with: range).lowercased()
         }
     }
-    
+
     private func matchesSelectedTag(_ text: String, selected: String?) -> Bool {
         guard let selected = selected?
             .lowercased()
@@ -1245,50 +1583,128 @@ struct GossipTabView: View {
         if tags.contains(selected) { return true }
         return text.lowercased().contains(selected)
     }
-    
-    // MARK: Posting / Media upload
-    private func postToFirebase() {
+
+    // ===============================================
+    // MARK: Posting / Media upload (MULTI-MEDIA, concurrent)
+    // ===============================================
+    private func postToFirebaseMultiple(
+        caption: String,
+        pickedImages: [UIImage],
+        pickedVideos: [URL]
+    ) {
+        if ProfanityFilter.containsBanned(caption) {
+            print("Post blocked: contains prohibited words.")
+            return
+        }
         guard let uid = Auth.auth().currentUser?.uid else { return }
-        
         posting = true
         isUploading = true
-        
+
         Task.detached(priority: .userInitiated) {
             do {
-                var mediaURLString: String? = nil
-                var mediaTypeString: String? = nil
-                
-                if selectedMediaType == .video, let inputURL = selectedVideoURL {
-                    var needsStop = false
-                    if inputURL.startAccessingSecurityScopedResource() { needsStop = true }
-                    defer { if needsStop { inputURL.stopAccessingSecurityScopedResource() } }
-                    
-                    let exportedURL = try await exportVideoIfNeeded(inputURL: inputURL)
-                    let storagePath = "posts/\(uid)/videos/\(UUID().uuidString).mp4"
-                    mediaURLString = try await uploadFileURL(exportedURL, path: storagePath, contentType: "video/mp4")
-                    mediaTypeString = "video"
-                    if exportedURL.path.contains(FileManager.default.temporaryDirectory.path) {
-                        try? FileManager.default.removeItem(at: exportedURL)
-                    }
-                } else if selectedMediaType == .image, let image = selectedImage {
-                    let tempURL = try writeImageToTemp(image, quality: 0.85)
-                    let storagePath = "posts/\(uid)/images/\(UUID().uuidString).jpg"
-                    mediaURLString = try await uploadFileURL(tempURL, path: storagePath, contentType: "image/jpeg")
-                    mediaTypeString = "image"
-                    try? FileManager.default.removeItem(at: tempURL)
-                }
-                
                 let postId = UUID().uuidString
                 let now = Date().timeIntervalSince1970
+
+                // 1) Upload media concurrently
+                var uploaded: [PostMedia] = []
+                try await withThrowingTaskGroup(of: PostMedia?.self) { group in
+
+                    for (idx, img) in pickedImages.enumerated() {
+                        group.addTask {
+                            // Ensure we have real JPEG bytes and basic sanity checks
+                            guard let data = img.jpegData(compressionQuality: 0.85), data.count > 0 else { return nil }
+
+                            // Optional: lightweight size metadata
+                            let width = Int(img.size.width)
+                            let height = Int(img.size.height)
+
+                            let mId = Database.database().reference().child("tmp").childByAutoId().key ?? UUID().uuidString
+                            let storagePath = "posts/\(uid)/\(postId)/images/\(mId).jpg"
+
+                            // 👉 Foreground upload (no background/resumable) to dodge -1017
+                            let urlStr = try await uploadData(data, path: storagePath, contentType: "image/jpeg")
+
+                            return PostMedia(
+                                id: mId,
+                                url: urlStr,
+                                kind: .image,
+                                thumbURL: urlStr,
+                                width: width,
+                                height: height,
+                                duration: nil,
+                                order: idx
+                            )
+                        }
+                    }
+
+
+                    for (vIdx, vURL) in pickedVideos.enumerated() {
+                        group.addTask {
+                            var needsStop = false
+                            if vURL.startAccessingSecurityScopedResource() { needsStop = true }
+                            defer { if needsStop { vURL.stopAccessingSecurityScopedResource() } }
+
+                            // Export to mp4 if beneficial (smaller, network-friendly); fallback is original
+                            let exportedURL = try? await exportVideoIfNeeded(inputURL: vURL)
+                            let candidate = exportedURL ?? vURL
+
+                            // COPY to temp to avoid security scope invalidation mid-upload
+                            let localCopy = try copyToTempIfNeeded(candidate, preferredExtension: "mp4")
+
+                            let mId = Database.database().reference().child("tmp").childByAutoId().key ?? UUID().uuidString
+                            let storagePath = "posts/\(uid)/\(postId)/videos/\(mId).mp4"
+                            let urlStr = try await uploadFileURL(localCopy, path: storagePath, contentType: "video/mp4")
+
+                            // cleanup
+                            try? FileManager.default.removeItem(at: localCopy)
+                            if let e = exportedURL { try? FileManager.default.removeItem(at: e) }
+
+                            return PostMedia(
+                                id: mId, url: urlStr, kind: .video, thumbURL: nil,
+                                width: nil, height: nil, duration: nil,
+                                order: pickedImages.count + vIdx
+                            )
+                        }
+                    }
+
+
+                    for try await item in group {
+                        if let m = item { uploaded.append(m) }
+                    }
+                }
+
+                // 2) Compose payload
                 var payload: [String: Any] = [
                     "id": postId,
-                    "text": newPostText.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "text": caption.trimmingCharacters(in: .whitespacesAndNewlines),
                     "timestamp": now,
                     "userId": uid
                 ]
-                if let murl = mediaURLString { payload["mediaURL"] = murl }
-                if let mtype = mediaTypeString { payload["mediaType"] = mtype }
-                
+
+                if !uploaded.isEmpty {
+                    var mediaMap: [String: Any] = [:]
+                    for m in uploaded {
+                        mediaMap[m.id] = [
+                            "id": m.id,
+                            "url": m.url,
+                            "kind": m.kind.rawValue,
+                            "thumbURL": m.thumbURL as Any,
+                            "width": m.width as Any,
+                            "height": m.height as Any,
+                            "duration": m.duration as Any,
+                            "order": m.order
+                        ]
+                    }
+                    payload["media"] = mediaMap
+
+                    // legacy single-media (only if exactly one)
+                    if uploaded.count == 1 {
+                        payload["mediaURL"] = uploaded[0].url
+                        payload["mediaType"] = uploaded[0].kind.rawValue
+                    }
+                }
+
+                // 3) Write once
                 let ref = Database.database().reference().child("posts").child(postId)
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     ref.setValue(payload) { error, _ in
@@ -1296,56 +1712,66 @@ struct GossipTabView: View {
                         cont.resume(returning: ())
                     }
                 }
-                
+
+                // 4) Update UI
                 await MainActor.run {
-                    let newItem = UserPost(
+                    var newItem = UserPost(
                         id: postId,
                         text: payload["text"] as? String ?? "",
                         timestamp: now,
-                        userId: uid,
-                        mediaURL: mediaURLString,
-                        mediaType: mediaTypeString
+                        userId: uid
                     )
+                    newItem.media = uploaded.sorted { $0.order < $1.order }
+                    if uploaded.count == 1 {
+                        newItem.mediaURL = uploaded[0].url
+                        newItem.mediaType = uploaded[0].kind.rawValue
+                    }
+
                     userPosts.insert(newItem, at: 0)
+                    savePostsCache()
                     mergeContent()
                     resetPaging()
-                    
+
                     newPostText = ""
-                    selectedImage = nil
-                    selectedVideoURL = nil
-                    selectedMediaType = nil
+                    clearComposerSelection()
                     editingPostId = nil
                     posting = false
                     isUploading = false
                     composerFocused = false
-                    composerVideoPlayer = nil
                 }
-                
+
             } catch {
                 await MainActor.run {
                     posting = false
                     isUploading = false
                     composerFocused = false
-                    print("Post failed: \(error.localizedDescription)")
+                    let ns = error as NSError
+                    print("❌ Post failed [\(ns.domain):\(ns.code)] \(ns.localizedDescription) userInfo=\(ns.userInfo)")
+                    // You could also set a @State var errorBannerText and show it briefly in the UI.
                 }
             }
+
         }
     }
-    
+
     private func updatePost(_ id: String) {
         let ref = Database.database().reference().child("posts").child(id)
         ref.updateChildValues(["text": newPostText]) { _, _ in
             resetPostFields()
         }
     }
-    
+
     private func deletePost(_ post: UserPost) {
         Database.database().reference()
             .child("posts").child(post.id)
-            .removeValue { _, _ in fetchUserPosts() }
+            .removeValue { _, _ in fetchUserPostsFast(limit: 180) }
     }
-    
+
     private func postComment(to post: UserPost) {
+        guard !ProfanityFilter.containsBanned(commentText) else {
+            print("Comment blocked: contains prohibited words.")
+            return
+        }
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference()
             .child("comments").child(post.id).childByAutoId()
@@ -1355,11 +1781,11 @@ struct GossipTabView: View {
             "timestamp": Date().timeIntervalSince1970
         ]) { _, _ in resetPostFields() }
     }
-    
+
     private func toggleLike(for id: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let r = Database.database().reference().child("likes").child(id).child(uid)
-        
+
         // Optimistic UI
         if let idx = userPosts.firstIndex(where: { $0.id == id }) {
             let already = userPosts[idx].isLikedByCurrentUser
@@ -1367,59 +1793,55 @@ struct GossipTabView: View {
             userPosts[idx].likeCount = max(0, userPosts[idx].likeCount + (already ? -1 : 1))
             mergeContent()
         }
-        
+
         r.observeSingleEvent(of: .value) { snap in
             if snap.exists() { r.removeValue() }
             else { r.setValue(true) }
         }
     }
-    
+
     private func toggleRepost(for id: String) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("reposts").child(id).child(uid)
-        
-        // Optimistic UI
+
         if let idx = userPosts.firstIndex(where: { $0.id == id }) {
             let already = userPosts[idx].hasRepostedByCurrentUser
             userPosts[idx].hasRepostedByCurrentUser.toggle()
             userPosts[idx].repostCount = max(0, userPosts[idx].repostCount + (already ? -1 : 1))
             mergeContent()
         }
-        
+
         ref.observeSingleEvent(of: .value) { snap in
             if snap.exists() { ref.removeValue() } else { ref.setValue(true) }
         }
     }
-    
+
     private func presentQuoteComposer(for post: UserPost) {
         composerFocused = true
         let prefix = newPostText.isEmpty ? "" : (newPostText + "\n")
         newPostText = "\(prefix)\"\(post.text)\" #quote"
         editingPostId = nil
     }
-    
+
     private func sharePost(_ post: UserPost) {
         guard let root = UIApplication.shared.windows.first?.rootViewController else { return }
         root.present(UIActivityViewController(activityItems: [post.text], applicationActivities: nil), animated: true)
     }
-    
+
     private func resetPostFields() {
         newPostText = ""
-        selectedImage = nil
-        selectedVideoURL = nil
-        selectedMediaType = nil
+        clearComposerSelection()
         editingPostId = nil
-        composerVideoPlayer = nil
-        fetchUserPosts()
+        fetchUserPostsFast(limit: 180)
     }
-    
+
     // ===============================================
     // MARK: Text with Tappable Hashtags
     // ===============================================
     struct TextWithHashtagsView: View {
         let text: String
         let onHashtagTap: (String) -> Void
-        
+
         var body: some View {
             let words = text.split(separator: " ")
             WrapHStack(spacing: 4) {
@@ -1437,7 +1859,7 @@ struct GossipTabView: View {
             }
         }
     }
-    
+
     struct WrapHStack<Content: View>: View {
         let spacing: CGFloat
         let content: () -> Content
@@ -1449,14 +1871,80 @@ struct GossipTabView: View {
             VStack(alignment: .leading, spacing: spacing) { content() }
         }
     }
-    
+
+    // ===============================================
+    // MARK: NEW: Media gallery (grid/pager)
+    // ===============================================
+    struct MediaGalleryView: View {
+        let media: [PostMedia]
+
+        var body: some View {
+            if media.isEmpty {
+                EmptyView()
+            } else if media.count == 1 {
+                Single(media: media[0])
+            } else if media.allSatisfy({ $0.kind == .image }) && media.count <= 4 {
+                ImageGrid(media: media)
+            } else {
+                Pager(media: media)
+            }
+        }
+
+        @ViewBuilder
+        private func Single(media: PostMedia) -> some View {
+            if media.kind == .video, let url = URL(string: media.url) {
+                DynamicVideoPlayer(url: url).cornerRadius(10)
+            } else if let url = URL(string: media.url) {
+                DynamicAsyncImageView(url: url, cornerRadius: 10)
+            }
+        }
+
+        private struct ImageGrid: View {
+            let media: [PostMedia]
+            var body: some View {
+                let cols = [GridItem(.flexible()), GridItem(.flexible())]
+                LazyVGrid(columns: cols, spacing: 8) {
+                    ForEach(media) { m in
+                        if let url = URL(string: m.url) {
+                            DynamicAsyncImageView(url: url, cornerRadius: 10)
+                                .frame(minHeight: 120)
+                        }
+                    }
+                }
+            }
+        }
+
+        private struct Pager: View {
+            let media: [PostMedia]
+            @State private var page: Int = 0
+            var body: some View {
+                TabView(selection: $page) {
+                    ForEach(Array(media.enumerated()), id: \.offset) { idx, m in
+                        Group {
+                            if m.kind == .video, let url = URL(string: m.url) {
+                                DynamicVideoPlayer(url: url)
+                            } else if let url = URL(string: m.url) {
+                                DynamicAsyncImageView(url: url, cornerRadius: 10)
+                            }
+                        }
+                        .tag(idx)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .padding(.horizontal, -2)
+                    }
+                }
+                .frame(height: 280)
+                .tabViewStyle(.page(indexDisplayMode: .automatic))
+            }
+        }
+    }
+
     // ===============================================
     // MARK: Throttler
     // ===============================================
     private final class Throttler {
         private var workItems: [String: DispatchWorkItem] = [:]
         private let queue = DispatchQueue(label: "Gossip.Throttler", qos: .userInitiated)
-        
+
         func throttle(_ key: String, interval: TimeInterval, action: @escaping () -> Void) {
             guard workItems[key] == nil else { return }
             let item = DispatchWorkItem { [weak self] in
@@ -1467,36 +1955,35 @@ struct GossipTabView: View {
             queue.asyncAfter(deadline: .now() + interval, execute: item)
         }
     }
-    
+
     // ===============================================
-    // MARK: RSS Card using server thumb
+    // MARK: RSS Card – uses DynamicAsyncImageView from mediahandling.swift
     // ===============================================
     struct GossipRSSCardView: View {
         let article: GossipArticle
         @Binding var selectedURL: URL?
         @Binding var showWebView: Bool
-        
+
         var body: some View {
             VStack(alignment: .leading, spacing: 8) {
-                
-                if let thumb = article.thumbURL?.absoluteString, !thumb.isEmpty {
-                    DynamicAsyncImageView(url: URL(string: thumb)!, cornerRadius: 12)
+                if let thumb = article.thumbURL?.absoluteString, !thumb.isEmpty, let url = URL(string: thumb) {
+                    DynamicAsyncImageView(url: url, cornerRadius: 12)
                 } else if let img = article.imageURL {
                     DynamicAsyncImageView(url: img, cornerRadius: 12)
                 } else {
                     placeholderView
                 }
-                
+
                 Text(article.title)
                     .font(.headline)
                     .foregroundColor(.white)
                     .lineLimit(3)
-                
+
                 Text(article.description)
                     .font(.subheadline)
                     .foregroundColor(.white.opacity(0.8))
                     .lineLimit(3)
-                
+
                 HStack(spacing: 16) {
                     Button {
                         if let url = URL(string: article.link) {
@@ -1507,11 +1994,9 @@ struct GossipTabView: View {
                         Label("Open", systemImage: "safari")
                     }
                     .foregroundColor(.blue)
-                    
+
                     Button {
-                        if let url = URL(string: article.link) {
-                            presentShare(url: url)
-                        }
+                        if let url = URL(string: article.link) { presentShare(url: url) }
                     } label: {
                         Label("Share", systemImage: "square.and.arrow.up")
                     }
@@ -1523,13 +2008,13 @@ struct GossipTabView: View {
             .background(Color.white.opacity(0.06))
             .cornerRadius(14)
         }
-        
+
         private var placeholderView: some View {
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.gray.opacity(0.2))
                 .frame(maxWidth: .infinity, minHeight: 120)
         }
-        
+
         private func presentShare(url: URL) {
             let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
             if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
@@ -1538,201 +2023,7 @@ struct GossipTabView: View {
             }
         }
     }
-    
-    // ===============================================
-    // MARK: Dynamic media helpers (self-contained)
-    // ===============================================
-    struct DynamicAsyncImageView: View {
-        let url: URL
-        var cornerRadius: CGFloat = 10
-        
-        @State private var uiImage: UIImage?
-        @State private var aspect: CGFloat = 16.0/9.0
-        
-        var body: some View {
-            ZStack {
-                if let img = uiImage {
-                    GeometryReader { geo in
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: geo.size.width, height: geo.size.width / aspect)
-                            .clipped()
-                    }
-                    .frame(height: UIScreen.main.bounds.width / aspect * 0.9) // responsive
-                } else {
-                    RoundedRectangle(cornerRadius: cornerRadius)
-                        .fill(Color.gray.opacity(0.2))
-                        .frame(height: 180)
-                        .overlay(ProgressView())
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
-            .task(id: url.absoluteString) {
-                ImageStore.shared.load(from: url, key: url.absoluteString) { img in
-                    if let img = img {
-                        uiImage = img
-                        let w = img.size.width, h = img.size.height
-                        if w > 0 && h > 0 { aspect = max(0.5, min(2.0, w/h)) } // clamp aspect
-                    }
-                }
-            }
-        }
-    }
-    
-    
-    // ===============================================
-    // MARK: - X-style inline video (autoplay muted, pause off-screen, native aspect)
-    // ===============================================
-    
-    final class GossipVideoPlaybackCenter: ObservableObject {
-        static let shared = GossipVideoPlaybackCenter()
-        @Published var currentlyPlaying: UUID?
-        private init() {}
-    }
-    
-    private struct FramePrefKey: PreferenceKey {
-        static var defaultValue: CGRect = .zero
-        static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
-    }
-    
-    struct VisibilityReader: View {
-        var onChange: (CGFloat) -> Void
-        init(_ onChange: @escaping (CGFloat) -> Void) { self.onChange = onChange }
-        
-        var body: some View {
-            GeometryReader { proxy in
-                Color.clear
-                    .preference(key: FramePrefKey.self, value: proxy.frame(in: .global))
-            }
-            .onPreferenceChange(FramePrefKey.self) { frame in
-                let screen = UIScreen.main.bounds
-                let intersection = frame.intersection(screen)
-                let ratio = max(0, min(1, intersection.height / max(1, frame.height)))
-                onChange(ratio) // 0.0 ... 1.0
-            }
-        }
-    }
-    
-    struct DynamicVideoPlayer: View {
-        let url: URL
-        
-        @State private var id = UUID()
-        @State private var player: AVPlayer?
-        @State private var aspect: CGFloat = 16.0 / 9.0 // updated once we inspect the asset
-        @State private var isMuted: Bool = true
-        @State private var endObserver: NSObjectProtocol?
-        
-        @ObservedObject private var center = GossipVideoPlaybackCenter.shared
-        
-        var body: some View {
-            // Reserve height up-front so layout is stable before the asset loads
-            let reservedHeight = calculatedHeightForCurrentAspect()
-            ZStack(alignment: .bottomTrailing) {
-                if let p = player {
-                    GeometryReader { geo in
-                        VideoPlayer(player: p)
-                            .frame(
-                                width: geo.size.width,
-                                height: clampedHeight(forWidth: geo.size.width)
-                            )
-                            .clipped()
-                            .cornerRadius(12)
-                        // If another cell claims "currently playing", pause this one.
-                            .onChange(of: center.currentlyPlaying) { newValue in
-                                guard let current = newValue else { return }
-                                if current != id { p.pause() }
-                            }
-                    }
-                    // Mute toggle (X autoplays muted; tap to un/mute)
-                    Button {
-                        isMuted.toggle()
-                        player?.isMuted = isMuted
-                    } label: {
-                        Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .padding(8)
-                            .background(Color.black.opacity(0.55))
-                            .clipShape(Circle())
-                    }
-                    .padding(10)
-                    .accessibilityLabel(isMuted ? "Unmute video" : "Mute video")
-                    
-                } else {
-                    // Placeholder while preparing the player
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.gray.opacity(0.2))
-                        .frame(height: reservedHeight)
-                        .overlay(ProgressView())
-                }
-            }
-            .frame(height: reservedHeight) // ensures stable list layout
-            .background(
-                // Visibility detector: play when >= ~55% visible, pause when <= ~30% visible
-                VisibilityReader { visible in
-                    guard let p = player else { return }
-                    if visible >= 0.55 {
-                        if center.currentlyPlaying != id {
-                            center.currentlyPlaying = id // claim focus so others pause
-                        }
-                        p.play()
-                    } else if visible <= 0.30 {
-                        p.pause()
-                    }
-                }
-            )
-            .onAppear { preparePlayer() }
-            .onDisappear {
-                player?.pause()
-                if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-            }
-        }
-        
-        private func preparePlayer() {
-            guard player == nil else { return }
-            
-            let asset = AVURLAsset(url: url)
-            
-            // Best-effort natural aspect using the first video track
-            if let track = asset.tracks(withMediaType: .video).first {
-                let size = track.naturalSize.applying(track.preferredTransform)
-                let w = abs(size.width), h = abs(size.height)
-                if w > 0 && h > 0 { aspect = max(0.2, min(5.0, w / h)) } // clamp to avoid extremes
-            }
-            
-            let p = AVPlayer(url: url)
-            p.isMuted = true  // X: autoplay muted
-            p.actionAtItemEnd = .pause
-            
-            // Loop inline like X (only if this cell still owns focus)
-            endObserver = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime,
-                object: p.currentItem,
-                queue: .main
-            ) { _ in
-                p.seek(to: .zero)
-                if GossipVideoPlaybackCenter.shared.currentlyPlaying == id {
-                    p.play()
-                }
-            }
-            
-            player = p
-        }
-        
-        private func calculatedHeightForCurrentAspect() -> CGFloat {
-            // matches your feed's .padding(.horizontal, 12) => width ≈ screen - 24
-            let width = UIScreen.main.bounds.width - 24
-            return clampedHeight(forWidth: width)
-        }
-        
-        private func clampedHeight(forWidth width: CGFloat) -> CGFloat {
-            // Native aspect like X: portrait/square get more height, landscape is shorter.
-            let h = width / max(0.01, aspect)
-            // Keep within sensible bounds for timeline readability
-            return max(160, min(h, 600))
-        }
-    }
-    
+/*
     // ===============================================
     // MARK: WebView
     // ===============================================
@@ -1755,33 +2046,23 @@ struct GossipTabView: View {
             webView.load(req)
         }
     }
-    /*
-     // ===============================================
-     // MARK: Notification name used by LiveCapture
-     // ===============================================
-     extension Notification.Name {
-     static let inviteOrbCapturedMedia = Notification.Name("inviteOrbCapturedMedia")
-     }
-     */
-    
-    // Drop this in GossipTabView.swift (or a related file)
-    
-    
+*/
+    // ===============================================
+    // MARK: IG-Style Composer Sheet
+    // ===============================================
     struct IGStylePostComposer: View {
         let image: UIImage?
         let videoURL: URL?
         let filterName: String
-        
+
         @State private var caption: String = ""
         @State private var isPosting = false
         @State private var progress: Double = 0
-        
-        // Inject your uploader if you want resumable uploads here too.
+
         var onPost: (_ caption: String, _ mediaURL: URL?, _ image: UIImage?) -> Void
-        
+
         var body: some View {
             VStack(spacing: 14) {
-                // Media preview (image or video)
                 ZStack {
                     if let img = image {
                         Image(uiImage: img)
@@ -1807,8 +2088,7 @@ struct GossipTabView: View {
                             .padding(8)
                     }
                 }
-                
-                // Caption box (IG-like)
+
                 TextField("Write a caption…", text: $caption, axis: .vertical)
                     .textFieldStyle(.plain)
                     .padding(12)
@@ -1819,29 +2099,25 @@ struct GossipTabView: View {
                     )
                     .foregroundColor(.white)
                     .lineLimit(3...6)
-                
-                // (Optional) quick chips
+
                 HStack(spacing: 8) {
                     Label("Tag friends", systemImage: "person.crop.circle.badge.plus")
                     Label("Add location", systemImage: "mappin.and.ellipse")
                     Label("Advanced", systemImage: "slider.horizontal.3")
                 }
                 .font(.caption).foregroundColor(.white.opacity(0.8))
-                
+
                 Spacer()
-                
+
                 Button {
                     guard !isPosting else { return }
                     isPosting = true
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    // Optimistic insert: emit your usual “create post” action immediately;
-                    // your upload can run in background (wire progress if you like).
                     onPost(caption, videoURL, image)
                 } label: {
                     HStack {
                         if isPosting { ProgressView(value: progress).progressViewStyle(.linear).frame(width: 20) }
-                        Text(isPosting ? "Posting…" : "Post")
-                            .bold()
+                        Text(isPosting ? "Posting…" : "Post").bold()
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
@@ -1861,4 +2137,199 @@ struct GossipTabView: View {
             .navigationBarTitleDisplayMode(.inline)
         }
     }
+
+    // ===============================================
+    // MARK: NEW: Composer Selected Preview (grid/pager like Twitter)
+    // ===============================================
+    struct ComposerSelectedPreview: View {
+        let images: [UIImage]
+        let videos: [URL]
+
+        var body: some View {
+            let total = images.count + videos.count
+            Group {
+                if total == 1 {
+                    oneUp
+                } else if total == 2 {
+                    twoUp
+                } else if total == 3 {
+                    threeUp
+                } else {
+                    fourUp // 4+ shows first 4
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+
+        private var oneUp: some View {
+            ZStack {
+                if let img = images.first {
+                    Image(uiImage: img).resizable().scaledToFill()
+                } else if let v = videos.first {
+                    VideoPlayer(player: AVPlayer(url: v))
+                }
+            }
+            .frame(height: 240).clipped()
+        }
+
+        private var twoUp: some View {
+            HStack(spacing: 6) {
+                thumb(0).frame(height: 200).clipped()
+                thumb(1).frame(height: 200).clipped()
+            }
+        }
+
+        private var threeUp: some View {
+            HStack(spacing: 6) {
+                thumb(0).frame(width: UIScreen.main.bounds.width * 0.5 - 24, height: 220).clipped()
+                VStack(spacing: 6) {
+                    thumb(1).frame(height: 107).clipped()
+                    thumb(2).frame(height: 107).clipped()
+                }
+            }
+        }
+
+        private var fourUp: some View {
+            let w = UIScreen.main.bounds.width
+            let cellH = 100.0
+            return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                thumb(0).frame(height: cellH).clipped()
+                thumb(1).frame(height: cellH).clipped()
+                thumb(2).frame(height: cellH).clipped()
+                thumb(3).frame(height: cellH).clipped()
+            }
+        }
+
+        @ViewBuilder
+        private func thumb(_ idx: Int) -> some View {
+            let seq = images.map { Either.img($0) } + videos.map { Either.vid($0) }
+            let item = seq.indices.contains(idx) ? seq[idx] : nil
+            switch item {
+            case .img(let ui):
+                Image(uiImage: ui).resizable().scaledToFill()
+            case .vid(let url):
+                ZStack {
+                    Rectangle().fill(Color.white.opacity(0.06))
+                    Image(systemName: "play.fill").font(.title2).foregroundColor(.white)
+                    // poster frame generation could be added later if needed
+                    VideoPlayer(player: AVPlayer(url: url)).opacity(0.0001) // keep simple; poster not required
+                }
+            case .none:
+                EmptyView()
+            }
+        }
+
+        private enum Either { case img(UIImage), vid(URL) }
+    }
+
+    // ===============================================
+    // MARK: NEW: System Multi Media Picker (Photos picker)
+// ===============================================
+    struct SystemMultiMediaPicker: UIViewControllerRepresentable {
+        let selectionLimit: Int
+        var onComplete: (_ images: [UIImage], _ videos: [URL]) -> Void
+
+        func makeUIViewController(context: Context) -> PHPickerViewController {
+            var cfg = PHPickerConfiguration(photoLibrary: .shared())
+            cfg.selectionLimit = selectionLimit
+            cfg.filter = .any(of: [.images, .videos])
+            cfg.preferredAssetRepresentationMode = .automatic
+            let vc = PHPickerViewController(configuration: cfg)
+            vc.delegate = context.coordinator
+            return vc
+        }
+
+        func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+        func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+        final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+            let parent: SystemMultiMediaPicker
+            init(_ parent: SystemMultiMediaPicker) { self.parent = parent }
+
+            func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+                picker.dismiss(animated: true)
+                guard !results.isEmpty else {
+                    parent.onComplete([], [])
+                    return
+                }
+
+                let group = DispatchGroup()
+                var images: [UIImage] = []
+                var videos: [URL] = []
+
+                for item in results {
+                    let provider = item.itemProvider
+
+                    if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                        group.enter()
+                        provider.loadObject(ofClass: UIImage.self) { obj, _ in
+                            defer { group.leave() }
+                            if let img = obj as? UIImage { images.append(img) }
+                        }
+                    } else if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                        group.enter()
+                        provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                            defer { group.leave() }
+                            guard let srcURL = url else { return }
+                            // copy to temp we control
+                            let tmp = FileManager.default.temporaryDirectory
+                                .appendingPathComponent(UUID().uuidString)
+                                .appendingPathExtension("mp4")
+                            do {
+                                if FileManager.default.fileExists(atPath: tmp.path) { try? FileManager.default.removeItem(at: tmp) }
+                                try FileManager.default.copyItem(at: srcURL, to: tmp)
+                                videos.append(tmp)
+                            } catch { }
+                        }
+                    }
+                }
+
+                group.notify(queue: .main) {
+                    // Trim to selectionLimit total, like X (max 4)
+                    var imgs = images
+                    var vids = videos
+                    let total = imgs.count + vids.count
+                    if total > self.parent.selectionLimit {
+                        // prefer keeping earlier items
+                        let over = total - self.parent.selectionLimit
+                        if vids.count >= over {
+                            vids = Array(vids.prefix(vids.count - over))
+                        } else {
+                            let remain = over - vids.count
+                            vids = []
+                            imgs = Array(imgs.prefix(max(0, imgs.count - remain)))
+                        }
+                    }
+                    self.parent.onComplete(imgs, vids)
+                }
+            }
+        }
+    }
+}
+
+/*
+// ===============================================
+// MARK: Notification used by LiveCapture
+// ===============================================
+extension Notification.Name {
+    static let inviteOrbCapturedMedia = Notification.Name("inviteOrbCapturedMedia")
+}
+*/
+extension View {
+    @ViewBuilder
+    func applySheetStyle() -> some View {
+        if #available(iOS 16.0, *) {
+            self
+                .presentationDetents([.large])        // or [.medium, .large]
+                .presentationDragIndicator(.visible)  // shows the native pull-down bar
+                .interactiveDismissDisabled(false)    // keep swipe-to-dismiss enabled
+        } else {
+            self
+        }
+    }
+}
+
+extension URL: Identifiable {
+    public var id: String { absoluteString }
 }

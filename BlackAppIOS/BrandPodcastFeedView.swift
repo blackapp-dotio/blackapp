@@ -4,11 +4,63 @@ import FirebaseDatabase
 import FirebaseAuth
 import AVKit
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // keep if you rewrote /checkout → /checkout.html
+
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String? = nil,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 struct BrandPodcastFeedView: View {
     var brand: BrandModel
     @State private var episodes: [PodcastEpisode] = []
     @State private var isLoading = true
     @State private var purchasedEpisodeIds: Set<String> = []
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         ScrollView {
@@ -17,7 +69,8 @@ struct BrandPodcastFeedView: View {
                     PodcastEpisodeCard(
                         episode: ep,
                         hasPurchased: purchasedEpisodeIds.contains(ep.id),
-                        brandOwnerId: brand.ownerId
+                        brandOwnerId: brand.ownerId,
+                        onPurchase: { openCheckout(for: ep) }
                     )
                     .padding(.horizontal)
                 }
@@ -42,6 +95,30 @@ struct BrandPodcastFeedView: View {
             fetchPodcastEpisodes()
             fetchPurchasedEpisodes()
         }
+    }
+
+    // MARK: - Checkout
+
+    private func openCheckout(for ep: PodcastEpisode) {
+        // require login like your original flow; remove this guard to allow guest checkout
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let url = Checkout.url(
+            tool: "podcast",
+            brandId: brand.id,
+            itemId: ep.id,
+            title: ep.title,
+            price: ep.price,
+            currency: "USD",
+            imagePath: nil,
+            userId: uid,
+            allowQty: false,
+            minQty: 1,
+            maxQty: 1,
+            returnUrl: "blackappios://done"
+            // clientTokenUrl: "https://blackapp.io/api/client_token",
+            // chargeUrl: "https://blackapp.io/api/charge_braintree"
+        )
+        if let url { openURL(url) }
     }
 
     // MARK: - Fetchers with fallbacks
@@ -81,14 +158,18 @@ struct BrandPodcastFeedView: View {
     }
 
     func fetchPurchasedEpisodes() {
+        // Updated to universal checkout schema:
+        // purchases/{uid}/{purchaseId} with fields { tool, itemId, ... }
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("purchases").child(uid)
         ref.observeSingleEvent(of: .value) { snapshot in
             var ids = Set<String>()
             for case let child as DataSnapshot in snapshot.children {
                 if let val = child.value as? [String: Any],
-                   val["type"] as? String == "podcast" {
-                    ids.insert(child.key)
+                   let tool = val["tool"] as? String,
+                   let itemId = val["itemId"] as? String,
+                   tool == "podcast" {
+                    ids.insert(itemId)
                 }
             }
             self.purchasedEpisodeIds = ids
@@ -126,6 +207,7 @@ struct PodcastEpisodeCard: View {
     let episode: PodcastEpisode
     let hasPurchased: Bool
     let brandOwnerId: String
+    var onPurchase: () -> Void
 
     @State private var isPlaying = false
     @State private var player: AVPlayer?
@@ -156,18 +238,7 @@ struct PodcastEpisodeCard: View {
             HStack {
                 Spacer()
                 if episode.isPremium && !hasPurchased {
-                    Button {
-                        guard let uid = Auth.auth().currentUser?.uid else { return }
-                        PurchaseManager.shared.startCheckout(
-                            buyerId: uid,
-                            sellerId: brandOwnerId,
-                            basePrice: episode.price,
-                            itemType: "podcast",
-                            itemId: episode.id,
-                            itemTitle: episode.title,
-                            itemImageURL: nil
-                        )
-                    } label: {
+                    Button(action: onPurchase) {
                         Label("Buy to Listen - $\(String(format: "%.2f", episode.price))", systemImage: "cart.fill")
                             .padding(.horizontal)
                             .padding(.vertical, 10)

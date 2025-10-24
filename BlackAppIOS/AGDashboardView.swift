@@ -29,6 +29,10 @@ struct AGDashboardView: View {
     @State private var manageTarget: NightlifeApplication?
     @State private var actionBusy = false
     @State private var actionError: String?
+    
+    // ===== Platform fee (single source of truth) =====
+    private let PLATFORM_FEE_RATE: Double = 0.05
+    private var platformFeePercentLabel: String { "\(Int(PLATFORM_FEE_RATE * 100))%" }
 
     struct MonthlyRevenue: Identifiable {
         let id = UUID()
@@ -378,7 +382,7 @@ struct AGDashboardView: View {
                 Text("🟢 Event Ticket Sales")
                     .bold()
                 Text("• Gross Revenue: $\(revenueStats.total)")
-                Text("• Platform Fee (2%): $\(revenueStats.platformEarnings)")
+                Text("• Platform Fee (\(platformFeePercentLabel)): $\(revenueStats.platformEarnings)")
                 Text("• Net to Sellers: $\(revenueStats.total - revenueStats.platformEarnings)")
             }
             .font(.caption)
@@ -392,6 +396,7 @@ struct AGDashboardView: View {
         }
         .padding(.top, 4)
     }
+
 
     private var revenueChartSection: some View {
         VStack(alignment: .leading) {
@@ -800,21 +805,21 @@ struct AGDashboardView: View {
                 chartData.append(MonthlyRevenue(month: name, value: value))
             }
 
-            let platformEarnings = runningTotal * 0.02
+            let platformEarnings = runningTotal * PLATFORM_FEE_RATE
 
             DispatchQueue.main.async {
                 self.monthlyBreakdown = chartData
-                // Live update top-line too so dashboard reflects DB changes immediately
+                // Live update top-line to reflect DB changes immediately
                 self.revenueStats = RevenueStats(
                     monthly: 0,
                     total: runningTotal,
                     platformEarnings: platformEarnings
                 )
-                // Debug
-                print("📊 Live revenue: total=\(runningTotal), fee=\(platformEarnings)")
+                print("📊 Live revenue: total=\(runningTotal), fee(\(platformFeePercentLabel))=\(platformEarnings)")
             }
         }
     }
+
 
 
     // MARK: - Suspend User

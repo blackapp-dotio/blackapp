@@ -196,7 +196,7 @@ struct SearchView: View {
                                             Button {
                                                 selectedUser = user
                                                 showUserPreview = true
-                                                log("Preview user tapped: \(user.id) @\(user.username)")
+                                                print("🔍 [Search] Preview user tapped: \(user.id) @\(user.username)")
                                             } label: { UserRow(user: user) }
                                             .buttonStyle(.plain)
                                             Divider().background(Color(.separator))
@@ -305,7 +305,6 @@ struct SearchView: View {
             if usedCache { sourceNote = "Cached"; isLoading = false }
         }
         
-        // inside runSuggestiveSearch(force:)
         isLoading = true; loadError = nil
         
         do {
@@ -341,7 +340,6 @@ struct SearchView: View {
     }
 
     // ---- Users: wrapper that tries Firestore then RTDB (case-insensitive)
-    // Try Firestore then RTDB; return [] if nothing
     private func searchUsersPrefix(q: String, limit: Int) async -> [UserProfile] {
         if let fs = try? await searchFirestorePrefix(q: q, limit: limit), !fs.isEmpty {
             return fs
@@ -350,7 +348,6 @@ struct SearchView: View {
         return rtdb
     }
 
-    // Firestore: now returns [UserProfile] (possibly empty)
     private func searchFirestorePrefix(q: String, limit: Int) async throws -> [UserProfile] {
         let db = Firestore.firestore()
         let needle = q.lowercased()
@@ -435,7 +432,6 @@ struct SearchView: View {
         }.prefix(limit).map { $0 }
     }
 
-    // RTDB: now returns [UserProfile] (possibly empty)
     private func searchRTDBPrefix(q: String, limit: UInt) async -> [UserProfile] {
         let ref = Database.database().reference(withPath: "users")
         let needle = q.lowercased()
@@ -550,7 +546,7 @@ struct SearchView: View {
     private func observeRTDBConnectivity() {
         let infoRef = Database.database().reference(withPath: ".info/connected")
         infoRef.observe(.value) { snap in
-            if let connected = snap.value as? Bool { log("RTDB connected=\(connected)") }
+            if let connected = snap.value as? Bool { print("🔍 [Search] RTDB connected=\(connected)") }
         }
     }
 
@@ -604,7 +600,7 @@ struct SearchView: View {
             batch.setData(stamp, forDocument: bRef, merge: true)
             try await batch.commit()
         } catch {
-            log("❌ ensurePendingContactsInFirestore error: \(error.localizedDescription)")
+            print("❌ ensurePendingContactsInFirestore error: \(error.localizedDescription)")
         }
     }
 
@@ -627,7 +623,7 @@ struct SearchView: View {
                 "userA": me, "userB": other
             ])
         } catch {
-            log("❌ ensureDirectChatDoc error: \(error.localizedDescription)")
+            print("❌ ensureDirectChatDoc error: \(error.localizedDescription)")
         }
     }
 
@@ -675,7 +671,7 @@ struct SearchView: View {
         do {
             try await incomingRef.setData(payloadIncoming, merge: true)
             try await outgoingRef.setData(payloadOutgoing, merge: true)
-        } catch { log("❌ dmRequests write failed: \(error)") }
+        } catch { print("❌ dmRequests write failed: \(error)") }
     }
 }
 
@@ -765,47 +761,583 @@ private struct HashtagRow: View {
     }
 }
 
-// Verbose, fast user preview
+// =====================================================
+// User preview + moderation + recent + brands + star power
+// =====================================================
+
 private struct UserPreviewSheet: View {
     let user: UserProfile
     var onMessage: () -> Void
+
+    @State private var isReporting = false
+    @State private var isBlocking  = false
+
+    // Five recent media
+    @State private var recentThumbs: [URL] = []
+    @State private var loadingRecent = true
+    @State private var recentError: String? = nil
+
     var body: some View {
         VStack(spacing: 16) {
-            CachedAvatar(urlString: user.profileImageURL)
-                .frame(width: 100, height: 100)
-                .clipShape(Circle())
-            VStack(spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(user.name).font(.title2).bold().foregroundColor(.white)
-                    LivePreviewStarBadgeArea(userId: user.id, initial: user.circleSize ?? 0)
+            // Header: avatar + identity + quick actions
+            HStack(alignment: .center, spacing: 12) {
+                CachedAvatar(urlString: user.profileImageURL)
+                    .frame(width: 72, height: 72)
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(user.name)
+                            .font(.title3).bold()
+                            .foregroundColor(.white)
+                        // Live badge near the name
+                        LivePreviewStarBadgeArea(userId: user.id, initial: user.circleSize ?? 0)
+                    }
+                    Text("@\(user.username)")
+                        .foregroundColor(.gray)
+                        .font(.subheadline)
                 }
-                Text("@\(user.username)").foregroundColor(.gray)
+
+                Spacer()
+
+                // Moderation + Message icons
+                HStack(spacing: 12) {
+                    Button { isReporting = true } label: {
+                        Image(systemName: "flag.fill")
+                            .font(.title3)
+                            .foregroundColor(.orange)
+                            .accessibilityLabel("Report user")
+                    }
+                    Button { isBlocking = true } label: {
+                        Image(systemName: "hand.raised.fill")
+                            .font(.title3)
+                            .foregroundColor(.red)
+                            .accessibilityLabel("Block user")
+                    }
+                    Button(action: onMessage) {
+                        Image(systemName: "paperplane.fill")
+                            .font(.title3)
+                            .foregroundColor(.blue)
+                            .accessibilityLabel("Message user")
+                    }
+                }
             }
+            .padding(.horizontal)
+
+            // Bio (optional)
             if !user.bio.trimmedLower().isEmpty {
-                Text(user.bio).multilineTextAlignment(.center).foregroundColor(.white).padding(.horizontal)
+                Text(user.bio)
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
             }
+
+            // Star Power: level 0 = white, then rainbow with current highlighted
+            StarPowerBarView(currentLevel: max(0, user.circleSize ?? 0))
+                .padding(.horizontal)
+
+            // Brands (auto-fetch)
             UserBrandsStrip(userId: user.id)
-            Button(action: onMessage) {
-                HStack { Image(systemName: "paperplane.fill"); Text("Message") }
-                    .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(Color.blue).cornerRadius(12).foregroundColor(.white)
+
+            // Recent media strip (up to 5)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Recent")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                    Spacer()
+                }
+                .padding(.horizontal)
+
+                if loadingRecent {
+                    ProgressView().padding(.horizontal)
+                } else if let err = recentError {
+                    Text(err).foregroundColor(.gray).font(.caption).padding(.horizontal)
+                } else if recentThumbs.isEmpty {
+                    Text("No recent posts").foregroundColor(.gray).font(.caption).padding(.horizontal)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            ForEach(recentThumbs, id: \.absoluteString) { url in
+                                CachedSquare(url: url)
+                                    .frame(width: 110, height: 110)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                        .padding(.horizontal)
+                        .padding(.top, 4)
+                    }
+                }
             }
-            .padding(.top, 8)
+
             Spacer()
         }
-        .padding(.top, 24)
+        .padding(.top, 20)
         .background(Color.black.ignoresSafeArea())
         .preferredColorScheme(.dark)
+        .onAppear { Task { await loadRecentFiveNoIndex() } }
+
+        // Moderation flows
+        .confirmationDialog("Report \(user.name)?", isPresented: $isReporting, titleVisibility: .visible) {
+            Button("Report for inappropriate content", role: .destructive) {
+                Task { await reportUserProfile(userId: user.id, reason: "inappropriate") }
+            }
+            Button("Report for spam", role: .destructive) {
+                Task { await reportUserProfile(userId: user.id, reason: "spam") }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert("Block \(user.name)?", isPresented: $isBlocking) {
+            Button("Block", role: .destructive) { Task { await blockUser(userId: user.id) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They won’t be able to contact you or see your content.")
+        }
+    }
+
+    // MARK: - Recent (5) with NO composite index
+    private func loadRecentFiveNoIndex() async {
+        loadingRecent = true
+        recentError = nil
+        do {
+            if let urls = try await fetchRecentFSNoIndex(userId: user.id, need: 5), !urls.isEmpty {
+                await MainActor.run {
+                    self.recentThumbs = urls
+                    self.loadingRecent = false
+                }
+                return
+            }
+            let urls = await fetchRecentRTDBNoIndex(userId: user.id, need: 5)
+            await MainActor.run {
+                self.recentThumbs = urls
+                self.loadingRecent = false
+            }
+        } catch {
+            await MainActor.run {
+                self.recentError = error.localizedDescription
+                self.loadingRecent = false
+            }
+        }
+    }
+
+    /// Firestore: order-only (no composite index), then filter by userId on client.
+    private func fetchRecentFSNoIndex(userId: String, need: Int) async throws -> [URL]? {
+        let db = Firestore.firestore()
+        var found: [URL] = []
+        for size in [30, 60, 120, 240] {
+            let snap = try await db.collection("posts")
+                .order(by: "createdAt", descending: true)
+                .limit(to: size)
+                .getDocuments()
+
+            for doc in snap.documents {
+                guard let dUserId = doc.data()["userId"] as? String, dUserId == userId else { continue }
+                if let s = (doc.data()["thumbURL"] as? String)
+                    ?? (doc.data()["imageURL"] as? String)
+                    ?? (doc.data()["mediaURL"] as? String),
+                   let u = URL(string: s) {
+                    found.append(u)
+                    if found.count >= need { return Array(found.prefix(need)) }
+                }
+            }
+            if found.count >= need { break }
+        }
+        return found.isEmpty ? nil : Array(found.prefix(need))
+    }
+
+    /// RTDB fallback: read recent window and filter by userId locally.
+    private func fetchRecentRTDBNoIndex(userId: String, need: Int) async -> [URL] {
+        let ref = Database.database().reference(withPath: "posts")
+        let lastN: UInt = 300
+        return await withCheckedContinuation { cont in
+            ref.queryOrdered(byChild: "timestamp")
+                .queryLimited(toLast: lastN)
+                .observeSingleEvent(of: .value) { snap in
+                    var candidates: [(ts: TimeInterval, url: URL)] = []
+                    for case let cs as DataSnapshot in snap.children {
+                        guard let d = cs.value as? [String: Any] else { continue }
+                        guard (d["userId"] as? String) == userId else { continue }
+                        let ts = (d["timestamp"] as? TimeInterval) ?? 0
+                        if let s = (d["thumbURL"] as? String)
+                            ?? (d["imageURL"] as? String)
+                            ?? (d["mediaURL"] as? String),
+                           let u = URL(string: s) {
+                            candidates.append((ts, u))
+                        }
+                    }
+                    let top = candidates.sorted { $0.ts > $1.ts }.prefix(need).map { $0.url }
+                    cont.resume(returning: top)
+                }
+        }
+    }
+
+    // MARK: - Moderation actions
+
+    private func reportUserProfile(userId: String, reason: String) async {
+        guard let me = Auth.auth().currentUser?.uid else { return }
+        let db = Firestore.firestore()
+        let doc = db.collection("reports").document()
+        let payload: [String: Any] = [
+            "type": "profile",
+            "reportedUserId": userId,
+            "reason": reason,
+            "byUserId": me,
+            "createdAt": FieldValue.serverTimestamp(),
+            "status": "open"
+        ]
+        do { try await doc.setData(payload) } catch {
+            print("❌ reportUserProfile failed: \(error.localizedDescription)")
+        }
+    }
+
+    // Firestore + RTDB mirror for block / unblock
+    private func blockUser(userId: String) async {
+        guard let me = Auth.auth().currentUser?.uid else { return }
+        let db = Firestore.firestore()
+
+        // 1) Firestore
+        do {
+            try await db.collection("blocks")
+                .document(me)
+                .collection("blocked")
+                .document(userId)
+                .setData([
+                    "blockedAt": FieldValue.serverTimestamp(),
+                    "userId": userId
+                ], merge: true)
+        } catch {
+            print("❌ blockUser (Firestore) failed: \(error.localizedDescription)")
+        }
+
+        // 2) RTDB mirror
+        let r = Database.database().reference()
+            .child("blocks").child(me).child("blocked").child(userId)
+
+        await withCheckedContinuation { cont in
+            r.setValue([
+                "userId": userId,
+                "blockedAt": ServerValue.timestamp()
+            ]) { error, _ in
+                if let error = error {
+                    print("⚠️ RTDB block mirror failed: \(error.localizedDescription)")
+                }
+                cont.resume()
+            }
+        }
     }
 }
 
-// Hashtag preview
+// MARK: - UserBrandsStrip (auto-fetches; FS first, RTDB fallback)
+
+private struct UserBrandsStrip: View {
+    let userId: String
+
+    // Optional injected (kept for compatibility)
+    var brands: [BrandSummary] = []
+    var loading: Bool = false
+
+    @State private var liveBrands: [BrandSummary] = []
+    @State private var isLoading: Bool = true
+    @State private var loadError: String? = nil
+
+    init(userId: String, brands: [BrandSummary]? = nil, loading: Bool? = nil) {
+        self.userId = userId
+        if let b = brands { self.brands = b }
+        if let l = loading { self.loading = l }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Brands").font(.headline).foregroundColor(.white)
+                Spacer()
+            }
+
+            let useInjected = !brands.isEmpty || loading
+            let effectiveLoading = useInjected ? loading : isLoading
+            let effectiveBrands  = useInjected ? brands  : liveBrands
+
+            if effectiveLoading {
+                ProgressView().tint(.white.opacity(0.8))
+            } else if let err = loadError {
+                Text(err).foregroundColor(.gray).font(.caption)
+            } else if effectiveBrands.isEmpty {
+                Text("No brands yet").foregroundColor(.gray).font(.caption)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(effectiveBrands, id: \.id) { brand in
+                            HStack(spacing: 8) {
+                                if let s = brand.logoURL, let url = URL(string: s) {
+                                    CachedSquare(url: url)
+                                        .frame(width: 40, height: 40)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                } else {
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.white.opacity(0.1))
+                                        .frame(width: 40, height: 40)
+                                        .overlay(Image(systemName: "briefcase.fill").foregroundColor(.gray))
+                                }
+                                Text(brand.name)
+                                    .foregroundColor(.white)
+                                    .font(.subheadline)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(Color.white.opacity(0.06))
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal)
+        .onAppear {
+            if brands.isEmpty && !loading {
+                Task { await fetchBrandsForUser() }
+            }
+        }
+    }
+
+    private func fetchBrandsForUser() async {
+        await MainActor.run { isLoading = true; loadError = nil; liveBrands = [] }
+        do {
+            if let fs = try await fetchBrandsFS(userId: userId), !fs.isEmpty {
+                await MainActor.run { liveBrands = fs; isLoading = false }
+                return
+            }
+            let rtdb = await fetchBrandsRTDB(userId: userId)
+            await MainActor.run { liveBrands = rtdb; isLoading = false }
+        } catch {
+            await MainActor.run {
+                loadError = error.localizedDescription
+                isLoading = false
+            }
+        }
+    }
+
+    private func fetchBrandsFS(userId: String) async throws -> [BrandSummary]? {
+        let db = Firestore.firestore()
+        var out: [BrandSummary] = []
+
+        // A) Subcollection under user
+        do {
+            let snap = try await db.collection("users").document(userId).collection("brands").getDocuments()
+            for doc in snap.documents {
+                let d = doc.data()
+                let name = (d["name"] as? String) ?? ""
+                guard !name.isEmpty else { continue }
+                let logo = d["logoURL"] as? String
+                let approved = (d["isApproved"] as? Bool) ?? false
+                out.append(.init(id: doc.documentID, name: name, logoURL: logo, isApproved: approved))
+            }
+        } catch { /* ignore */ }
+
+        // B) Top-level with ownerId filter
+        if out.isEmpty {
+            do {
+                let snap = try await db.collection("brands").whereField("ownerId", isEqualTo: userId).getDocuments()
+                for doc in snap.documents {
+                    let d = doc.data()
+                    let name = (d["name"] as? String) ?? ""
+                    guard !name.isEmpty else { continue }
+                    let logo = d["logoURL"] as? String
+                    let approved = (d["isApproved"] as? Bool) ?? false
+                    out.append(.init(id: doc.documentID, name: name, logoURL: logo, isApproved: approved))
+                }
+            } catch { /* ignore */ }
+        }
+
+        return out.isEmpty ? nil : out
+    }
+
+    private func fetchBrandsRTDB(userId: String) async -> [BrandSummary] {
+        let ref = Database.database().reference(withPath: "users/\(userId)/brands")
+        return await withCheckedContinuation { cont in
+            ref.observeSingleEvent(of: .value) { snap in
+                var out: [BrandSummary] = []
+                for case let cs as DataSnapshot in snap.children {
+                    if let d = cs.value as? [String: Any] {
+                        let name = (d["name"] as? String) ?? ""
+                        if name.isEmpty { continue }
+                        let logo = d["logoURL"] as? String
+                        let approved = (d["isApproved"] as? Bool) ?? false
+                        out.append(.init(id: cs.key, name: name, logoURL: logo, isApproved: approved))
+                    }
+                }
+                cont.resume(returning: out)
+            }
+        }
+    }
+}
+
+// MARK: - Cached images (AsyncImage – no custom cache dependency)
+/*
+private struct CachedAvatar: View {
+    let urlString: String?
+    var body: some View {
+        ZStack {
+            if let s = urlString, let url = URL(string: s) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty: ProgressView()
+                    case .success(let img): img.resizable().scaledToFill()
+                    case .failure: Circle().fill(Color(.systemGray5)).overlay(Image(systemName: "person.crop.circle.fill").font(.title).foregroundColor(.gray))
+                    @unknown default: ProgressView()
+                    }
+                }
+            } else {
+                Circle().fill(Color(.systemGray5))
+                    .overlay(Image(systemName: "person.crop.circle.fill").font(.title).foregroundColor(.gray))
+            }
+        }
+    }
+} */
+
+private struct CachedSquare: View {
+    let url: URL
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            switch phase {
+            case .empty: RoundedRectangle(cornerRadius: 8).fill(Color(.systemGray5)).overlay(ProgressView())
+            case .success(let img): img.resizable().scaledToFill()
+            case .failure: RoundedRectangle(cornerRadius: 8).fill(Color(.systemGray5)).overlay(Image(systemName: "photo").foregroundColor(.gray))
+            @unknown default: RoundedRectangle(cornerRadius: 8).fill(Color(.systemGray5))
+            }
+        }
+    }
+}
+
+// MARK: - Live star badge (kept)
+
+private struct CircleSizeBadgeInline: View {
+    let userId: String
+    let initial: Int
+    @State private var size: Int
+    @State private var ref: DatabaseReference?
+    @State private var handle: DatabaseHandle?
+    init(userId: String, initial: Int) { self.userId = userId; self.initial = initial; _size = State(initialValue: initial) }
+    var body: some View {
+        Group {
+            if size > 0 {
+                Image(systemName: "star.fill")
+                    .foregroundColor(.yellow)
+                    .font(.caption2)
+                    .overlay(
+                        Text("\(min(9, max(1, size)))")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.black)
+                            .offset(y: 0)
+                    )
+                    .transition(.opacity.combined(with: .scale))
+            }
+        }
+        .onAppear(perform: start)
+        .onDisappear(perform: stop)
+    }
+    private func start() {
+        let r = Database.database().reference().child("users").child(userId).child("circleSize")
+        ref = r
+        handle = r.observe(.value) { snap in
+            if let n = snap.value as? NSNumber { size = n.intValue }
+            else if let n = snap.value as? Int { size = n }
+        }
+    }
+    private func stop() { if let r = ref, let h = handle { r.removeObserver(withHandle: h) }; ref = nil; handle = nil }
+}
+
+// MARK: - Helpers
+
+fileprivate func deriveUsername(fromName name: String, id: String) -> String {
+    let allowed = CharacterSet.alphanumerics
+    let base = name.lowercased().components(separatedBy: allowed.inverted).filter { !$0.isEmpty }.joined()
+    if base.count >= 3 { return base }
+    let suffix = String(id.suffix(6)).lowercased()
+    return (base.isEmpty ? "user" : base) + suffix
+}
+
+fileprivate func makeRecipient(from u: UserProfile) -> ChatUserProfile? {
+    let obj: [String: Any?] = [
+        "id": u.id,
+        "name": u.name,
+        "displayName": u.name,
+        "username": u.username,
+        "handle": u.username,
+        "avatarUrl": u.profileImageURL,
+        "photoURL": u.profileImageURL,
+        "profileImageURL": u.profileImageURL,
+        "bio": u.bio
+    ]
+    let compact = obj.compactMapValues { $0 }
+    do {
+        let data = try JSONSerialization.data(withJSONObject: compact, options: [])
+        let decoded = try JSONDecoder().decode(ChatUserProfile.self, from: data)
+        return decoded
+    } catch {
+        print("❌ JSON bridge decode failed: \(error) | payload=\(compact)")
+        return nil
+    }
+}
+
+private extension String {
+    func trimmedLower() -> String {
+        trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    func hashtagStripped() -> String {
+        trimmedLower().trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+    }
+    var isBlank: Bool { trimmedLower().isEmpty }
+}
+
+private extension Int {
+    func formattedWithSeparator() -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        return f.string(from: NSNumber(value: self)) ?? "\(self)"
+    }
+}
+
+// ---- Existing components kept ----
+
+private struct ChatLaunchContainer: View, Identifiable {
+    let id = UUID()
+    let target: UserProfile
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if let recipient = makeRecipient(from: target) {
+                    DirectChatRoomView(recipient: recipient)
+                } else {
+                    VStack(spacing: 12) {
+                        Text("Couldn’t prepare chat").foregroundColor(.white).font(.headline)
+                        Text("Failed to build ChatUserProfile – check console for decode errors.")
+                            .foregroundColor(.gray).multilineTextAlignment(.center).padding(.horizontal)
+                        Button("Close") { dismiss() }.padding(.top, 8)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                }
+            }
+            Button(action: { dismiss() }) {
+                Image(systemName: "xmark.circle.fill").font(.system(size: 28)).foregroundColor(.secondary)
+                    .padding(.top, 10).padding(.trailing, 12)
+            }
+        }
+        .background(Color.black)
+    }
+}
+
+// Minimal Hashtag preview
+
 private struct HashtagPreviewSheet: View {
     let tag: HashtagSummary
 
     @State private var isLoading = true
     @State private var error: String? = nil
-    @State private var mediaThumbs: [URL] = [] // small grid from recent posts
+    @State private var mediaThumbs: [URL] = []
 
     var body: some View {
         VStack(spacing: 12) {
@@ -863,7 +1395,6 @@ private struct HashtagPreviewSheet: View {
         }
     }
 
-    // Firestore attempt
     private func fetchFS(tagLower: String) async throws -> [URL]? {
         let db = Firestore.firestore()
         let snap = try await db.collection("posts")
@@ -883,7 +1414,6 @@ private struct HashtagPreviewSheet: View {
         return urls.isEmpty ? nil : urls
     }
 
-    // RTDB fallback: scan latest N posts (light cap), filter locally
     private func fetchRTDB(tagLower: String) async -> [URL] {
         let ref = Database.database().reference(withPath: "posts")
         let limit: UInt = 120
@@ -907,160 +1437,17 @@ private struct HashtagPreviewSheet: View {
     }
 }
 
-// MARK: - Cached images
-
-private struct CachedAvatar: View {
-    let urlString: String?
-    @State private var image: UIImage?
-
-    var body: some View {
-        ZStack {
-            if let img = image { Image(uiImage: img).resizable().scaledToFill() }
-            else { Circle().fill(Color(.systemGray5)).overlay(ProgressView()) }
-        }
-        .task(id: urlString ?? "") {
-            guard let s = urlString, let url = URL(string: s) else { image = nil; return }
-            ImageStore.shared.load(from: url, key: s) { img in
-                withAnimation(.easeOut(duration: 0.15)) { image = img }
-            }
-        }
-    }
-}
-
-private struct CachedSquare: View {
-    let url: URL
-    @State private var image: UIImage?
-    var body: some View {
-        ZStack {
-            if let img = image { Image(uiImage: img).resizable().scaledToFill() }
-            else { RoundedRectangle(cornerRadius: 8).fill(Color(.systemGray5)).overlay(ProgressView()) }
-        }
-        .task(id: url.absoluteString) {
-            ImageStore.shared.load(from: url, key: url.absoluteString) { img in
-                withAnimation(.easeOut(duration: 0.15)) { image = img }
-            }
-        }
-    }
-}
-
-// MARK: - Live star badge (unchanged from your file)
-
-private struct CircleSizeBadgeInline: View {
-    let userId: String
-    let initial: Int
-    @State private var size: Int
-    @State private var ref: DatabaseReference?
-    @State private var handle: DatabaseHandle?
-    init(userId: String, initial: Int) { self.userId = userId; self.initial = initial; _size = State(initialValue: initial) }
-    var body: some View {
-        Group {
-            if size > 0 { StarBadgeInline(circleSize: size).transition(.opacity.combined(with: .scale)) }
-        }
-        .onAppear(perform: start)
-        .onDisappear(perform: stop)
-    }
-    private func start() {
-        let r = Database.database().reference().child("users").child(userId).child("circleSize")
-        ref = r
-        handle = r.observe(.value) { snap in
-            if let n = snap.value as? NSNumber { size = n.intValue }
-            else if let n = snap.value as? Int { size = n }
-        }
-    }
-    private func stop() { if let r = ref, let h = handle { r.removeObserver(withHandle: h) }; ref = nil; handle = nil }
-}
-
-// MARK: - Helpers
-
-fileprivate func deriveUsername(fromName name: String, id: String) -> String {
-    let allowed = CharacterSet.alphanumerics
-    let base = name.lowercased().components(separatedBy: allowed.inverted).filter { !$0.isEmpty }.joined()
-    if base.count >= 3 { return base }
-    let suffix = String(id.suffix(6)).lowercased()
-    return (base.isEmpty ? "user" : base) + suffix
-}
-
-fileprivate func makeRecipient(from u: UserProfile) -> ChatUserProfile? {
-    let obj: [String: Any?] = [
-        "id": u.id,
-        "name": u.name,
-        "displayName": u.name,
-        "username": u.username,
-        "handle": u.username,
-        "avatarUrl": u.profileImageURL,
-        "photoURL": u.profileImageURL,
-        "profileImageURL": u.profileImageURL,
-        "bio": u.bio
-    ]
-    let compact = obj.compactMapValues { $0 }
-    do {
-        let data = try JSONSerialization.data(withJSONObject: compact, options: [])
-        let decoded = try JSONDecoder().decode(ChatUserProfile.self, from: data)
-        return decoded
-    } catch {
-        log("❌ JSON bridge decode failed: \(error) | payload=\(compact)")
-        return nil
-    }
-}
-
-@inline(__always) private func log(_ message: String) {
-    print("🔍 [Search] \(message)")
-}
-
-private extension String {
-    func trimmedLower() -> String {
-        trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-    func hashtagStripped() -> String {
-        trimmedLower().trimmingCharacters(in: CharacterSet(charactersIn: "#"))
-    }
-    var isBlank: Bool { trimmedLower().isEmpty }
-}
-
-private extension Int {
-    func formattedWithSeparator() -> String {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        return f.string(from: NSNumber(value: self)) ?? "\(self)"
-    }
-}
-
-// ---- Existing components kept from your file ----
-
-private struct ChatLaunchContainer: View {
-    let target: UserProfile
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Group {
-                if let recipient = makeRecipient(from: target) {
-                    DirectChatRoomView(recipient: recipient)
-                } else {
-                    VStack(spacing: 12) {
-                        Text("Couldn’t prepare chat").foregroundColor(.white).font(.headline)
-                        Text("Failed to build ChatUserProfile – check console for decode errors.")
-                            .foregroundColor(.gray).multilineTextAlignment(.center).padding(.horizontal)
-                        Button("Close") { dismiss() }.padding(.top, 8)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black)
-                }
-            }
-            Button(action: { dismiss() }) {
-                Image(systemName: "xmark.circle.fill").font(.system(size: 28)).foregroundColor(.secondary)
-                    .padding(.top, 10).padding(.trailing, 12)
-            }
-        }
-        .background(Color.black)
-    }
-}
+// MARK: - Empty / Error views
 
 private struct EmptyStateView: View {
     let message: String
     var body: some View {
         VStack {
             Spacer()
-            Text(message).foregroundColor(.gray).multilineTextAlignment(.center).padding()
+            Text(message)
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+                .padding()
             Spacer()
         }
         .background(Color.black)
@@ -1072,20 +1459,29 @@ private struct SearchErrorView: View {
     let onRetry: () -> Void
     var body: some View {
         VStack(spacing: 8) {
-            Text("Couldn’t load results").font(.headline).foregroundColor(.white)
-            Text(message).foregroundColor(.gray).multilineTextAlignment(.center).padding(.horizontal)
+            Text("Couldn’t load results")
+                .font(.headline)
+                .foregroundColor(.white)
+            Text(message)
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
             Button(action: onRetry) {
-                Text("Retry").padding(.horizontal, 16).padding(.vertical, 8)
-                    .background(Color.blue).cornerRadius(10).foregroundColor(.white)
-            }.padding(.top, 6)
+                Text("Retry")
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.blue)
+                    .cornerRadius(10)
+                    .foregroundColor(.white)
+            }
+            .padding(.top, 6)
         }
         .padding()
         .background(Color.black)
     }
 }
 
-// Minimal versions so the preview compiles even if you haven’t wired these yet.
-// (You can swap these with your richer implementations later.)
+/// Minimal wrapper so your inline badge in the preview compiles.
 private struct LivePreviewStarBadgeArea: View {
     let userId: String
     let initial: Int
@@ -1094,16 +1490,53 @@ private struct LivePreviewStarBadgeArea: View {
     }
 }
 
-private struct UserBrandsStrip: View {
-    let userId: String
+// =====================================================
+// StarPowerBarView (level 0 = white, then rainbow; current highlighted)
+// =====================================================
+
+private struct StarPowerBarView: View {
+    /// 0 = white, 1 = red, 2 = orange, 3 = yellow, 4 = green, 5 = blue, 6 = indigo, 7 = violet
+    let currentLevel: Int
+
+    private let levels: [Color] = [
+        .white,                                  // 0
+        Color(red: 1.00, green: 0.20, blue: 0.20), // 1 red
+        .orange,                                 // 2 orange
+        .yellow,                                 // 3 yellow
+        .green,                                  // 4 green
+        .blue,                                   // 5 blue
+        Color(red: 0.29, green: 0.00, blue: 0.51), // 6 indigo (approx)
+        .purple                                  // 7 violet
+    ]
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Brands").font(.headline).foregroundColor(.white)
+            Text("Star Power")
+                .font(.headline)
+                .foregroundColor(.white)
+
+            HStack(spacing: 10) {
+                ForEach(levels.indices, id: \.self) { idx in
+                    let isCurrent = idx == clampedIndex
+                    Image(systemName: isCurrent ? "star.fill" : "star")
+                        .font(.system(size: isCurrent ? 20 : 18, weight: isCurrent ? .bold : .regular))
+                        .foregroundColor(levels[idx])
+                        .opacity(isCurrent ? 1.0 : 0.38)
+                        .scaleEffect(isCurrent ? 1.05 : 1.0)
+                        .accessibilityLabel(isCurrent ? "Current star level \(idx)" : "Star level \(idx)")
+                }
                 Spacer()
             }
-            Text("No brands yet").foregroundColor(.gray).font(.caption)
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.white.opacity(0.06))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.12), lineWidth: 1))
+            )
         }
-        .padding(.horizontal)
+    }
+
+    private var clampedIndex: Int {
+        min(max(currentLevel, 0), levels.count - 1)
     }
 }

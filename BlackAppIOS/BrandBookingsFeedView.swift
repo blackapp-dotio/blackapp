@@ -3,6 +3,57 @@ import Firebase
 import FirebaseDatabase
 import FirebaseAuth
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // keep if you rewrote /checkout → /checkout.html
+
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String? = nil,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 struct BrandBookingsFeedView: View {
     var brand: BrandModel
     @State private var sessions: [BookingSession] = []
@@ -12,7 +63,7 @@ struct BrandBookingsFeedView: View {
         ScrollView {
             VStack(spacing: 20) {
                 ForEach(sessions) { session in
-                    BookingCard(session: session, brandOwnerId: brand.ownerId)
+                    BookingCard(session: session, brand: brand, brandOwnerId: brand.ownerId)
                         .padding(.horizontal)
                 }
 
@@ -99,10 +150,12 @@ struct BookingSession: Identifiable {
 
 struct BookingCard: View {
     let session: BookingSession
+    let brand: BrandModel
     let brandOwnerId: String
 
     @State private var isSaved = false
     @State private var showShareSheet = false
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -169,16 +222,24 @@ struct BookingCard: View {
             return
         }
 
-        // Route to hosted checkout with platform fee logic handled by PurchaseManager
-        PurchaseManager.shared.startCheckout(
-            buyerId: uid,
-            sellerId: brandOwnerId,
-            basePrice: session.price,
-            itemType: "booking",
+        // Open the hosted universal checkout (Card or PayPal via Braintree)
+        let url = Checkout.url(
+            tool: "bookings",
+            brandId: brand.id,
             itemId: session.id,
-            itemTitle: session.title,
-            itemImageURL: "" // add a thumbnail URL if you have one
+            title: session.title,
+            price: session.price,
+            currency: "USD",
+            imagePath: nil,         // add a thumbnail path if you store one
+            userId: uid,
+            allowQty: false,        // one booking per order
+            minQty: 1,
+            maxQty: 1,
+            returnUrl: "blackappios://done"
+            // clientTokenUrl: "https://blackapp.io/api/client_token",
+            // chargeUrl: "https://blackapp.io/api/charge_braintree"
         )
+        if let url { openURL(url) }
     }
 
     private func toggleSave() {

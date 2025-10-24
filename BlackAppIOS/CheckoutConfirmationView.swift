@@ -8,48 +8,69 @@ struct CheckoutConfirmationView: View {
     var onConfirm: ((Int, Int) -> Void)? = nil
     @Environment(\.presentationMode) var presentationMode
 
+    // Quantities
     @State private var ticketQty = 0
     @State private var tableQty = 0
 
-    var ticketTotal: Double {
-        Double(ticketQty) * event.ticketPrice
-    }
+    // ✅ Single source of truth for buyer platform fee
+    private let platformBuyerFeeRate: Double = 0.05
 
-    var tableTotal: Double {
-        Double(tableQty) * event.tablePrice
-    }
+    // Subtotals
+    var ticketTotal: Double { Double(ticketQty) * event.ticketPrice }
+    var tableTotal: Double { Double(tableQty) * event.tablePrice }
+    var subTotal: Double { ticketTotal + tableTotal }
 
+    // Fee + total (rounded to 2 decimals)
+    var platformFee: Double {
+        round2(subTotal * platformBuyerFeeRate)
+    }
     var totalWithFee: Double {
-        (ticketTotal + tableTotal) * 1.02
+        round2(subTotal + platformFee)
     }
 
     var body: some View {
         NavigationView {
             Form {
+                // Quantities
                 Section(header: Text("Select Quantities")) {
                     if event.ticketQuantity > 0 {
                         Stepper("Tickets (\(ticketQty))", value: $ticketQty, in: 0...event.ticketQuantity)
-                        Text("Subtotal: $\(ticketTotal, specifier: "%.2f")")
-                            .font(.caption)
+                        Text("Subtotal: $\(ticketTotal, specifier: "%.2f")").font(.caption)
                     }
 
                     if event.tableQuantity > 0 {
                         Stepper("Tables (\(tableQty))", value: $tableQty, in: 0...event.tableQuantity)
-                        Text("Subtotal: $\(tableTotal, specifier: "%.2f")")
-                            .font(.caption)
+                        Text("Subtotal: $\(tableTotal, specifier: "%.2f")").font(.caption)
                     }
                 }
 
-                Section(header: Text("Total with 2% Platform Fee")) {
-                    Text(ticketQty + tableQty == 0 ? "$0.00" : "$\(totalWithFee, specifier: "%.2f")")
-                        .font(.title2)
-                        .bold()
+                // ✅ Clear price breakdown
+                Section(header: Text("Order Summary")) {
+                    HStack {
+                        Text("Subtotal")
+                        Spacer()
+                        Text("$\(subTotal, specifier: "%.2f")")
+                    }
+                    HStack {
+                        Text("Platform Fee (5%)")
+                        Spacer()
+                        Text("$\(platformFee, specifier: "%.2f")")
+                    }
+                    HStack {
+                        Text("Total")
+                            .font(.headline)
+                        Spacer()
+                        Text("$\(totalWithFee, specifier: "%.2f")")
+                            .font(.headline)
+                    }
                 }
 
+                // Action
                 if ticketQty > 0 || tableQty > 0 {
-                    Button(totalWithFee == 0 ? "Claim Free Tickets" : "Proceed to Payment") {
+                    Button(subTotal == 0 ? "Claim Free Tickets" : "Proceed to Payment") {
                         presentationMode.wrappedValue.dismiss()
-                        if totalWithFee == 0 {
+                        if subTotal == 0 {
+                            // No fee on $0 orders
                             claimFreeTickets(ticketQty: ticketQty, tableQty: tableQty)
                         } else {
                             onConfirm?(ticketQty, tableQty)
@@ -76,6 +97,7 @@ struct CheckoutConfirmationView: View {
         }
     }
 
+    // Keep your free-claim flow unchanged
     func claimFreeTickets(ticketQty: Int, tableQty: Int) {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let db = Database.database().reference()
@@ -118,5 +140,10 @@ struct CheckoutConfirmationView: View {
                 return TransactionResult.success(withValue: currentData)
             }
         }
+    }
+
+    // Helpers
+    private func round2(_ x: Double) -> Double {
+        (x * 100).rounded() / 100
     }
 }

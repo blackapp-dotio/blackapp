@@ -12,13 +12,19 @@
     "clean": "rm -rf node_modules package-lock.json lib .tsbuildinfo"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.11.0",
     "braintree": "^3.33.1",
+    "cheerio": "^1.1.2",
     "cors": "^2.8.5",
+    "fast-xml-parser": "^4.5.3",
     "firebase-admin": "^12.7.0",
-    "firebase-functions": "^6.4.0",
-    "node-fetch": "^3.3.2",
+    "firebase-functions": "^6.5.0",
+    "got": "^13.0.0",
+    "htmlparser2": "^10.0.0",
+    "node-fetch": "^2.7.0",
+    "node-ical": "^0.21.0",
     "rss-parser": "^3.13.0",
-    "sharp": "^0.34.3",
+    "sharp": "^0.34.4",
     "undici": "^7.16.0"
   }
 }

@@ -4,6 +4,57 @@ import FirebaseDatabase
 import FirebaseAuth
 import AVKit
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // keep if you rewrote /checkout → /checkout.html
+
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String? = nil,
+        userId: String?,
+        allowQty: Bool = false,
+        minQty: Int = 1,
+        maxQty: Int = 1,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 struct BrandVlogFeedView: View {
     var brand: BrandModel
     @State private var vlogs: [VlogVideo] = []
@@ -12,6 +63,7 @@ struct BrandVlogFeedView: View {
     @State private var purchasedVlogIds: Set<String> = []
     @State private var showShareSheet = false
     @State private var shareURL: URL?
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         ScrollView {
@@ -23,18 +75,7 @@ struct BrandVlogFeedView: View {
                         hasPurchased: purchasedVlogIds.contains(vlog.id),
                         onSaveToggle: { toggleSave(for: vlog) },
                         onShare: { share(vlog: vlog) },
-                        onPurchase: {
-                            guard let uid = Auth.auth().currentUser?.uid else { return }
-                            PurchaseManager.shared.startCheckout(
-                                buyerId: uid,
-                                sellerId: brand.ownerId,
-                                basePrice: vlog.price,
-                                itemType: "vlog",
-                                itemId: vlog.id,
-                                itemTitle: vlog.title,
-                                itemImageURL: nil
-                            )
-                        }
+                        onPurchase: { openCheckout(for: vlog) }
                     )
                     .padding(.horizontal)
                 }
@@ -67,6 +108,30 @@ struct BrandVlogFeedView: View {
                 VlogShareSheet(activityItems: [url, "🎬 Watch on BlackApp"])
             }
         }
+    }
+
+    // MARK: - Checkout
+
+    private func openCheckout(for vlog: VlogVideo) {
+        // require login like your original flow; remove this guard if you want guest checkout
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let url = Checkout.url(
+            tool: "vlog",
+            brandId: brand.id,
+            itemId: vlog.id,
+            title: vlog.title,
+            price: vlog.price,
+            currency: "USD",
+            imagePath: nil,           // add a thumbnail path if you later store one
+            userId: uid,
+            allowQty: false,
+            minQty: 1,
+            maxQty: 1,
+            returnUrl: "blackappios://done"
+            // clientTokenUrl: "https://blackapp.io/api/client_token",
+            // chargeUrl: "https://blackapp.io/api/charge_braintree"
+        )
+        if let url { openURL(url) }
     }
 
     // MARK: - Fetchers with fallbacks
@@ -114,14 +179,18 @@ struct BrandVlogFeedView: View {
     }
 
     func fetchPurchasedVlogs() {
+        // Updated to match universal checkout schema:
+        // purchases/{uid}/{purchaseId} with fields { tool, itemId, ... }
         guard let uid = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("purchases").child(uid)
         ref.observeSingleEvent(of: .value) { snapshot in
             var ids = Set<String>()
             for case let child as DataSnapshot in snapshot.children {
                 if let val = child.value as? [String: Any],
-                   val["type"] as? String == "vlog" {
-                    ids.insert(child.key)
+                   let tool = val["tool"] as? String,
+                   let itemId = val["itemId"] as? String,
+                   tool == "vlog" {
+                    ids.insert(itemId)
                 }
             }
             self.purchasedVlogIds = ids
@@ -230,7 +299,7 @@ struct VlogVideoCard: View {
     }
 }
 
-// unique share wrapper
+// Unique share wrapper
 struct VlogShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {

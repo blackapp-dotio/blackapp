@@ -1,0 +1,42 @@
+{
+  "CLT": {
+    "label": "Charlotte, NC",
+    "tags": ["#Charlotte", "CLT", "Charlotte"],
+    "sources": [
+      "https://clture.org/events/",
+      "https://qcnerve.com/category/events/",
+      "https://www.reddit.com/r/Charlotte/",
+      "https://www.charlotteagenda.com/category/events/",
+      "https://www.eventbrite.com/d/nc--charlotte/nightlife--events/"
+    ]
+  },
+  "ATL": {
+    "label": "Atlanta, GA",
+    "tags": ["#Atlanta", "ATL", "Atlanta"],
+    "sources": [
+      "https://www.atlantamagazine.com/events/",
+      "https://creativeloafing.com/events",
+      "https://www.reddit.com/r/Atlanta/",
+      "https://www.eventbrite.com/d/ga--atlanta/nightlife--events/"
+    ]
+  },
+  "LOS": {
+    "label": "Lagos, Nigeria",
+    "tags": ["#Lagos", "LOS", "Lagos", "Naija", "Nigeria", "Lekki", "Victoria Island"],
+    "sources": [
+      "https://allevents.in/lagos/all",
+      "https://www.bellanaija.com/tag/events/",
+      "https://www.eventbrite.com/d/nigeria--lagos/nightlife--events/"
+    ]
+  },
+  "LON": {
+    "label": "London, UK",
+    "tags": ["#London", "LON", "London"],
+    "sources": [
+      "https://londontheinside.com/events/",
+      "https://www.timeout.com/london/things-to-do",
+      "https://www.reddit.com/r/london/",
+      "https://www.eventbrite.co.uk/d/united-kingdom--london/amapiano/"
+    ]
+  }
+}

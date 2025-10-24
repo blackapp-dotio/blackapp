@@ -3,6 +3,7 @@ import Firebase
 import FirebaseDatabase
 import FirebaseStorage
 
+// MARK: - BrandShopFeedView
 struct BrandShopFeedView: View {
     var brand: BrandModel
     @State private var products: [BrandProduct] = []
@@ -14,6 +15,7 @@ struct BrandShopFeedView: View {
             VStack(spacing: 16) {
                 ForEach(products) { product in
                     ProductCard(brand: brand, product: product)
+                        .environmentObject(authVM)
                         .padding(.horizontal)
                 }
 
@@ -94,6 +96,60 @@ struct BrandProduct: Identifiable {
     }
 }
 
+// MARK: - Universal Checkout URL Builder
+fileprivate enum Checkout {
+    /// Hosted universal checkout (Card or PayPal via Braintree)
+    static let base = "https://blackapp.io/checkout" // if you rewrote /checkout → /checkout.html
+
+    /// Build a URL for any monetized tool; here used by the Shop feed
+    static func url(
+        tool: String,
+        brandId: String,
+        itemId: String,
+        title: String,
+        price: Double,
+        currency: String = "USD",
+        imagePath: String?,
+        userId: String?,
+        allowQty: Bool = true,
+        minQty: Int = 1,
+        maxQty: Int = 5,
+        returnUrl: String = "blackappios://done",
+        clientTokenUrl: String? = nil,  // optional override
+        chargeUrl: String? = nil        // optional override
+    ) -> URL? {
+        var comps = URLComponents(string: base)
+        var q: [URLQueryItem] = [
+            .init(name: "tool", value: tool),
+            .init(name: "brandId", value: brandId),
+            .init(name: "itemId", value: itemId),
+            .init(name: "title", value: title),
+            .init(name: "price", value: String(format: "%.2f", price)),
+            .init(name: "currency", value: currency),
+            .init(name: "allowQty", value: allowQty ? "1" : "0"),
+            .init(name: "minQty", value: "\(minQty)"),
+            .init(name: "maxQty", value: "\(maxQty)"),
+            .init(name: "returnUrl", value: returnUrl)
+        ]
+
+        if let imagePath, !imagePath.isEmpty {
+            q.append(.init(name: "imagePath", value: imagePath))
+        }
+        if let userId, !userId.isEmpty {
+            q.append(.init(name: "userId", value: userId))
+        }
+        if let clientTokenUrl, !clientTokenUrl.isEmpty {
+            q.append(.init(name: "clientTokenUrl", value: clientTokenUrl))
+        }
+        if let chargeUrl, !chargeUrl.isEmpty {
+            q.append(.init(name: "chargeUrl", value: chargeUrl))
+        }
+
+        comps?.queryItems = q
+        return comps?.url
+    }
+}
+
 // MARK: - Product Card
 struct ProductCard: View {
     let brand: BrandModel
@@ -104,6 +160,7 @@ struct ProductCard: View {
     @State private var showShareSheet = false
 
     @EnvironmentObject var authVM: AuthViewModel
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -160,20 +217,31 @@ struct ProductCard: View {
                 Spacer()
 
                 Button {
-                    guard let userId = authVM.user?.uid else {
+                    // Require login like your original flow; if you want guest checkout, remove this guard
+                    guard let userId = (authVM.currentUser?.uid ?? authVM.user?.uid) else {
                         print("❌ No user logged in")
                         return
                     }
 
-                    PurchaseManager.shared.startCheckout(
-                        buyerId: userId,
-                        sellerId: brand.ownerId,       // correct seller
-                        basePrice: product.price,
-                        itemType: "product",
+                    let url = Checkout.url(
+                        tool: "shop",
+                        brandId: brand.id,
                         itemId: product.id,
-                        itemTitle: product.title,
-                        itemImageURL: product.imagePath
+                        title: product.title,
+                        price: product.price,
+                        currency: "USD",
+                        imagePath: product.imagePath,
+                        userId: userId,
+                        allowQty: true,     // shoppers can buy multiple
+                        minQty: 1,
+                        maxQty: 5,
+                        returnUrl: "blackappios://done"
+                        // If your token/charge endpoints live elsewhere, pass overrides:
+                        // clientTokenUrl: "https://blackapp.io/api/client_token",
+                        // chargeUrl: "https://blackapp.io/api/charge_braintree"
                     )
+
+                    if let url { openURL(url) }
                 } label: {
                     Text("Buy Now")
                         .padding(.horizontal, 12)
@@ -208,7 +276,7 @@ struct ProductCard: View {
     }
 
     private func toggleSave() {
-        guard let uid = authVM.user?.uid else { return }
+        guard let uid = (authVM.currentUser?.uid ?? authVM.user?.uid) else { return }
         let ref = savedRef(for: uid)
 
         if isSaved {
@@ -230,7 +298,7 @@ struct ProductCard: View {
     }
 
     private func checkSavedStatus() {
-        guard let uid = authVM.user?.uid else { return }
+        guard let uid = (authVM.currentUser?.uid ?? authVM.user?.uid) else { return }
         savedRef(for: uid).observeSingleEvent(of: .value) { snap in
             isSaved = snap.exists()
         }
@@ -267,7 +335,7 @@ struct ProductCard: View {
     }
 }
 
-/*// MARK: - Native Share Sheet
+/*// MARK: - Native Share Sheet (keep commented if you already define ActivityView elsewhere)
 struct ActivityView: UIViewControllerRepresentable {
     var activityItems: [Any]
     var applicationActivities: [UIActivity]? = nil

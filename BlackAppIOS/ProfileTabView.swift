@@ -71,20 +71,34 @@ struct ProfileTabView: View {
             .background(Color.black.ignoresSafeArea())
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    if isAdmin {
-                        NavigationLink(destination: AGDashboardView()) {
-                            Image("ag-global-logo")
-                                .resizable()
-                                .renderingMode(.original)
-                                .frame(width: 36, height: 36)
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                .shadow(radius: 3)
-                                .accessibilityLabel("AG Dashboard")
+                    HStack(spacing: 12) {
+                        if isAdmin {
+                            NavigationLink(destination: AGDashboardView()) {
+                                Image("ag-global-logo")
+                                    .resizable()
+                                    .renderingMode(.original)
+                                    .frame(width: 36, height: 36)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .shadow(radius: 3)
+                                    .accessibilityLabel("AG Dashboard")
+                            }
+                        }
+
+                        // ⚙️ Settings button (posts .openSettings so MainTabView opens the Settings sheet)
+                        Button {
+                            NotificationCenter.default.post(name: .openSettings, object: nil)
+                        } label: {
+                            Image(systemName: "gearshape.fill")
+                                .font(.system(size: 22, weight: .semibold))
+                                .imageScale(.large)
+                                .foregroundColor(.white)
+                                .accessibilityLabel("Settings")
                         }
                     }
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
+
         }
         .onAppear {
             fetchProfile()

@@ -38,65 +38,71 @@
     <p><strong>Tickets:</strong> <span id="ticketSummary"></span></p>
     <p><strong>Tables:</strong> <span id="tableSummary"></span></p>
     <p><strong>Subtotal:</strong> $<span id="baseTotal"></span></p>
-    <p><strong>Platform Fee (2%):</strong> $<span id="fee"></span></p>
+    <p><strong id="feeLabel">Platform Fee (5%):</strong> $<span id="fee"></span></p>
     <p><strong>Total to Pay:</strong> $<span id="total"></span></p>
   </div>
 
-  <!-- Only Braintree Drop-in (cards + PayPal) -->
+  <!-- Braintree Drop-in (cards + PayPal) -->
   <div id="dropin-container"></div>
   <button id="submit-button" style="display:none">Pay Now</button>
 
   <script>
-    // --------------------------
-    // Parse query params
-    // --------------------------
+    // ---------- constants & helpers ----------
+    const FEE_RATE = 0.05; // 5%
+    const cents = v => Math.round((Number(v) || 0) * 100);
+    const fromCents = c => (c / 100).toFixed(2);
+
+    // ---------- Parse query params ----------
     const query = new URLSearchParams(window.location.search);
     const userId = query.get("userId") || "unknown";
     const eventId = query.get("eventId") || "unknown";
     const eventName = decodeURIComponent(query.get("eventName") || "Event");
     const eventImagePath = decodeURIComponent(query.get("eventImagePath") || "");
     const eventTime = query.get("eventTime") || "";
+
     const ticketQty = Number(query.get("ticketQty") || 0);
     const ticketPrice = Number(query.get("ticketPrice") || 0);
     const tableQty = Number(query.get("tableQty") || 0);
     const tablePrice = Number(query.get("tablePrice") || 0);
-    const baseTotal = parseFloat(query.get("baseTotal") || "0");
-    const totalWithFee = parseFloat(query.get("totalWithFee") || "0");
 
-    // These may still be present from event settings; harmless to forward to backend
+    // Optional/legacy values (ignored for math; we recompute)
     const payoutMethod = query.get("payoutMethod") || "PayPal";
     const payoutDetails = decodeURIComponent(query.get("payoutDetails") || "");
 
-    // --------------------------
-    // Fill UI
-    // --------------------------
+    // ---------- Recompute totals (ignore URL's totalWithFee) ----------
+    const baseTotalC = cents(ticketQty * ticketPrice + tableQty * tablePrice);
+    const feeC = Math.round(baseTotalC * FEE_RATE);
+    const totalC = baseTotalC + feeC;
+
+    const baseTotal = fromCents(baseTotalC);
+    const fee = fromCents(feeC);
+    const totalWithFee = fromCents(totalC);
+
+    // ---------- Fill UI ----------
     document.getElementById("eventName").textContent = eventName;
     document.getElementById("ticketSummary").textContent =
-      `${ticketQty} x $${ticketPrice} = $${(ticketQty * ticketPrice).toFixed(2)}`;
+      `${ticketQty} × $${(Number(ticketPrice) || 0).toFixed(2)} = $${(ticketQty * ticketPrice).toFixed(2)}`;
     document.getElementById("tableSummary").textContent =
-      `${tableQty} x $${tablePrice} = $${(tableQty * tablePrice).toFixed(2)}`;
-    document.getElementById("baseTotal").textContent = baseTotal.toFixed(2);
-    document.getElementById("fee").textContent = (totalWithFee - baseTotal).toFixed(2);
-    document.getElementById("total").textContent = totalWithFee.toFixed(2);
+      `${tableQty} × $${(Number(tablePrice) || 0).toFixed(2)} = $${(tableQty * tablePrice).toFixed(2)}`;
+    document.getElementById("baseTotal").textContent = baseTotal;
+    document.getElementById("fee").textContent = fee;
+    document.getElementById("total").textContent = totalWithFee;
+    document.getElementById("feeLabel").textContent = "Platform Fee (5%):";
 
-    // --------------------------
-    // Braintree Drop-in (Cards + PayPal)
-    // --------------------------
+    // ---------- Braintree Drop-in ----------
     const submitBtn = document.getElementById("submit-button");
 
     fetch("https://us-central1-blackappios.cloudfunctions.net/generateClientToken")
       .then(res => res.json())
       .then(data => {
         console.log("🔑 Received Braintree client token");
-        const amountToSend = parseFloat(totalWithFee) || 0.01;
 
         braintree.dropin.create({
           authorization: data.clientToken,
           container: "#dropin-container",
-          // Let Drop-in show Card and PayPal options automatically
           paypal: {
             flow: "checkout",
-            amount: amountToSend,
+            amount: Number(totalWithFee),
             currency: "USD"
           },
           card: {
@@ -128,13 +134,13 @@
               }
 
               const postData = {
-                amount: amountToSend.toFixed(2),
                 paymentMethodNonce: payload.nonce,
                 userId, eventId, eventName, eventImagePath, eventTime,
                 ticketQty, ticketPrice, tableQty, tablePrice,
-                baseTotal, totalWithFee,
-                payoutMethod, payoutDetails, // forwarded for your records
-                platformFee: (totalWithFee - baseTotal)
+                // send recomputed values
+                platformFee: Number(fee),
+                totalWithFee: Number(totalWithFee),
+                payoutMethod, payoutDetails
               };
 
               console.log("📤 Submitting payment:", postData);

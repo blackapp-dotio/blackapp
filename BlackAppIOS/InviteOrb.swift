@@ -9,18 +9,40 @@ extension Notification.Name {
     static let inviteOrbCapturedMedia = Notification.Name("inviteOrbCapturedMedia")
 }
 
-// MARK: - Build the invite text (TestFlight + Invite Code)
+// MARK: - Build the invite text (Smart Link; no invite code shown)
 enum InviteLinkBuilder {
-    /// Final share text: includes TestFlight steps and the inviter's short code.
-    static func shareText(inviteCode: String, circleSize: Int?, nextTarget: Int?) -> String {
+    /// Final share text: uses your smart link (routes to App Store or TestFlight).
+    static func shareText(inviteCode _: String, circleSize: Int?, nextTarget: Int?) -> String {
+        let current = circleSize ?? 0
         var s = "🚀 Join the BlackApp movement ✊🏾✨\nNightlife • Creators • Brands — all in one app.\n"
-        if let n = nextTarget { s += "Help me hit my next invite milestone: \(n)! 💫\n" }
-        s += "\n📲 iOS beta install:\n"
-        s += "1) Get TestFlight: https://apps.apple.com/app/testflight/id899247664\n"
-        s += "2) Join BlackApp Beta: https://testflight.apple.com/join/p5ZFKcen\n"
-        s += "\n🔑 Invite code (paste in app or keep copied): \(inviteCode)\n"
+
+        if let target = nextTarget, target > current {
+            let remaining = max(0, target - current)
+            s += "\n⭐️ Expand your circle by \(remaining) invites to reach the next Star Power level (\(target)).\n"
+        } else {
+            s += "\n👑 You’ve reached the top Star Power level.\n"
+        }
+
+        s += "\n📲 Get the app: https://blackapp.io/app\n"
         return s
     }
+}
+
+
+// Derive all Star Power level thresholds using your badge API.
+// Keep this in the same file where `_InviteOrbBadge` is visible.
+fileprivate func inviteBadgeLevels() -> [Int] {
+    var levels: [Int] = []
+    var cursor = 0
+    var guardCount = 0
+    while let next = _InviteOrbBadge.nextTarget(after: cursor), guardCount < 50 {
+        // Safety: ensure monotonic increase to avoid cycles
+        guard next > cursor else { break }
+        levels.append(next)
+        cursor = next
+        guardCount += 1
+    }
+    return levels
 }
 
 // MARK: - Fetch the current user's invite code
@@ -395,20 +417,36 @@ public struct InviteOrb: View {
         self.circleSize = circleSize
     }
     
-    // Milestone message ONLY (removed time-aware coaching text)
+    // Milestone message ONLY (short + clear)
     private var nextTargetText: String {
-        let next = _InviteOrbBadge.nextTarget(after: circleSize ?? 0)
-        if let n = next {
-            return "Just \(n - (circleSize ?? 0)) invites away from reaching \(n)! Expand your circle and rise to the next Star Power level! 🌟🎉"
+        let current = circleSize ?? 0
+        if let next = _InviteOrbBadge.nextTarget(after: current) {
+            let remaining = max(0, next - current)
+            return "Expand your circle by \(remaining) invites to rise to the next Star Power level."
         } else {
-            return "You’ve reached the ultimate popularity level/badge. 👑"
+            return "You’ve reached the top Star Power level. 👑"
         }
     }
-    
+
+    // Derive *all* star-power thresholds from your existing API
+    private func allStarPowerLevels() -> [Int] {
+        var levels: [Int] = []
+        var cursor = 0
+        var guardCount = 0
+        while let next = _InviteOrbBadge.nextTarget(after: cursor), guardCount < 50 {
+            // protect against accidental cycles
+            guard next > cursor else { break }
+            levels.append(next)
+            cursor = next
+            guardCount += 1
+        }
+        return levels
+    }
+
     public var body: some View {
         ZStack(alignment: .bottomTrailing) {
             if showCoach {
-                CoachingBubble(text: nextTargetText) { showCoach = false }
+                StarPowerCoachCard(circleSize: circleSize) { showCoach = false }
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                     .padding(.bottom, 120)
                     .padding(.trailing, 18)
@@ -475,6 +513,50 @@ public struct InviteOrb: View {
         .onAppear { startOrbitIfNeeded() }
         .onChange(of: orbitActive) { _ in
             if orbitActive { startOrbitIfNeeded() } else { stopOrbit() }
+        }
+    }
+
+    // Replace previous StarPowerCoachCard with this one (same signature)
+    fileprivate struct StarPowerCoachCard: View {
+        let circleSize: Int?
+        let onClose: () -> Void
+
+        var body: some View {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "sparkles")
+                    .foregroundColor(.white)
+                    .padding(.top, 2)
+
+                // Message + inline star meter
+                NextTargetNotice(circleSize: circleSize, levels: inviteBadgeLevels())
+
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.caption.bold())
+                        .foregroundColor(.white.opacity(0.85))
+                }
+            }
+            .padding(12)
+            .background(
+                // Futuristic translucent bubble, in the same family as MenuPill/orb
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.blue.opacity(0.32),
+                                Color.purple.opacity(0.32)
+                            ],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        )
+                    )
+                    .background(.ultraThinMaterial.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                    .shadow(color: Color.blue.opacity(0.25), radius: 12, x: 0, y: 8)
+            )
+            .padding(.trailing, 10)
         }
     }
 
