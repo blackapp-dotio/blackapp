@@ -1,7 +1,7 @@
 {
   "images" : [
     {
-      "filename" : "AppLogo-2.png",
+      "filename" : "Icon-1024.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -13,6 +13,7 @@
           "value" : "dark"
         }
       ],
+      "filename" : "Icon-1024 1.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -24,6 +25,7 @@
           "value" : "tinted"
         }
       ],
+      "filename" : "Icon-1024 2.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -74,7 +76,7 @@
       "size" : "512x512"
     },
     {
-      "filename" : "AppLogo-2 1.png",
+      "filename" : "icon_1024 3.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "512x512"

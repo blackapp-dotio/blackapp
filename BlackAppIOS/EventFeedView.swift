@@ -5,21 +5,45 @@ import FirebaseAuth
 import FirebaseStorage
 import FirebaseDatabase
 
-// MARK: - EventFeedView (Internal events only)
+// =====================================================
+// MARK: - Eventbrite lightweight model (namespaced here)
+// =====================================================
+struct EBEvent: Identifiable {
+    let id: String
+    let title: String
+    let venueName: String
+    let address: String
+    let date: Date
+    let imageURL: String?
+    let externalURL: String?
+    let source: String // "eventbrite"
+}
+
+fileprivate let _iso8601Z: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    // Our function emits ISO-8601 with 'Z', sometimes with fractional seconds.
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+
+// =====================================================
+// MARK: - EventFeedView (Platform + Eventbrite)
+// =====================================================
 struct EventFeedView: View {
     @State private var platformEvents: [EventModel] = []
-    @State private var isLoading = true
+    @State private var externalEvents: [EBEvent] = []   // ⬅️ namespaced model
+    @State private var isLoading: Bool = true
 
     // Filters
-    @State private var showOnlyUpcoming = true
-    @State private var filterToday = false
-    @State private var filterWeekend = false
-    @State private var locationQuery = ""
+    @State private var showOnlyUpcoming: Bool = true
+    @State private var filterToday: Bool = false
+    @State private var filterWeekend: Bool = false
+    @State private var locationQuery: String = ""
     @State private var ticketMinPrice: Double? = nil
     @State private var ticketMaxPrice: Double? = nil
     @State private var tableMinPrice: Double? = nil
     @State private var tableMaxPrice: Double? = nil
-    @State private var showFilters = false
+    @State private var showFilters: Bool = false
 
     var body: some View {
         NavigationView {
@@ -28,6 +52,7 @@ struct EventFeedView: View {
                     ProgressView("Loading Events...")
                         .padding()
                 } else {
+                    // ---------------- Filters header ----------------
                     VStack(alignment: .leading, spacing: 12) {
                         Button(action: { withAnimation { showFilters.toggle() } }) {
                             HStack {
@@ -80,8 +105,9 @@ struct EventFeedView: View {
                     }
                     .padding(.horizontal)
 
+                    // ---------------- Lists ----------------
                     List {
-                        // --- Platform events (your own) ---
+                        // Platform events
                         Section(header: Text("BlackApp Events")) {
                             if platformEvents.isEmpty {
                                 Text("No upcoming events.")
@@ -89,8 +115,24 @@ struct EventFeedView: View {
                                     .italic()
                                     .padding(.vertical)
                             } else {
-                                ForEach(filteredEvents(), id: \.id) { event in
+                                ForEach(filteredPlatformEvents(), id: \.id) { event in
                                     EventCardView(event: event)
+                                        .listRowSeparator(.hidden)
+                                        .listRowBackground(Color.clear)
+                                }
+                            }
+                        }
+
+                        // Imported Eventbrite events
+                        Section(header: Text("Eventbrite")) {
+                            if externalEvents.isEmpty {
+                                Text("No imported Eventbrite events.")
+                                    .foregroundColor(.gray)
+                                    .italic()
+                                    .padding(.vertical)
+                            } else {
+                                ForEach(filteredExternalEvents()) { ev in
+                                    EventbriteCardView(item: ev)
                                         .listRowSeparator(.hidden)
                                         .listRowBackground(Color.clear)
                                 }
@@ -104,14 +146,18 @@ struct EventFeedView: View {
             .background(Color.black.edgesIgnoringSafeArea(.all))
             .onAppear {
                 isLoading = true
+                // Load both sources in parallel
                 fetchPlatformEvents()
+                fetchExternalEventbrite()
             }
         }
         .preferredColorScheme(.dark)
     }
 }
 
-// MARK: - DATA (Platform only)
+// =====================================================
+// MARK: - DATA LOADERS
+// =====================================================
 extension EventFeedView {
     func fetchPlatformEvents() {
         let ref = Database.database().reference().child("events")
@@ -124,15 +170,68 @@ extension EventFeedView {
                 }
             }
             platformEvents = events.sorted { $0.date > $1.date }
-            isLoading = false
+            maybeFinishLoading()
         }
+    }
+
+    func fetchExternalEventbrite() {
+        let ref = Database.database().reference()
+            .child("externalEvents")
+            .child("eventbrite")
+
+        ref.observeSingleEvent(of: .value) { snapshot in
+            var out: [EBEvent] = []
+
+            for case let child as DataSnapshot in snapshot.children {
+                guard let dict = child.value as? [String: Any] else { continue }
+
+                let id: String = child.key
+                let title: String = (dict["title"] as? String) ?? "Event"
+                let venueName: String = (dict["venueName"] as? String) ?? ""
+                let address: String = (dict["address"] as? String) ?? ""
+                let isoDate: String = (dict["date"] as? String) ?? ""
+                let imageURL: String? = (dict["imageURL"] as? String) ?? (dict["heroImage"] as? String)
+                let externalURL: String? = (dict["externalURL"] as? String)
+                let source: String = (dict["source"] as? String) ?? "eventbrite"
+
+                // Parse ISO8601 to Date with explicit fallback
+                let parsedDate: Date = {
+                    if let d = _iso8601Z.date(from: isoDate) { return d }
+                    let alt = ISO8601DateFormatter()
+                    if let d2 = alt.date(from: isoDate) { return d2 }
+                    return Date()
+                }()
+
+                out.append(EBEvent(
+                    id: id,
+                    title: title,
+                    venueName: venueName,
+                    address: address,
+                    date: parsedDate,
+                    imageURL: imageURL,
+                    externalURL: externalURL,
+                    source: source
+                ))
+            }
+
+            self.externalEvents = out.sorted { $0.date < $1.date }
+            maybeFinishLoading()
+        }
+    }
+
+    private func maybeFinishLoading() {
+        // Simple spinner gate: once either loader completes, turn off.
+        // If you want stricter gating, track two booleans and end only after both finish.
+        if isLoading { isLoading = false }
     }
 }
 
-// MARK: - FILTERING (applies to internal events)
+// =====================================================
+// MARK: - FILTERING
+// =====================================================
 extension EventFeedView {
-    func filteredEvents() -> [EventModel] {
-        var out = platformEvents
+    func filteredPlatformEvents() -> [EventModel] {
+        var out: [EventModel] = platformEvents
 
         if showOnlyUpcoming {
             out = out.filter { $0.date >= Date() }
@@ -158,18 +257,45 @@ extension EventFeedView {
 
         return out.sorted { $0.date < $1.date }
     }
+
+    func filteredExternalEvents() -> [EBEvent] {
+        var out: [EBEvent] = externalEvents
+
+        if showOnlyUpcoming {
+            out = out.filter { $0.date >= Date() }
+        }
+        if filterToday {
+            let cal = Calendar.current
+            out = out.filter { cal.isDateInToday($0.date) }
+        }
+        if filterWeekend {
+            let cal = Calendar.current
+            out = out.filter { cal.isDateInWeekend($0.date) }
+        }
+
+        if !locationQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+            let q = locationQuery.lowercased()
+            out = out.filter {
+                $0.address.lowercased().contains(q) ||
+                $0.venueName.lowercased().contains(q) ||
+                $0.title.lowercased().contains(q)
+            }
+        }
+        // Price filters are platform-only; Eventbrite feed doesn't include our ticket/table fields.
+
+        return out.sorted { $0.date < $1.date }
+    }
 }
 
-// =======================
-// MARK: - Event Card View
-// =======================
-
+// =====================================================
+// MARK: - Event Card View (Platform events - unchanged)
+// =====================================================
 struct EventCardView: View {
     let event: EventModel
 
-    @State private var showCheckout = false
-    @State private var isSaved = false
-    @State private var showShareOptions = false   // stays, but dialog moved to container
+    @State private var showCheckout: Bool = false
+    @State private var isSaved: Bool = false
+    @State private var showShareOptions: Bool = false
 
     // Compact formatters
     private static let dateFormatter: DateFormatter = {
@@ -254,7 +380,7 @@ struct EventCardView: View {
                 }
             }
 
-            // Save & Share (buttons are now 'borderless' so taps don't bubble to row)
+            // Save & Share
             HStack {
                 Button(action: {
                     isSaved.toggle()
@@ -275,7 +401,7 @@ struct EventCardView: View {
             .font(.caption)
             .padding(.top, 4)
 
-            // Checkout (also borderless so the row never hijacks it)
+            // Checkout
             Button(action: { showCheckout = true }) {
                 Text("Buy Tickets / Tables")
                     .foregroundColor(.white)
@@ -290,14 +416,13 @@ struct EventCardView: View {
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(12)
-        .contentShape(Rectangle())                 // keep taps well-scoped
+        .contentShape(Rectangle())
         .onAppear(perform: checkIfSaved)
         .sheet(isPresented: $showCheckout) {
             CheckoutConfirmationView(event: event) { ticketQty, tableQty in
                 openCheckout(ticketQty: ticketQty, tableQty: tableQty)
             }
         }
-        // ⬇️ Moved here: ONLY shows when showShareOptions is set by the Share button
         .confirmationDialog("Share Event",
                             isPresented: $showShareOptions,
                             titleVisibility: .visible) {
@@ -377,14 +502,19 @@ struct EventCardView: View {
             shareToSystem()
         }
     }
+
     private func shareToSystem() {
         guard let url = buildEventDeepLink() else { return }
         presentSystemShare([makeEventCaption(), url])
     }
+
     private func buildEventDeepLink() -> URL? {
         URL(string: "https://blackappios.web.app/event.html?eventId=\(event.id)")
     }
+
     private func makeEventCaption() -> String {
+        let dateText = Self.dateFormatter.string(from: event.date)
+        let timeText = Self.timeFormatter.string(from: event.date)
         var parts: [String] = []
         parts.append(event.title)
         parts.append("\(dateText) • \(timeText)")
@@ -395,8 +525,125 @@ struct EventCardView: View {
     }
 }
 
+// =====================================================
+// MARK: - Eventbrite Card (External events UI)
+// =====================================================
+fileprivate struct EventbriteCardView: View {
+    let item: EBEvent
 
-// MARK: - Generic share presenters (safe fallback)
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .none; return f
+    }()
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .none; f.timeStyle = .short; return f
+    }()
+    private var dateText: String { Self.dateFormatter.string(from: item.date) }
+    private var timeText: String { Self.timeFormatter.string(from: item.date) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Remote hero image
+            if let urlStr = item.imageURL, let url = URL(string: urlStr) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty:
+                        ZstackLoader()
+                    case .success(let img):
+                        img.resizable().scaledToFill()
+                    case .failure:
+                        Color.gray.opacity(0.2)
+                    @unknown default:
+                        Color.gray.opacity(0.2)
+                    }
+                }
+                .frame(height: 200)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+
+            // Title + source badge
+            HStack(spacing: 8) {
+                Text(item.title).font(.headline)
+                Spacer()
+                Text("via Eventbrite")
+                    .font(.caption2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.2))
+                    .cornerRadius(6)
+            }
+
+            HStack(spacing: 12) {
+                Label(dateText, systemImage: "calendar")
+                Label(timeText, systemImage: "clock")
+            }
+            .font(.subheadline)
+            .foregroundColor(.white.opacity(0.9))
+
+            if !item.venueName.isEmpty || !item.address.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "mappin.and.ellipse").foregroundColor(.gray)
+                    Text(item.venueName.isEmpty ? item.address : "\(item.venueName), \(item.address)")
+                        .font(.subheadline).foregroundColor(.gray)
+                        .lineLimit(2)
+                }
+            }
+
+            // --- Actions ---
+            VStack(spacing: 8) {
+                // Buy inside BlackApp (embedded checkout page)
+                Button {
+                    let uid = Auth.auth().currentUser?.uid ?? "anon"
+                    if let url = URL(string: "https://blackappios.web.app/eb.html?eventId=\(item.id)&userId=\(uid)") {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Text("Buy in BlackApp")
+                        .foregroundColor(.white)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue)
+                        .cornerRadius(10)
+                }
+                .buttonStyle(.borderless)
+
+                // Open directly on Eventbrite (fallback / alternative)
+                if let urlStr = item.externalURL, let url = URL(string: urlStr) {
+                    Button {
+                        UIApplication.shared.open(url)
+                    } label: {
+                        Text("Open in Eventbrite")
+                            .foregroundColor(.white)
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.orange)
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(.top, 6)
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+}
+
+// Small loader view for AsyncImage empty state
+fileprivate struct ZstackLoader: View {
+    var body: some View {
+        ZStack {
+            Color.gray.opacity(0.2)
+            ProgressView()
+        }
+    }
+}
+
+
+// =====================================================
+// MARK: - Generic share presenters (existing helpers)
+// =====================================================
 private func presentSystemShare(_ items: [Any]) {
     DispatchQueue.main.async {
         guard let top = topMostController() else { return }

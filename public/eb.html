@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Eventbrite Checkout | BlackApp</title>
+  <style>
+    :root {
+      --bg: #000;
+      --fg: #fff;
+      --muted: #9aa0a6;
+      --brand: #2563EB; /* Blue */
+      --card: rgba(20,20,20,0.9);
+      --border: rgba(255,255,255,0.08);
+    }
+    html, body {
+      margin: 0; padding: 0;
+      height: 100%; width: 100%;
+      background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Arial, sans-serif;
+      display: flex; flex-direction: column;
+    }
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: saturate(1.1) blur(6px);
+    }
+    .topbar {
+      display: flex; align-items: center; justify-content: center;
+      height: 56px;
+    }
+    .topbar img { height: 36px; }
+    .hero {
+      position: relative;
+      width: 100%;
+      min-height: 180px;
+      display: grid;
+      grid-template-columns: 1fr;
+      align-items: end;
+      overflow: hidden;
+      background: #111;
+    }
+    .hero img {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      object-fit: cover; filter: brightness(0.75);
+    }
+    .heroShade {
+      position: absolute; inset: 0;
+      background: linear-gradient(to top, rgba(0,0,0,.7), rgba(0,0,0,.0) 60%);
+    }
+    .heroContent {
+      position: relative; z-index: 1;
+      padding: 16px;
+    }
+    .title { font-size: 20px; font-weight: 700; line-height: 1.25; }
+    .meta  { margin-top: 6px; color: var(--muted); font-size: 13px; }
+    .meta span { margin-right: 12px; white-space: nowrap; }
+    main { flex: 1; display: flex; flex-direction: column; }
+    #checkoutContainer { min-height: 420px; }
+    footer {
+      border-top: 1px solid var(--border);
+      background: var(--card);
+      padding: 12px; text-align: center; color: var(--muted); font-size: 12px;
+    }
+    .back-btn {
+      display: inline-block; margin-top: 8px; padding: 8px 16px;
+      background: var(--brand); border-radius: 10px; color: #fff; text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <img src="https://blackapp.io/images/blackapp-logo.png" alt="BlackApp"/>
+    </div>
+    <div class="hero" id="hero">
+      <img id="heroImg" alt="" style="display:none;">
+      <div class="heroShade"></div>
+      <div class="heroContent">
+        <div id="heroTitle" class="title">Loading…</div>
+        <div id="heroMeta" class="meta"></div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="checkoutContainer">
+      <p style="padding:40px; text-align:center; opacity:.85">Loading secure checkout…</p>
+    </div>
+  </main>
+
+  <footer>
+    Secure checkout powered by Eventbrite<br/>
+    <a class="back-btn" href="blackappios://events">Back to BlackApp</a>
+  </footer>
+
+  <!-- Eventbrite embed -->
+  <script src="https://www.eventbrite.com/static/widgets/eb_widgets.js"></script>
+  <script>
+    // ---- Config ----
+    const RTDB_BASE = "https://blackappios-default-rtdb.firebaseio.com"; // change if your RTDB host is different
+
+    // ---- Utils ----
+    const qs = new URLSearchParams(location.search);
+    const eventId = qs.get("eventId");
+    const userId  = qs.get("userId") || "anon";
+
+    function fmtDateTime(iso) {
+      try {
+        const d = new Date(iso);
+        const ds = d.toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" });
+        const ts = d.toLocaleTimeString(undefined, { hour: "numeric", minute:"2-digit" });
+        return `${ds} • ${ts}`;
+      } catch { return ""; }
+    }
+
+    async function fetchJSON(url) {
+      const r = await fetch(url, { credentials: "omit" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }
+
+    async function loadEventMeta(id) {
+      // Pull from RTDB: /externalEvents/eventbrite/{eventId}
+      const url = `${RTDB_BASE}/externalEvents/eventbrite/${encodeURIComponent(id)}.json`;
+      try {
+        const m = await fetchJSON(url);
+        if (!m || typeof m !== "object") return null;
+        return {
+          title: m.title || "Event",
+          dateISO: m.date || null,
+          venueName: m.venueName || "",
+          address: m.address || "",
+          imageURL: m.imageURL || m.heroImage || ""
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    function renderHeader(meta) {
+      const titleEl = document.getElementById("heroTitle");
+      const metaEl  = document.getElementById("heroMeta");
+      const imgEl   = document.getElementById("heroImg");
+
+      if (meta?.title) {
+        titleEl.textContent = meta.title;
+        document.title = `${meta.title} | BlackApp`;
+      } else {
+        titleEl.textContent = "Event";
+      }
+
+      const bits = [];
+      if (meta?.dateISO) bits.push(fmtDateTime(meta.dateISO));
+      if (meta?.venueName) bits.push(meta.venueName);
+      if (meta?.address && !meta.venueName?.length) bits.push(meta.address);
+      metaEl.textContent = bits.join("   •   ");
+
+      if (meta?.imageURL) {
+        imgEl.src = meta.imageURL;
+        imgEl.style.display = "block";
+      } else {
+        imgEl.removeAttribute("src");
+        imgEl.style.display = "none";
+      }
+    }
+
+    async function boot() {
+      if (!eventId) {
+        document.getElementById("heroTitle").textContent = "Missing eventId";
+        return;
+      }
+
+      // 1) Load and render metadata (non-blocking for checkout)
+      loadEventMeta(eventId).then(renderHeader).catch(()=>{});
+
+      // 2) Mount embedded checkout
+      document.getElementById("checkoutContainer").innerHTML = "";
+      window.EBWidgets.createWidget({
+        widgetType: "checkout",
+        eventId: eventId,
+        iframeContainerId: "checkoutContainer",
+        onOrderComplete: function() {
+          // Nudge your backend to reconcile this event's orders
+          fetch(`/api/eb/order-complete?eventId=${encodeURIComponent(eventId)}&userId=${encodeURIComponent(userId)}`)
+            .catch(()=>{});
+        }
+      });
+    }
+
+    boot();
+  </script>
+</body>
+</html>
+

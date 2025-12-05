@@ -33,7 +33,7 @@
           { "key": "X-Frame-Options", "value": "SAMEORIGIN" },
           {
             "key": "Content-Security-Policy",
-            "value": "default-src 'self'; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com; media-src 'self' blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com; connect-src 'self' https://us-central1-blackappios.cloudfunctions.net https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://firebasestorage.googleapis.com https://*.firebasestorage.app; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://www.googletagmanager.com; style-src 'self' 'unsafe-inline'; frame-ancestors 'self'; base-uri 'self';"
+            "value": "default-src 'self'; frame-src 'self' https://www.eventbrite.com https://*.eventbrite.com; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com https://img.evbuc.com; media-src 'self' blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com; connect-src 'self' https://us-central1-blackappios.cloudfunctions.net https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://firebasestorage.googleapis.com https://*.firebasestorage.app https://www.eventbriteapi.com https://www.eventbrite.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://www.googletagmanager.com https://www.eventbrite.com; style-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'self';"
           }
         ]
       }
@@ -49,6 +49,13 @@
 
       { "source": "/api/rssBundle",        "function": { "functionId": "rssBundle",        "region": "us-central1" } },
       { "source": "/api/imgThumb",         "function": { "functionId": "imgThumb",         "region": "us-central1" } },
+
+      { "source": "/api/eventbrite/webhook", "function": { "functionId": "ebWebhook",         "region": "us-central1" } },
+      { "source": "/api/eb/order-complete",  "function": { "functionId": "ebOrderComplete",   "region": "us-central1" } },
+
+      { "source": "/api/eb/claim",         "function": { "functionId": "ebClaimTicket",  "region": "us-central1" } },
+      { "source": "/api/eb/list-unclaimed","function": { "functionId": "ebListUnclaimed",
+"region": "us-central1" } },
 
       { "source": "**", "destination": "/index.html" }
     ]

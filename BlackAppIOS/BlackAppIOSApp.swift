@@ -2,6 +2,7 @@
 // Keeps: Firebase (Auth/DB/Firestore), App Check, FCM/APNs bridge,
 // OneSignal, deep links, referral capture, Invite Orb, payment sheet.
 // Adds: Actionable notifications + in-app center reply dialog + loud diagnostics.
+// Also adds: ZORA_QUICK (AI Assistant) watch-first quick actions wired to backend intents.
 
 import SwiftUI
 import Combine
@@ -22,10 +23,16 @@ import UserNotifications
 
 // MARK: - Notification Category & Action IDs
 fileprivate enum PushUX {
+    // Chat
     static let categoryChat = "CHAT_MESSAGE"
     static let actionReply  = "REPLY_ACTION"
     static let actionOpen   = "OPEN_ACTION"
     static let actionRead   = "MARK_READ_ACTION"
+
+    // AI Assistant (watch-first)
+    static let categoryAI      = "ZORA_QUICK"
+    static let actionTonight   = "ZORA_TONIGHT"
+    static let actionSnooze    = "ZORA_SNOOZE"
 }
 
 // MARK: - AppDelegate
@@ -76,11 +83,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // --- OneSignal (skip on Simulator to reduce noise) ---
         #if !targetEnvironment(simulator)
         OneSignal.initialize("69366bbb-2d87-44b1-921c-3fd2cba8effc", withLaunchOptions: launchOptions)
-
-        // Optionally enable verbose logs if your SDK has this API
-        // #if DEBUG
-        // OneSignal.Debug.setLogLevel(.LL_VERBOSE)
-        // #endif
 
         // Optional soft re-prompt if not granted
         UNUserNotificationCenter.current().getNotificationSettings { settings in
@@ -134,11 +136,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         print("📵 OneSignal disabled on Simulator")
         #endif
 
+        // --- Persist timezone for regional nudges (if already authed) ---
+        if let uid = Auth.auth().currentUser?.uid {
+            let tz = TimeZone.current.identifier
+            Firestore.firestore().collection("users").document(uid)
+                .setData(["timezone": tz], merge: true)
+        }
+
         return true
     }
 
-    /// Register iOS notification actions and categories (text input reply, open, mark read)
+    /// Register iOS notification actions and categories (text input reply, open, mark read, ZORA_QUICK)
     private func registerNotificationCategories() {
+        // --- Chat category ---
         let reply = UNTextInputNotificationAction(
             identifier: PushUX.actionReply,
             title: "Reply",
@@ -166,7 +176,28 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             options: [.customDismissAction]
         )
 
-        UNUserNotificationCenter.current().setNotificationCategories([chat])
+        // --- AI Assistant (watch-first) category ---
+        // Foreground so tapping "Tonight" opens the app and we can show the panel
+        let tonight = UNNotificationAction(
+            identifier: PushUX.actionTonight,
+            title: "Tonight",
+            options: [.foreground]
+        )
+
+        let snooze = UNNotificationAction(
+            identifier: PushUX.actionSnooze,
+            title: "Snooze",
+            options: []
+        )
+
+        let ai = UNNotificationCategory(
+            identifier: PushUX.categoryAI,
+            actions: [tonight, snooze],
+            intentIdentifiers: [],
+            options: []
+        )
+
+        UNUserNotificationCenter.current().setNotificationCategories([chat, ai])
     }
 
     // MARK: - Diagnostics Helpers
@@ -228,6 +259,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         } else {
             print("⚠️ FCM bridge has no APNs token yet")
         }
+
+        // Persist FCM token for server pushes
+        if let uid = Auth.auth().currentUser?.uid, let token = fcmToken, !token.isEmpty {
+            Firestore.firestore()
+                .collection("users").document(uid)
+                .collection("fcmTokens").document(token)
+                .setData(["active": true], merge: true)
+        }
     }
 
     // Foreground push presentation
@@ -258,7 +297,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 userInfo: c.userInfo
             )
         } else {
-            // Non-chat pushes keep normal behavior
+            // Non-chat pushes keep normal behavior (ZORA_QUICK shows)
             completionHandler([.banner, .list, .sound])
         }
     }
@@ -276,12 +315,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         completionHandler(.noData)
     }
 
+    // Handle taps / quick actions
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
 
         switch response.actionIdentifier {
+        // --- Chat actions ---
         case PushUX.actionReply:
             if let textResp = response as? UNTextInputNotificationResponse {
                 QuickReplyHandler.shared.sendReply(userInfo: userInfo, text: textResp.userText) { _ in
@@ -298,6 +339,22 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                             userInfo: userInfo)
             completionHandler()
             return
+
+        // --- AI Assistant quick actions (watch-first) ---
+        case PushUX.actionTonight:
+            // Open the assistant panel and fetch tonight's picks
+            NotificationCenter.default.post(name: .zoraOpenAssistantPanel, object: nil)
+            Task {
+                let uid = Auth.auth().currentUser?.uid
+                await callAIIntent(uid: uid, intent: "nightlife.suggest", payload: nil)
+                completionHandler()
+            }
+            return
+        case PushUX.actionSnooze:
+            // Optional: Tell backend to defer nudges; for now, no-op
+            completionHandler()
+            return
+
         default:
             break
         }
@@ -308,20 +365,37 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                         userInfo: userInfo)
         completionHandler()
     }
+
+    // MARK: - AI Assistant: backend intent caller (uses RemoteOrbService; falls back to HTTP)
+    private func callAIIntent(uid: String?, intent: String, payload: [String:String]?) async {
+        do {
+            _ = try await RemoteOrbService.shared.runIntent(uid: uid, intent: intent, payload: payload)
+        } catch {
+            await fallbackAIRequest(uid: uid, intent: intent, payload: payload)
+        }
+    }
+
+    private func fallbackAIRequest(uid: String?, intent: String, payload: [String:String]?) async {
+        struct HandleBody: Codable { let uid: String; let intent: String; let payload: [String:String]? }
+        let project = "blackappios"
+        guard let url = URL(string: "https://us-central1-\(project).cloudfunctions.net/aiOrbHandle") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = HandleBody(uid: uid ?? Auth.auth().currentUser?.uid ?? "", intent: intent, payload: payload)
+        do {
+            req.httpBody = try JSONEncoder().encode(body)
+            _ = try await URLSession.shared.data(for: req)
+        } catch {
+            print("⚠️ fallbackAIRequest error: \(error.localizedDescription)")
+        }
+    }
 }
 
 // MARK: - Notification names
 extension Notification.Name {
     static let openEventFromDeepLink = Notification.Name("OpenEventFromDeepLink")
-}
-
-// MARK: - Referral helper
-fileprivate func storePendingReferrer(from url: URL) {
-    guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-          let ref = comps.queryItems?.first(where: { $0.name.lowercased() == "ref" })?.value,
-          !ref.isEmpty else { return }
-    UserDefaults.standard.set(ref, forKey: "pendingReferrerUid")
-    print("🔗 Stored pending referrer: \(ref)")
+    static let zoraOpenAssistantPanel = Notification.Name("ZoraOpenAssistantPanel")
 }
 
 // MARK: - Overlay wrapper (pins the orb bottom-right over any content)
@@ -382,8 +456,6 @@ fileprivate enum OrbPalette {
 }
 
 // MARK: - Logo mark (top-left “stamp”)
-// Looks for an asset named "BlackAppMark", "AppLogo", or "blackapp_logo".
-// Falls back to a system symbol if not found.
 fileprivate struct LogoMark: View {
     var size: CGFloat = 26
 
@@ -436,12 +508,10 @@ fileprivate struct FuturisticGlassPanel<Content: View>: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(baseFill)
                 .overlay(
-                    // thin inner highlight for glassy look
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .stroke(.white.opacity(0.08), lineWidth: 1)
                 )
                 .overlay(
-                    // animated glowing rim
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .stroke(rim, lineWidth: pulse ? 1.8 : 1.1)
                         .blur(radius: pulse ? 0.9 : 1.4)
@@ -450,7 +520,6 @@ fileprivate struct FuturisticGlassPanel<Content: View>: View {
                 .shadow(color: OrbPalette.blue.opacity(pulse ? 0.28 : 0.18), radius: pulse ? 22 : 14, x: 0, y: 10)
                 .shadow(color: OrbPalette.violet.opacity(pulse ? 0.28 : 0.18), radius: pulse ? 22 : 14, x: 0, y: 10)
                 .background(
-                    // faint gradient wash under the glass
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .fill(LinearGradient(
                             colors: [OrbPalette.blue.opacity(0.18), OrbPalette.violet.opacity(0.18)],
@@ -663,8 +732,8 @@ final class QuickReplyHandler {
 private struct AuthedContainerView: View {
     @ObservedObject var authVM: AuthViewModel
     @Binding var paymentSuccess: Bool
+    @State private var showZoraPanelFromPush = false
 
-    // Split out to keep the type checker happy
     @ViewBuilder
     private var mainStack: some View {
         MainTabView()
@@ -674,6 +743,10 @@ private struct AuthedContainerView: View {
                 _ = TokenSyncMonitor.shared
                 if let uid = Auth.auth().currentUser?.uid {
                     ReferralManager.consumePendingReferralIfAny(currentUserId: uid)
+                    // Persist timezone on appear in case login just happened
+                    let tz = TimeZone.current.identifier
+                    Firestore.firestore().collection("users").document(uid)
+                        .setData(["timezone": tz], merge: true)
                 }
             }
             // Custom scheme deep links
@@ -698,10 +771,18 @@ private struct AuthedContainerView: View {
             .sheet(isPresented: $paymentSuccess) {
                 PaymentSuccessSheet(paymentSuccess: $paymentSuccess)
             }
+            // Open the Zora panel when Tonight is tapped from the push
+            .onReceive(NotificationCenter.default.publisher(for: .zoraOpenAssistantPanel)) { _ in
+                showZoraPanelFromPush = true
+            }
+            .sheet(isPresented: $showZoraPanelFromPush) {
+                // Start directly on nightlife suggestions
+                OrbPanel(uid: authVM.user?.uid, initialIntent: "nightlife.suggest", initialPayload: nil)
+                    .ignoresSafeArea(edges: .bottom)
+            }
     }
 
     var body: some View {
-        // Keep the view tree simple to avoid type-checker blowups
         InviteOrbOverlay(userId: authVM.user?.uid, circleSize: nil) {
             mainStack
         }
@@ -709,6 +790,9 @@ private struct AuthedContainerView: View {
         .onChange(of: authVM.user?.uid) { newUid in
             if let uid = newUid {
                 ReferralManager.consumePendingReferralIfAny(currentUserId: uid)
+                let tz = TimeZone.current.identifier
+                Firestore.firestore().collection("users").document(uid)
+                    .setData(["timezone": tz], merge: true)
             }
         }
     }
@@ -729,9 +813,6 @@ private struct PaymentSuccessSheet: View {
 }
 
 // MARK: - App Entry
-import SwiftUI
-import FirebaseAuth
-
 @main
 struct BlackAppIOSApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
@@ -758,9 +839,15 @@ struct BlackAppIOSApp: App {
             // Forward phone-auth callback URLs to Firebase Auth
             .onOpenURL { url in
                 if Auth.auth().canHandle(url) { return }
-                // Handle other deep links here if needed
             }
         }
     }
 }
-
+// MARK: - Referral helper (captures ?ref=... from deep/universal links)
+fileprivate func storePendingReferrer(from url: URL) {
+    guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          let ref = comps.queryItems?.first(where: { $0.name.lowercased() == "ref" })?.value,
+          !ref.isEmpty else { return }
+    UserDefaults.standard.set(ref, forKey: "pendingReferrerUid")
+    print("🔗 Stored pending referrer: \(ref)")
+}

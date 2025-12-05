@@ -10,6 +10,31 @@ const sharp = require("sharp");
 const { fetch: undiciFetch } = require("undici");
 const parser = new RSSParser();
 
+
+// --- Config helper (non-conflicting) ---
+const getCfg = (() => {
+  // snapshot functions.config() safely
+  let conf = {};
+  try { conf = functions.config() || {}; } catch { conf = {}; }
+
+  // return a reader function
+  return (path, fallback = null) => {
+    try {
+      const v = path
+        .split(".")
+        .reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), conf);
+      if (v !== undefined && v !== null && String(v).length) return v;
+      // fallback to ENV: onesignal.app_id -> ONESIGNAL_APP_ID
+      const envKey = path.toUpperCase().replace(/\./g, "_");
+      return process.env[envKey] ?? fallback;
+    } catch {
+      return fallback;
+    }
+  };
+})();
+
+
+
 // --- Superadmin override (hardcoded UID)
 const SUPERADMIN_UID = "XszTTDbebpcYjiqYqgQPAlxWEs82";
 
@@ -809,95 +834,197 @@ exports.syncInstagramNowOwnedOnly = fn.https.onRequest(async (req, res) => {
 
 
 
-// ---- Load ALL IG partner items (no time window), newest-first, image-safe thumbs with 25% logo fallback
-async function loadAllPartnerInstagramItems({ thumbWidth = 900, partnerLimit /* optional */ } = {}) {
-  // partnerLimit: optional hard cap of total items returned. If omitted, no cap (streams everything).
-  const partnersSnap = await db.ref("/gossip/partners").get();
-  const partnersObj = partnersSnap.val() || {};
+// ---- Load ALL IG partner + nightlife hashtag items
+// - Reads partner posts from /gossip/partners + /gossip/items/{partnerId}
+// - Reads hashtag posts from /gossip/nightlife/igHashtags
+// - Merges, newest-first, with imgThumb + 25% logo fallback
+async function loadAllPartnerInstagramItems({
+  thumbWidth = 900,
+  partnerLimit,       // optional total cap on combined items
+  maxAgeDays = 7      // how far back to look for hashtag items
+} = {}) {
+  const logoFallback = getLogoFallback();
 
-  const enabledPartners = Object.keys(partnersObj).filter(
-    (pid) => partnersObj[pid] && partnersObj[pid].enabled !== false
-  );
-  if (!enabledPartners.length) {
-    console.log("[IG] no enabled partners found");
-    return [];
+  const forceHttps = (u) => {
+    try {
+      if (!u) return null;
+      const url = new URL(String(u));
+      url.protocol = "https:";
+      return url.toString();
+    } catch {
+      return null;
+    }
+  };
+
+  // ---------------------------
+  // 1) Partner IG items
+  // ---------------------------
+  let partnerItems = [];
+  try {
+    const partnersSnap = await db.ref("/gossip/partners").get();
+    const partnersObj = partnersSnap.val() || {};
+
+    const enabledPartners = Object.keys(partnersObj).filter(
+      (pid) => partnersObj[pid] && partnersObj[pid].enabled !== false
+    );
+
+    if (!enabledPartners.length) {
+      console.log("[IG] no enabled partners found");
+    } else {
+      const perPartnerArrays = await Promise.all(
+        enabledPartners.map(async (partnerId) => {
+          try {
+            const ref = db.ref(`/gossip/items/${partnerId}`);
+            const snap = await ref.orderByChild("timestamp").get();
+            const bucket = [];
+
+            snap.forEach((cs) => {
+              const v = cs.val() || {};
+              const ts = Number(v.timestamp || v.createdAt || 0);
+
+              const candidates = [v.image, v.rawThumbUrl, v.rawMediaUrl].filter(Boolean);
+              const rawBest = forceHttps(candidates[0] || null);
+
+              const safeThumb = cfUrl("imgThumb", {
+                url: rawBest || "",
+                w: thumbWidth,
+                fallback: logoFallback,
+                fallbackScale: 0.25,
+              });
+
+              if (!safeThumb && !rawBest) return;
+
+              bucket.push({
+                id: String(v.id || cs.key),
+                title: String(v.title || v.caption || "Instagram Post"),
+                link: String(v.permalink || v.link || ""),
+                summary: String(v.caption || v.title || "").slice(0, 800),
+                pubDate: ts > 0 ? ts : Date.now(),
+                image: rawBest || null,
+                thumb: safeThumb || rawBest || null,
+                aspect: null,
+                kind: "nightlife",              // partner content is nightlife
+                source: `instagram:${partnerId}`,
+              });
+            });
+
+            bucket.sort((a, b) => b.pubDate - a.pubDate);
+            console.log("[IG] partner loaded (UNBOUNDED)", {
+              partnerId,
+              count: bucket.length,
+              firstTs: bucket[0]?.pubDate ?? null,
+              lastTs: bucket[bucket.length - 1]?.pubDate ?? null,
+            });
+
+            return bucket;
+          } catch (e) {
+            console.warn(`[IG] partner ${partnerId} load error:`, e?.message || e);
+            return [];
+          }
+        })
+      );
+
+      partnerItems = perPartnerArrays.flat().sort((a, b) => b.pubDate - a.pubDate);
+    }
+  } catch (e) {
+    console.warn("[IG] partners root load error:", e?.message || e);
   }
 
-  const perPartnerArrays = await Promise.all(
-    enabledPartners.map(async (partnerId) => {
-      try {
-        // ⬇️ No per-partner limit: pull the whole bucket ordered by timestamp
-        const ref = db.ref(`/gossip/items/${partnerId}`);
-        const snap = await ref.orderByChild("timestamp").get();
-        const bucket = [];
+  // ---------------------------
+  // 2) Nightlife hashtag items
+  //    (Afro-diaspora events from /gossip/nightlife/igHashtags)
+  // ---------------------------
+  let hashtagItems = [];
+  try {
+    const snap = await db.ref("gossip/nightlife/igHashtags").get();
+    if (!snap.exists()) {
+      console.log("[IG] no gossip/nightlife/igHashtags data");
+    } else {
+      const now = Date.now();
+      const cutoffMs = now - maxAgeDays * 24 * 60 * 60 * 1000;
 
-        snap.forEach((cs) => {
+      const bucket = [];
+
+      snap.forEach((tagSnap) => {
+        const tag = tagSnap.key; // e.g. "afrobeats"
+        tagSnap.forEach((cs) => {
           const v = cs.val() || {};
-          const ts = Number(v.timestamp || v.createdAt || 0);
+          if (!v.mediaUrl) return;
 
-          // Choose the best raw image candidate we have on record
-          const candidates = [v.image, v.rawThumbUrl, v.rawMediaUrl].filter(Boolean);
-const forceHttps = (u) => {
-  try { const url = new URL(String(u)); url.protocol = "https:"; return url.toString(); }
-  catch { return null; }
-};
-          const rawBest = forceHttps(candidates[0] || null);
+          const tsMs =
+            (v.timestamp ? v.timestamp * 1000 : null) ||
+            (v.createdAt || now);
 
-          // Always build a thumb that:
-          //  - returns logo (25% centered) fast when real image isn’t reachable yet
-          //  - swaps to the real image automatically as soon as it’s available
+          // ignore very old posts
+          if (tsMs < cutoffMs) return;
+
+          // nightlife keyword filter (Afro-diaspora, clubs, brunch, etc.)
+          if (!matchesNightlife(v.caption || v.hashtag || "")) {
+            // comment this out if you want *all* hashtag posts
+            // return;
+          }
+
+          const rawBest = forceHttps(v.mediaUrl);
           const safeThumb = cfUrl("imgThumb", {
             url: rawBest || "",
             w: thumbWidth,
-            fallback: getLogoFallback(),
+            fallback: logoFallback,
             fallbackScale: 0.25,
           });
 
-          // If we have neither thumb nor image candidates, skip the item
           if (!safeThumb && !rawBest) return;
 
           bucket.push({
             id: String(v.id || cs.key),
-            title: String(v.title || v.caption || "Instagram Post"),
-            link: String(v.permalink || v.link || ""),
-            summary: String(v.caption || v.title || "").slice(0, 800),
-            pubDate: ts > 0 ? ts : Date.now(),
+            title: String(v.caption || "Instagram Post"),
+            link: String(v.permalink || ""),
+            summary: String(v.caption || "").slice(0, 800),
+            pubDate: tsMs,
             image: rawBest || null,
             thumb: safeThumb || rawBest || null,
             aspect: null,
-            kind: "nightlife",              // partner content is nightlife for the client’s 80/20
-            source: `instagram:${partnerId}`,
+            kind: "nightlife",
+            source: v.source || "instagram",
+            hashtag: v.hashtag || tag,
+            mediaType: v.mediaType || "IMAGE",
           });
         });
+      });
 
-        bucket.sort((a, b) => b.pubDate - a.pubDate);
-        console.log("[IG] partner loaded (UNBOUNDED)", {
-          partnerId,
-          count: bucket.length,
-          firstTs: bucket[0]?.pubDate ?? null,
-          lastTs: bucket[bucket.length - 1]?.pubDate ?? null,
-        });
+      bucket.sort((a, b) => b.pubDate - a.pubDate);
+      console.log("[IG] hashtag nightlife items loaded", bucket.length);
+      hashtagItems = bucket;
+    }
+  } catch (e) {
+    console.warn("[IG] hashtag nightlife load error:", e?.message || e);
+  }
 
-        return bucket;
-      } catch (e) {
-        console.warn(`[IG] partner ${partnerId} load error:`, e?.message || e);
-        return [];
-      }
-    })
+  // ---------------------------
+  // 3) Merge + global sort + optional cap
+  // ---------------------------
+  let all = [...partnerItems, ...hashtagItems].sort(
+    (a, b) => b.pubDate - a.pubDate
   );
-
-  // Flatten everything, newest first — no time window, no per-partner cap
-  let all = perPartnerArrays.flat().sort((a, b) => b.pubDate - a.pubDate);
 
   if (Number.isFinite(partnerLimit) && partnerLimit > 0) {
     all = all.slice(0, partnerLimit);
   }
 
-  console.log("[IG] combined items (UNBOUNDED):", all.length, all.slice(0, 3).map((x) => ({
-    id: x.id, ts: x.pubDate, src: x.source,
-  })));
+  console.log("[IG] combined partner+hashtag items:", {
+    total: all.length,
+    partners: partnerItems.length,
+    hashtags: hashtagItems.length,
+    sample: all.slice(0, 3).map((x) => ({
+      id: x.id,
+      ts: x.pubDate,
+      src: x.source,
+      hashtag: x.hashtag || null,
+    })),
+  });
+
   return all;
 }
+
 
 // ====== config / helpers ======
 
@@ -1443,69 +1570,792 @@ async function pullOne(handle) {
 
   return { handle, added: 0, mode: "none", note: "no eligible tweet found" };
 }
+// ==============================
+// Week 2: Hashtag ingest for X
+// Normalizes to /gossip/xnews/posts
+// ==============================
 
-// --- Public pull: GET /xNewsPullNow?users=a,b (global cap=3/day; per-handle=1/day) ---
+
+// Map common nightlife tags → city label (tweak to taste)
+const CITY_MAP = {
+  "#charlottenights": "Charlotte, NC",
+  "#lagosafrobeats": "Lagos, NG",
+  "#atlafterdark": "Atlanta, GA"
+};
+
+// Tiny sentiment stub (placeholder)
+function quickSentiment(s) {
+  const t = (s || "").toLowerCase();
+  const pos = ["lit","amazing","dope","fire","love","vibe","vibes","great","packed"];
+  const neg = ["bad","trash","boring","cancelled","late","problem"];
+  let score = 0;
+  pos.forEach(w => { if (t.includes(w)) score++; });
+  neg.forEach(w => { if (t.includes(w)) score--; });
+  return score > 0 ? "pos" : score < 0 ? "neg" : "neu";
+}
+
+// Normalize a tweet (with attached _includes) to our schema
+function mapTweet(t) {
+  const id = String(t.id);
+  const text = t.text || "";
+  const media = [];
+  if (t._includes?.media?.length) {
+    for (const m of t._includes.media) {
+      if (m.type === "photo" && m.url) media.push({ type: "photo", url: m.url });
+      if (m.type === "video" && m.preview_image_url)
+        media.push({ type: "video", url: m.preview_image_url });
+    }
+  }
+  const user = t._includes?.users?.[0] || {};
+  const lower = text.toLowerCase();
+  const cityKey = Object.keys(CITY_MAP).find(h => lower.includes(h)) || null;
+
+  return {
+    id: `x_${id}`,
+    source: "x",
+    authorName: user.name || "",
+    authorHandle: user.username ? `@${user.username}` : "",
+    authorAvatar: user.profile_image_url || "",
+    text,
+    media,
+    createdAt: t.created_at || new Date().toISOString(),
+    city: cityKey ? CITY_MAP[cityKey] : "",
+    tags: (t.entities?.hashtags || []).map(h => (h.tag || "").toLowerCase()).filter(Boolean),
+    likeCount: t.public_metrics?.like_count || 0,
+    replyCount: t.public_metrics?.reply_count || 0,
+    repostCount: t.public_metrics?.retweet_count || 0,
+    ba: { likes: 0, comments: 0, shares: 0 },   // BlackApp-only counters
+    sentiment: quickSentiment(text)
+  };
+}
+
+// Fetch recent tweets for hashtags (OR query), attach includes, map
+async function fetchXHashtagBatch({ hashtags = [], max = 30 }) {
+  if (!X_CFG.bearer) return [];
+  if (!hashtags.length) return [];
+
+  const url = new URL("https://api.twitter.com/2/tweets/search/recent");
+  const q = "(" + hashtags.map(h => (h.startsWith("#") ? h : `#${h}`)).join(" OR ") + ")";
+  url.searchParams.set("query", `${q} lang:en -is:reply -is:quote`);
+  url.searchParams.set("max_results", String(Math.min(max, 100)));
+  url.searchParams.set("tweet.fields", "created_at,public_metrics,entities");
+  url.searchParams.set("expansions", "attachments.media_keys,author_id");
+  url.searchParams.set("media.fields", "type,url,preview_image_url");
+  url.searchParams.set("user.fields", "name,username,profile_image_url");
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 8000);
+
+  try {
+    const resp = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${X_CFG.bearer}` },
+      signal: ac.signal
+    });
+    const data = await resp.json().catch(() => ({}));
+
+    // weave includes back
+    const includes = data.includes || {};
+    const usersById = {};
+    (includes.users || []).forEach(u => (usersById[u.id] = u));
+    const mediaByKey = {};
+    (includes.media || []).forEach(m => (mediaByKey[m.media_key] = m));
+
+    const out = [];
+    for (const t of data.data || []) {
+      t._includes = {
+        users: [usersById[t.author_id]].filter(Boolean),
+        media: (t.attachments?.media_keys || []).map(k => mediaByKey[k]).filter(Boolean)
+      };
+      out.push(mapTweet(t));
+    }
+    return out;
+  } catch (e) {
+    console.warn("fetchXHashtagBatch error:", e?.message || e);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Save normalized posts; de-dupe by id
+async function saveXPosts(posts) {
+  if (!posts.length) return 0;
+  const ref = rtdb.ref("gossip/xnews/posts");
+  const updates = {};
+  for (const p of posts) updates[p.id] = p;
+  await ref.update(updates);
+  return posts.length;
+}
+
+
+
+
+
+// =======================================
+// UPDATED: Public pull (handles + hashtags)
+// GET /xNewsPullNow?users=@a,@b&hashtags=#CharlotteNights,#LagosAfrobeats&limit=3&hashtag_limit=30
+// =======================================
 exports.xNewsPullNow = fn.https.onRequest(async (req, res) => {
   res.set("Access-Control-Allow-Origin", "*");
   try {
-    // Build the candidate list
+    // ---------- HANDLE MODE (existing behavior) ----------
     const usersQS = String(req.query.users || "").trim();
     let handles;
     if (usersQS) {
-      handles = usersQS
-        .split(",")
-        .map(s => s.replace(/^@/, "").trim())
-        .filter(Boolean);
+      handles = usersQS.split(",").map(s => s.replace(/^@/, "").trim()).filter(Boolean);
     } else {
       const snap = await rtdb.ref("gossip/xnews/handles").get();
       const obj = snap.exists() ? snap.val() : {};
       const fromDb = Object.keys(obj || {});
       handles = fromDb.length ? fromDb : X_PRIORITY_HANDLES;
     }
-    // Re-order to priority
     handles = byPriority(handles);
 
-    // Global daily cap
     const GLOBAL_CAP = Math.max(1, Math.min(10, Number(req.query.limit) || 3)); // default 3/day
-
     const results = [];
     let totalAdded = 0;
 
     for (const h of handles) {
-      if (totalAdded >= GLOBAL_CAP) break;       // stop when the global cap is reached
-      const out = await pullOne(h);              // per-handle cap is enforced inside
+      if (totalAdded >= GLOBAL_CAP) break;
+      const out = await pullOne(h);             // your existing per-handle puller (kept intact)
       results.push(out);
       totalAdded += (out.added || 0);
     }
 
-    return res.json({ ok: true, day: todayUTC(), added: totalAdded, results });
+    // ---------- HASHTAG MODE (NEW) ----------
+    const hashtagsQS = String(req.query.hashtags || "").trim();
+    // If caller provided hashtags, use them; else try a small default set
+    const hashtagList = hashtagsQS
+      ? hashtagsQS.split(",").map(s => s.trim()).filter(Boolean)
+      : ["#CharlotteNights", "#LagosAfrobeats"];
+    const HASHTAG_CAP = Math.max(5, Math.min(100, Number(req.query.hashtag_limit) || 30));
+
+    let hashtagFetched = 0;
+    let hashtagSaved = 0;
+    if (hashtagList.length) {
+      const posts = await fetchXHashtagBatch({ hashtags: hashtagList, max: HASHTAG_CAP });
+      hashtagFetched = posts.length;
+      hashtagSaved = await saveXPosts(posts);
+    }
+
+    return res.json({
+      ok: true,
+      day: todayUTC(),
+      addedFromHandles: totalAdded,
+      resultHandles: results,
+      hashtags: hashtagList,
+      hashtagFetched,
+      hashtagSaved
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// --- Optional cron: hourly sweep honoring caps (cheap) ---
-exports.xNewsCronHourly = fn.pubsub
+// =======================================
+// UPDATED: Cron — hourly sweep (handles + default hashtags)
+// =======================================
+exports.xNewsCronHourly = fn.pubsub.schedule("every 60 minutes").onRun(async () => {
+  try {
+    // Handles (existing logic)
+    const snap = await rtdb.ref("gossip/xnews/handles").get();
+    const obj = snap.exists() ? snap.val() : {};
+    let handles = Object.keys(obj || {});
+    handles = handles.length ? byPriority(handles) : X_PRIORITY_HANDLES;
+
+    let added = 0;
+    const GLOBAL_CAP = 3;
+    for (const h of handles) {
+      if (added >= GLOBAL_CAP) break;
+      const out = await pullOne(h);
+      added += (out.added || 0);
+    }
+
+    // Hashtags (new)
+    const hashtags = ["#CharlotteNights", "#LagosAfrobeats"];
+    const posts = await fetchXHashtagBatch({ hashtags, max: 50 });
+    await saveXPosts(posts);
+  } catch (e) {
+    console.warn("xNewsCronHourly:", e?.message || e);
+  }
+  return null;
+});
+
+
+
+// ====== Social Pulls: Instagram, Facebook, Eventbrite (normalized) ======
+
+// ---- Config (set via firebase functions:config:set …)
+const SOC = (() => {
+  try {
+    const c = functions.config();
+    return {
+      // Instagram Graph
+      ig_token: (c.ig && c.ig.token) || process.env.IG_TOKEN || "",
+      ig_biz_id: (c.ig && c.ig.business_id) || process.env.IG_BUSINESS_ID || "",
+      // Facebook Graph
+      fb_token: (c.fb && c.fb.token) || process.env.FB_TOKEN || "",
+      // Eventbrite (you already set these)
+      eb_token: (c.eventbrite && c.eventbrite.token) || process.env.EVENTBRITE_TOKEN || "",
+      eb_org:   (c.eventbrite && c.eventbrite.org_id) || process.env.EB_ORG_ID || "",
+    };
+  } catch {
+    return {
+      ig_token: process.env.IG_TOKEN || "",
+      ig_biz_id: process.env.IG_BUSINESS_ID || "",
+      fb_token: process.env.FB_TOKEN || "",
+      eb_token: process.env.EVENTBRITE_TOKEN || "",
+      eb_org: process.env.EB_ORG_ID || "",
+    };
+  }
+})();
+
+function isoNow() { return new Date().toISOString(); }
+function keyFrom(s) { return crypto.createHash("md5").update(String(s)).digest("hex").slice(0,16); }
+
+async function savePostsNormalized(posts) {
+  if (!posts || !posts.length) return { saved: 0 };
+  const ref = rtdb.ref("gossip/social/posts");
+  const up = {};
+  for (const p of posts) {
+    const k = p._key || keyFrom(p.link || JSON.stringify(p));
+    up[k] = { ...p, updatedAt: isoNow() };
+  }
+  await ref.update(up);
+  return { saved: posts.length };
+}
+
+// ---------- Instagram: hashtag -> recent media ----------
+async function igHashtagId(tag) {
+  const url = `https://graph.facebook.com/v21.0/ig_hashtag_search?user_id=${encodeURIComponent(SOC.ig_biz_id)}&q=${encodeURIComponent(tag)}&access_token=${encodeURIComponent(SOC.ig_token)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`IG hashtag search failed ${res.status}`);
+  const j = await res.json();
+  return (j.data && j.data[0] && j.data[0].id) ? j.data[0].id : null;
+}
+
+async function igHashtagRecent(tag, limit=30) {
+  const id = await igHashtagId(tag);
+  if (!id) return [];
+  const fields = "caption,media_type,media_url,permalink,timestamp,username,children{media_type,media_url}";
+  const url = `https://graph.facebook.com/v21.0/${id}/recent_media?user_id=${encodeURIComponent(SOC.ig_biz_id)}&fields=${encodeURIComponent(fields)}&limit=${limit}&access_token=${encodeURIComponent(SOC.ig_token)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`IG recent_media failed ${res.status}`);
+  const j = await res.json();
+  const items = j.data || [];
+  return items.map(it => {
+    // pick best media URL
+    let mediaUrl = it.media_url || null;
+    if (!mediaUrl && it.children && it.children.data && it.children.data.length) {
+      const first = it.children.data.find(c => c.media_url);
+      if (first) mediaUrl = first.media_url;
+    }
+    return {
+      _key: keyFrom(it.permalink || it.id),
+      source: "instagram",
+      tag,
+      author: it.username || "Instagram",
+      text: (it.caption || "").slice(0, 1000),
+      media: mediaUrl ? { url: mediaUrl, type: it.media_type || "image" } : null,
+      link: it.permalink,
+      createdAt: it.timestamp || isoNow(),
+      meta: { platform: "instagram", media_type: it.media_type || "", id: it.id },
+    };
+  });
+}
+
+// ---------- Facebook: pages feed ----------
+async function fbPageFeed(pageId, limit=20) {
+  const fields = "message,created_time,permalink_url,from,attachments{media_type,media_url}";
+  const url = `https://graph.facebook.com/v21.0/${pageId}/posts?fields=${encodeURIComponent(fields)}&limit=${limit}&access_token=${encodeURIComponent(SOC.fb_token)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`FB feed failed ${res.status}`);
+  const j = await res.json();
+  const items = j.data || [];
+  return items.map(it => {
+    let mediaUrl = null;
+    if (it.attachments && it.attachments.data && it.attachments.data.length) {
+      const a = it.attachments.data[0];
+      if (a.media_url) mediaUrl = a.media_url;
+      if (!mediaUrl && a.subattachments && a.subattachments.data && a.subattachments.data.length) {
+        const s = a.subattachments.data.find(x => x.media_url);
+        if (s) mediaUrl = s.media_url;
+      }
+    }
+    const author = (it.from && (it.from.name || it.from.id)) || "Facebook";
+    return {
+      _key: keyFrom(it.permalink_url || JSON.stringify(it)),
+      source: "facebook",
+      author,
+      text: (it.message || "").slice(0, 1000),
+      media: mediaUrl ? { url: mediaUrl, type: "image" } : null,
+      link: it.permalink_url || "",
+      createdAt: it.created_time || isoNow(),
+      meta: { platform: "facebook", pageId },
+    };
+  });
+}
+
+// ---------- Eventbrite: org events -> conversational cards ----------
+async function ebOrgEvents(limit=50) {
+  const url = `https://www.eventbriteapi.com/v3/organizations/${encodeURIComponent(SOC.eb_org)}/events/?expand=venue,logo,organizer&status=live&order_by=start_asc&page_size=${limit}`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${SOC.eb_token}` }});
+  if (!res.ok) throw new Error(`EB org events failed ${res.status}`);
+  const j = await res.json();
+  const items = j.events || [];
+  return items.map(ev => {
+    const link = ev.url || (ev.resource_uri || "");
+    const img = ev.logo && ev.logo.url ? ev.logo.url : null;
+    const when = (ev.start && ev.start.utc) || ev.start?.local || isoNow();
+    const venue = (ev.venue && (ev.venue.name || ev.venue.address?.localized_address_display)) || "";
+    return {
+      _key: keyFrom(link || ev.id),
+      source: "eventbrite",
+      author: ev.organizer && ev.organizer.name ? ev.organizer.name : "Eventbrite",
+      text: `${ev.name?.text || "Event"}${venue ? " • " + venue : ""}`,
+      media: img ? { url: img, type: "image" } : null,
+      link,
+      createdAt: when,
+      meta: { platform: "eventbrite", id: ev.id },
+    };
+  });
+}
+
+// -------- HTTP endpoints --------
+
+// GET /pullIGHashtags?tags=CharlotteNights,LagosAfrobeats&limit=30
+exports.pullIGHashtags = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    if (!SOC.ig_token || !SOC.ig_biz_id) {
+      return res.status(400).json({ ok: false, error: "IG config missing (ig.token, ig.business_id)" });
+    }
+    const tags = String(req.query.tags || "CharlotteNights,LagosAfrobeats")
+      .split(",").map(s => s.replace(/^#/, "").trim()).filter(Boolean);
+    const limit = Math.max(5, Math.min(60, Number(req.query.limit) || 30));
+
+    let collected = [];
+    for (const tag of tags) {
+      try {
+        const items = await igHashtagRecent(tag, limit);
+        collected = collected.concat(items);
+      } catch (e) {
+        console.warn("IG tag fail", tag, e?.message || e);
+      }
+    }
+    // de-dupe
+    const seen = new Set(), unique = [];
+    for (const p of collected) {
+      const k = p._key || p.link;
+      if (k && !seen.has(k)) { seen.add(k); unique.push(p); }
+    }
+    const { saved } = await savePostsNormalized(unique);
+    return res.json({ ok: true, tags, fetched: collected.length, saved });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// GET /pullFacebookPages?pages=123,456&limit=15
+exports.pullFacebookPages = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    if (!SOC.fb_token) {
+      return res.status(400).json({ ok: false, error: "FB config missing (fb.token)" });
+    }
+    const pages = String(req.query.pages || "").split(",").map(s => s.trim()).filter(Boolean);
+    if (!pages.length) return res.status(400).json({ ok: false, error: "Provide ?pages=comma,separated,ids" });
+    const limit = Math.max(5, Math.min(50, Number(req.query.limit) || 15));
+
+    let collected = [];
+    for (const id of pages) {
+      try {
+        const items = await fbPageFeed(id, limit);
+        collected = collected.concat(items);
+      } catch (e) {
+        console.warn("FB page fail", id, e?.message || e);
+      }
+    }
+    // de-dupe
+    const seen = new Set(), unique = [];
+    for (const p of collected) {
+      const k = p._key || p.link;
+      if (k && !seen.has(k)) { seen.add(k); unique.push(p); }
+    }
+    const { saved } = await savePostsNormalized(unique);
+    return res.json({ ok: true, pages, fetched: collected.length, saved });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// GET /pullEventbriteOrgsFeed?limit=50
+exports.pullEventbriteOrgsFeed = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    if (!SOC.eb_token || !SOC.eb_org) {
+      return res.status(400).json({ ok: false, error: "Eventbrite config missing (eventbrite.token, eventbrite.org_id)" });
+    }
+    const limit = Math.max(5, Math.min(100, Number(req.query.limit) || 50));
+    const cards = await ebOrgEvents(limit);
+    const { saved } = await savePostsNormalized(cards);
+    return res.json({ ok: true, org: SOC.eb_org, fetched: cards.length, saved });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// -------- Optional: hourly cron to keep it fresh --------
+exports.socialPullCronHourly = fn.pubsub
   .schedule("every 60 minutes")
   .onRun(async () => {
     try {
-      const snap = await rtdb.ref("gossip/xnews/handles").get();
-      const obj = snap.exists() ? snap.val() : {};
-      let handles = Object.keys(obj || {});
-      handles = handles.length ? byPriority(handles) : X_PRIORITY_HANDLES;
-
-      let added = 0;
-      const GLOBAL_CAP = 3;
-      for (const h of handles) {
-        if (added >= GLOBAL_CAP) break;
-        const out = await pullOne(h);
-        added += (out.added || 0);
+      // IG default tags from RTDB if you want: /gossip/ig/tags/{tag}=true
+      let tags = ["CharlotteNights","LagosAfrobeats"];
+      const tagSnap = await rtdb.ref("gossip/ig/tags").get();
+      if (tagSnap.exists()) tags = Object.keys(tagSnap.val() || {});
+      let collected = [];
+      // IG
+      if (SOC.ig_token && SOC.ig_biz_id) {
+        for (const t of tags) {
+          try { collected = collected.concat(await igHashtagRecent(t, 20)); } catch {}
+        }
       }
+      // FB Pages from RTDB: /gossip/facebook/pages/{pageId}=true
+      const fbSnap = await rtdb.ref("gossip/facebook/pages").get();
+      const pages = fbSnap.exists() ? Object.keys(fbSnap.val() || {}) : [];
+      if (SOC.fb_token && pages.length) {
+        for (const id of pages) {
+          try { collected = collected.concat(await fbPageFeed(id, 10)); } catch {}
+        }
+      }
+      // EB
+      if (SOC.eb_token && SOC.eb_org) {
+        try { collected = collected.concat(await ebOrgEvents(30)); } catch {}
+      }
+      // de-dupe & save
+      const seen = new Set(), unique = [];
+      for (const p of collected) {
+        const k = p._key || p.link;
+        if (k && !seen.has(k)) { seen.add(k); unique.push(p); }
+      }
+      await savePostsNormalized(unique);
     } catch (e) {
-      console.warn("xNewsCronHourly:", e?.message || e);
+      console.warn("socialPullCronHourly:", e?.message || e);
     }
     return null;
   });
+
+
+// ================================
+// Nightlife IG hashtag → RTDB
+// ================================
+const IG_CFG = (() => {
+  try {
+    const c = functions.config();
+    return {
+      token:
+        (c.ig && c.ig.token) ||
+        process.env.IG_TOKEN ||
+        "",
+      businessId:
+        (c.ig && c.ig.business_id) ||
+        process.env.IG_BUSINESS_ID ||
+        "",
+    };
+  } catch {
+    return {
+      token: process.env.IG_TOKEN || "",
+      businessId: process.env.IG_BUSINESS_ID || "",
+    };
+  }
+})();
+
+// Small helper to call Graph + JSON decode
+async function igFetchJSON(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`IG fetch failed ${resp.status}: ${text}`);
+  }
+  return await resp.json();
+}
+
+// HTTPS function: GET /nightlifeIgHashtagPull?tag=afrodiaspora&limit=10
+exports.nightlifeIgHashtagPull = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+
+  if (req.method === "OPTIONS") {
+    res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    return res.status(204).end();
+  }
+
+  try {
+    const tag = String(req.query.tag || "afrodiaspora").replace("#", "").trim();
+    const limit = Math.min(
+      30,
+      Math.max(1, Number(req.query.limit) || 10)
+    );
+
+    if (!IG_CFG.token || !IG_CFG.businessId) {
+      return res.status(500).json({
+        ok: false,
+        error: "IG config missing (token or business_id)",
+      });
+    }
+
+    const base = "https://graph.facebook.com/v21.0";
+
+    // 1) Resolve hashtag → id
+    const searchUrl =
+      `${base}/ig_hashtag_search?` +
+      new URLSearchParams({
+        user_id: IG_CFG.businessId,
+        q: tag,
+        access_token: IG_CFG.token,
+      }).toString();
+
+    const search = await igFetchJSON(searchUrl);
+    const hashtagId =
+      Array.isArray(search.data) && search.data[0] && search.data[0].id;
+
+    if (!hashtagId) {
+      return res.json({
+        ok: false,
+        tag,
+        error: "NO_HASHTAG_ID",
+        raw: search,
+      });
+    }
+
+    // 2) Fetch recent_media for that hashtag
+    const mediaUrl =
+      `${base}/${hashtagId}/recent_media?` +
+      new URLSearchParams({
+        user_id: IG_CFG.businessId,
+        fields: "id,caption,media_url,permalink,timestamp,media_type",
+        limit: String(limit),
+        access_token: IG_CFG.token,
+      }).toString();
+
+    const media = await igFetchJSON(mediaUrl);
+    const list = Array.isArray(media.data) ? media.data : [];
+
+    if (!list.length) {
+      return res.json({
+        ok: true,
+        tag,
+        hashtagId,
+        saved: 0,
+        note: "no media returned",
+      });
+    }
+
+    const now = Date.now();
+    const updates = {};
+    for (const m of list) {
+      if (!m.id) continue;
+      const key = m.id;
+
+      // Normalize into a simple gossip-friendly object
+      const tsUnix = m.timestamp
+        ? Math.floor(new Date(m.timestamp).getTime() / 1000)
+        : Math.floor(now / 1000);
+
+      updates[`gossip/nightlife/igHashtags/${tag}/${key}`] = {
+        id: key,
+        source: "instagram",
+        hashtag: tag,
+        caption: m.caption || "",
+        mediaUrl: m.media_url || "",
+        permalink: m.permalink || "",
+        mediaType: m.media_type || "IMAGE",
+        timestamp: tsUnix,
+        createdAt: now,
+      };
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.json({
+        ok: true,
+        tag,
+        hashtagId,
+        saved: 0,
+        note: "no valid items to save",
+      });
+    }
+
+    await rtdb.ref().update(updates);
+
+    return res.json({
+      ok: true,
+      tag,
+      hashtagId,
+      saved: Object.keys(updates).length,
+    });
+  } catch (e) {
+    console.error("nightlifeIgHashtagPull error", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+
+// Afro-diaspora default tags for cron
+const NIGHTLIFE_TAGS = [
+  "afrobeats",
+  "soca",
+  "hiphop",
+  "zouk",
+  "rap",
+  "dancehall",
+  "amapiano"
+];
+
+// Lightweight wrapper that calls nightlifeIgHashtagPull logic internally
+async function pullIgHashtag(tag, limit = 10) {
+  // reuse the same logic as nightlifeIgHashtagPull, but without HTTP
+  // You can factor out the core of nightlifeIgHashtagPull into a helper
+  // called doNightlifeIgHashtagPull(tag, limit) and call that from both.
+  return; // placeholder – only needed if you really want to reuse it
+}
+
+// Cron: run every 2 hours over core Afro-diaspora tags
+exports.nightlifeIgCron = fn.pubsub
+  .schedule("every 120 minutes")
+  .onRun(async () => {
+    if (!IG_CFG.token || !IG_CFG.businessId) {
+      console.warn("nightlifeIgCron: IG config missing");
+      return null;
+    }
+
+    const baseUrl = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/nightlifeIgHashtagPull`;
+    for (const tag of NIGHTLIFE_TAGS) {
+      try {
+        const url = `${baseUrl}?tag=${encodeURIComponent(tag)}&limit=10`;
+        await fetch(url);
+        console.log("nightlifeIgCron pulled", tag);
+      } catch (e) {
+        console.warn("nightlifeIgCron error for", tag, e?.message || e);
+      }
+    }
+    return null;
+  });
+
+// ===============================
+// Nightlife discovery keywords (IG + FB)
+// ===============================
+const NIGHTLIFE_KEYWORDS = [
+  "afrobeats",
+  "afrobeat",
+  "afrodiaspora",
+  "amapiano",
+  "soca",
+  "dancehall",
+  "hip hop",
+  "hiphop",
+  "rap",
+  "r&b",
+  "rnb",
+  "zouk",
+  "club",
+  "lounge",
+  "loung",
+  "rooftop",
+  "day party",
+  "day-party",
+  "dayparty",
+  "brunch",
+  "hookah",
+  "live band",
+  "live music",
+  "dj set",
+  "after party",
+  "after-party",
+  "turn up",
+  "turnup"
+];
+
+function matchesNightlife(text = "") {
+  const s = String(text || "").toLowerCase();
+  if (!s) return false;
+  return NIGHTLIFE_KEYWORDS.some(k => s.includes(k));
+}
+
+// =============================================
+// Helper: Load all IG hashtag items (nightlife discovery)
+// - Reads from gossip/nightlife/igHashtags/{tag}/{mediaId}
+// - Flattens + normalizes into a simple list
+// =============================================
+async function loadNightlifeHashtagItems({ maxAgeDays = 7 } = {}) {
+  try {
+    const snap = await rtdb.ref("gossip/nightlife/igHashtags").get();
+    if (!snap.exists()) {
+      console.log("[IG] no gossip/nightlife/igHashtags data");
+      return [];
+    }
+
+    const now = Date.now();
+    const cutoffMs = now - maxAgeDays * 24 * 60 * 60 * 1000;
+
+    const items = [];
+    snap.forEach(tagSnap => {
+      const tag = tagSnap.key; // e.g. "afrobeats"
+      tagSnap.forEach(cs => {
+        const v = cs.val() || {};
+        if (!v.mediaUrl) return;
+
+        // Convert stored unix seconds → ms, or fall back to createdAt / now
+        const tsMs =
+          (v.timestamp ? v.timestamp * 1000 : null) ||
+          (v.createdAt || now);
+
+        // Optional: ignore very old posts
+        if (tsMs < cutoffMs) return;
+
+        // Optional extra filter using your nightlife keywords
+        if (!matchesNightlife(v.caption || v.hashtag || "")) {
+          // comment this out if you want **everything**, not just nightlife-y
+          // return;
+        }
+
+        items.push({
+          id: v.id || cs.key,
+          caption: v.caption || "",
+          image: v.mediaUrl || "",
+          link: v.permalink || "",
+          pubDate: tsMs,
+          source: v.source || "instagram",
+          hashtag: v.hashtag || tag,
+          mediaType: v.mediaType || "IMAGE"
+        });
+      });
+    });
+
+    // Most recent first
+    items.sort((a, b) => b.pubDate - a.pubDate);
+
+    console.log(
+      "[IG] loadNightlifeHashtagItems loaded",
+      items.length,
+      "items"
+    );
+    return items;
+  } catch (e) {
+    console.warn(
+      "[IG] loadNightlifeHashtagItems error:",
+      e?.message || e
+    );
+    return [];
+  }
+}
+
+
+
+
 
 // ===============================
 // Helper: AI Crew → bundle items
@@ -1558,6 +2408,69 @@ async function fetchAICrewPostsForBundle({ limit = 60, thumbWidth = 900 } = {}) 
     return [];
   }
 }
+
+
+      async function fetchUserPosts(limit = 120) {
+        try {
+          const snap = await rtdb
+            .ref("gossip/posts")
+            .orderByChild("timestamp")
+            .limitToLast(limit)
+            .get();
+
+          const rows = [];
+          snap.forEach((cs) => {
+            const v = cs.val() || {};
+
+            // Only non-AI posts are treated as "user posts" here.
+            if (v.source === "ai-scraper") return;
+
+            const ts = Number(v.timestamp || v.createdAt || Date.now());
+
+            // Try to find a usable media URL (we'll still enforce hasRealImage later)
+            const candidates = [
+              v.imageUrl,
+              v.image,
+              v.mediaUrl,
+              v.thumb,
+              v.rawMediaUrl,
+            ].filter(Boolean);
+            const primary = candidates[0] || null;
+
+            rows.push({
+              id: v.id || cs.key,
+              title: String(v.title || v.caption || v.text || "Post"),
+              link: String(
+                v.permalink ||
+                  v.link ||
+                  primary ||
+                  ""
+              ),
+              summary: String(v.caption || v.text || v.title || "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 800),
+              pubDate: ts,
+              image: primary,
+              kind: "nightlife",
+              source: "user-post",
+              userId: v.userId || null,
+              hashTags: Array.isArray(v.hashTags) ? v.hashTags : [],
+            });
+          });
+
+          // newest first
+          rows.sort((a, b) => b.pubDate - a.pubDate);
+          return rows;
+        } catch (e) {
+          console.warn("[rssBundle] user posts fetch error:", e?.message || e);
+          return [];
+        }
+      }
+
+
+
+
 
 // ===============================
 // Helper: XNews → bundle items
@@ -1745,11 +2658,11 @@ const thumbFor = (img, givenThumb, w) => {
   });
 };
 
-
 // ===============================
-// POST /rssBundle (IG prioritized, resilient, 25% logo fallback, optional cache)
-// - Merges: client feeds + Tumblr blogs + AI Crew posts (+ optional xnews cache)
-// - Safe await usage (no top-level awaits)
+// POST /rssBundle (user-first, IG de-prioritized, strict media for non-user)
+// - User posts: backend-driven priority tiers + always included (even text-only)
+// - Final feed: user, non-user, user, non-user… (1,3,5,7… are user posts)
+// - Non-user "soup": AI, Tumblr, RSS, X, other, IG (IG strictly last + capped)
 // ===============================
 exports.rssBundle = fn
   .runWith({ timeoutSeconds: 20, memory: "512MB" })
@@ -1758,7 +2671,10 @@ exports.rssBundle = fn
     if (req.method === "OPTIONS") {
       res.set("Access-Control-Allow-Origin", "*");
       res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.set("Access-Control-Allow-Headers", "Content-Type, X-Firebase-AppCheck");
+      res.set(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-Firebase-AppCheck"
+      );
       return res.status(204).end();
     }
     res.set("Access-Control-Allow-Origin", "*");
@@ -1766,7 +2682,8 @@ exports.rssBundle = fn
     // ---- Deadline guard for iOS timeouts ----
     const HARD_DEADLINE_MS = 9000;
     const started = Date.now();
-    const timeLeft = () => Math.max(0, HARD_DEADLINE_MS - (Date.now() - started));
+    const timeLeft = () =>
+      Math.max(0, HARD_DEADLINE_MS - (Date.now() - started));
 
     try {
       if (req.method !== "POST") {
@@ -1774,11 +2691,20 @@ exports.rssBundle = fn
       }
 
       // ---------- Parse body ----------
-      const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+      const body =
+        typeof req.body === "string"
+          ? JSON.parse(req.body || "{}")
+          : req.body || {};
       const clientFeeds = Array.isArray(body.feeds) ? body.feeds : [];
-      const perFeedLimit = Math.min(Math.max(parseInt(body.perFeedLimit || 6, 10) || 6, 1), 30);
-      const thumbWidth   = Math.min(Math.max(parseInt(body.thumbWidth   || 900, 10) || 900, 120), 1600);
-      const wantCache    = String(body.cache || "1") !== "0";
+      const perFeedLimit = Math.min(
+        Math.max(parseInt(body.perFeedLimit || 6, 10) || 6, 1),
+        30
+      );
+      const thumbWidth = Math.min(
+        Math.max(parseInt(body.thumbWidth || 900, 10) || 900, 120),
+        1600
+      );
+      const wantCache = String(body.cache || "1") !== "0";
 
       // ---------- Helpers ----------
       const normalizeUrl = (u) => {
@@ -1790,7 +2716,9 @@ exports.rssBundle = fn
           return String(u || "").replace(/^http:/i, "https:");
         }
       };
-      const sha1 = (s) => require("crypto").createHash("sha1").update(String(s)).digest("hex");
+
+      const sha1 = (s) =>
+        require("crypto").createHash("sha1").update(String(s)).digest("hex");
 
       // Prefer configured 25% logo if present; fallback to brand/logo path
       const logoFallback =
@@ -1798,35 +2726,92 @@ exports.rssBundle = fn
         (functions.config().brand && functions.config().brand.logo_fallback) ||
         "https://blackapp.io/images/blackapp-logo.png";
 
+      // Unwrap nested imgThumb?url=... chains to the original source (max 3 levels)
+// Unwrap nested imgThumb?url=... chains to the original source (max 20 levels)
+function stripThumb(u) {
+  let s = String(u || "");
+  const re =
+    /(cloudfunctions\.net\/imgThumb|blackapp\.io\/api\/imgThumb)/i;
+  let guard = 0;
+  while (re.test(s) && guard < 20) {
+    try {
+      const urlObj = new URL(s);
+      const next = urlObj.searchParams.get("url") || "";
+      if (!next || next === s) break; // safety against infinite loops
+      s = next;
+    } catch {
+      break;
+    }
+    guard++;
+  }
+  return s || null;
+}
+
+
       const thumbFor = (img) =>
-        cfUrl("imgThumb", { url: img || "", w: thumbWidth, fallback: logoFallback, fallbackScale: 0.25 });
+        cfUrl("imgThumb", {
+          url: img || "",
+          w: thumbWidth,
+          fallback: logoFallback,
+          fallbackScale: 0.25,
+        });
+
+      // Strip invalid surrogate range chars so iOS / jq don't choke
+      const BAD_SURROGATE_RE = /[\uD800-\uDFFF]/g;
+      const cleanText = (s) => String(s || "").replace(BAD_SURROGATE_RE, "");
+
+      const isLogoUrl = (u) => {
+        const s = String(u || "").toLowerCase();
+        if (!s) return true;
+        return s === String(logoFallback).toLowerCase();
+      };
+
+      // For non-user content, we insist on a real image.
+      // For user posts, we allow anything (even no image) so they never vanish.
+      const hasRealImage = (it) => {
+        if (it.source === "user") return true;
+        const candidate =
+          stripThumb(it.thumb || it.image || "") ||
+          it.image ||
+          "";
+        return !!candidate && !isLogoUrl(candidate);
+      };
 
       // ---------- Data loaders ----------
       async function fetchAICrewPosts(limit = 60) {
         try {
-          const snap = await rtdb.ref("gossip/posts")
+          const snap = await rtdb
+            .ref("gossip/posts")
             .orderByChild("timestamp")
             .limitToLast(limit)
             .get();
 
           const rows = [];
-          snap.forEach(cs => {
+          snap.forEach((cs) => {
             const v = cs.val() || {};
             if (v.source !== "ai-scraper") return;
+
+            const titleRaw = v.text || "Nightlife";
+            const summaryRaw = `#${(v.city || "").split(",")[0] || "City"} • by ${
+              v.author || "BlackAppCrew"
+            }`;
+
             rows.push({
               id: v.id || cs.key,
-              title: String(v.text || "Nightlife"),
+              title: cleanText(titleRaw),
               link: String(v.eventUrl || v.imageUrl || ""),
-              summary: `#${(v.city || "").split(",")[0] || "City"} • by ${v.author || "BlackAppCrew"}`,
+              summary: cleanText(summaryRaw),
               pubDate: Number(v.timestamp || Date.now()),
               image: v.imageUrl || null,
               kind: "nightlife",
               source: "ai-scraper",
-              author: v.author || null,
+              author: cleanText(v.author || ""),
               avatar: v.authorAvatarUrl || logoFallback,
-              city: v.city || null,
-              region: v.region || null,
-              tags: Array.isArray(v.hashTags) ? v.hashTags : []
+              city: cleanText(v.city || ""),
+              region: cleanText(v.region || ""),
+              tags: Array.isArray(v.hashTags)
+                ? v.hashTags.map((t) => cleanText(t))
+                : [],
             });
           });
           rows.sort((a, b) => b.pubDate - a.pubDate);
@@ -1839,24 +2824,31 @@ exports.rssBundle = fn
 
       async function fetchXNews(limit = 40) {
         try {
-          const s = await rtdb.ref("gossip/xnews/items").orderByChild("pubDate").limitToLast(limit).get();
+          const s = await rtdb
+            .ref("gossip/xnews/items")
+            .orderByChild("pubDate")
+            .limitToLast(limit)
+            .get();
           const arr = [];
-          s.forEach(cs => {
+          s.forEach((cs) => {
             const v = cs.val() || {};
             arr.push({
               id: cs.key,
-              title: String(v.title || "Untitled"),
+              title: cleanText(String(v.title || "Untitled")),
               link: String(v.link || ""),
-              summary: String(v.summary || v.description || ""),
+              summary: cleanText(
+                String(v.summary || v.description || "")
+              ),
               pubDate: Number(v.pubDate || Date.now()),
               image: v.image || null,
-              kind: (v.kind === "news" ? "news" : "nightlife"),
-              source: String(v.source || "xnews")
+              kind: v.kind === "news" ? "news" : "nightlife",
+              source: String(v.source || "xnews"),
             });
           });
           arr.sort((a, b) => b.pubDate - a.pubDate);
           return arr;
-        } catch {
+        } catch (e) {
+          console.warn("[rssBundle] xnews fetch error:", e?.message || e);
           return [];
         }
       }
@@ -1870,36 +2862,73 @@ exports.rssBundle = fn
 
           const out = [];
           for (const it of items.slice(0, limitPerFeed)) {
-            const id = String(it.guid || it.id || it.link || it.title || "").slice(0, 128)
-              || sha1(it.link || it.title || Math.random());
-            const title = String(
-              it.title || it["media:title"] || it["content:encoded:title"] || "Untitled"
-            ).slice(0, 200);
+            const id =
+              String(it.guid || it.id || it.link || it.title || "").slice(
+                0,
+                128
+              ) || sha1(it.link || it.title || Math.random());
+
+            const title = cleanText(
+              String(
+                it.title ||
+                  it["media:title"] ||
+                  it["content:encoded:title"] ||
+                  "Untitled"
+              ).slice(0, 200)
+            );
 
             const link = String(it.link || it.guid || "");
-            const pubRaw = it.isoDate || it.pubDate || it.published || it.updated || new Date().toISOString();
+            const pubRaw =
+              it.isoDate ||
+              it.pubDate ||
+              it.published ||
+              it.updated ||
+              new Date().toISOString();
             const pubDate = Date.parse(pubRaw) || Date.now();
 
             // Try enclosure/media, else first <img> in content
-            let image = it.enclosure?.url || it["media:content"]?.url || it["media:thumbnail"]?.url || null;
+            let image =
+              it.enclosure?.url ||
+              it["media:content"]?.url ||
+              it["media:thumbnail"]?.url ||
+              null;
             if (!image) {
-              const html = (it["content:encoded"] || it["content"] || it["summary"] || it["description"] || "");
-              const m = String(html || "").match(/<img[^>]+src="([^"]+)"/i);
+              const html =
+                it["content:encoded"] ||
+                it["content"] ||
+                it["summary"] ||
+                it["description"] ||
+                "";
+              const m = String(html || "").match(
+                /<img[^>]+src="([^"]+)"/i
+              );
               if (m && m[1]) image = m[1];
             }
 
-            const summary = String(
-              it.summary || it.contentSnippet || it.description || ""
-            ).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+            const summary = cleanText(
+              String(
+                it.summary || it.contentSnippet || it.description || ""
+              )
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+            );
 
             out.push({
-              id, title, link, summary,
+              id,
+              title,
+              link,
+              summary,
               pubDate,
               image: image || null,
               kind,
               source: (() => {
-                try { return new URL(link).hostname.replace(/^www\./, ""); } catch { return ""; }
-              })()
+                try {
+                  return new URL(link).hostname.replace(/^www\./, "");
+                } catch {
+                  return "";
+                }
+              })(),
             });
           }
           return out;
@@ -1909,10 +2938,79 @@ exports.rssBundle = fn
         }
       }
 
-      // ---------- IG partner items ----------
+      // ---------- User posts (backend visual bucket) ----------
+      async function fetchUserPosts(limit = 180) {
+        try {
+          const snap = await rtdb
+            .ref("posts")
+            .orderByChild("timestamp")
+            .limitToLast(limit)
+            .get();
+
+          const rows = [];
+          snap.forEach((cs) => {
+            const v = cs.val() || {};
+            const ts = Number(v.timestamp || v.createdAt || 0);
+            if (!ts) return;
+
+            const text = v.text || v.body || "";
+            const uid = v.userId || v.userID || v.uid || "";
+
+            // Try to find the best image candidate (purely for visuals);
+            // but EVEN if we don't find one, we still include this post.
+            // Try to find the best image candidate (purely for visuals);
+// Try to find the best image candidate (purely for visuals);
+// but EVEN if we don't find one, we still include this post.
+// IMPORTANT: for user posts, we do NOT try to "fix" or unwrap
+// the URL here — we just mirror what RTDB already uses, so
+// My Posts and bundle behave identically.
+let img = null;
+
+if (typeof v.mediaURL === "string" && /^https?:\/\//i.test(v.mediaURL)) {
+  img = v.mediaURL;
+} else if (v.media && typeof v.media === "object") {
+  const allMedia = Object.values(v.media || {});
+  const firstImg = allMedia.find(
+    (m) =>
+      m &&
+      (m.kind === "image" || m.kind === "photo") &&
+      typeof m.url === "string" &&
+      /^https?:\/\//i.test(m.url)
+  );
+  if (firstImg) {
+    img = firstImg.url;
+  }
+}
+
+
+            rows.push({
+              id: v.id || cs.key,
+              title: cleanText(text || "Post"),
+              link: "", // optional: could link to a web detail page later
+              summary: cleanText(text),
+              pubDate: ts * 1000, // assuming stored as seconds
+              image: img,         // may be null; that's OK for source:'user'
+              kind: "nightlife",
+              source: "user",
+              userId: uid,
+              tags: Array.isArray(v.hashTags)
+                ? v.hashTags.map((t) => cleanText(t))
+                : [],
+            });
+          });
+
+          rows.sort((a, b) => b.pubDate - a.pubDate);
+          return rows;
+        } catch (e) {
+          console.warn("[rssBundle] user posts fetch error:", e?.message || e);
+          return [];
+        }
+      }
+
+      // ---------- IG partner / nightlife hashtag items ----------
       let igItems = [];
       try {
-        igItems = await loadAllPartnerInstagramItems({ thumbWidth });
+        igItems = await loadNightlifeHashtagItems({ maxAgeDays: 7 });
       } catch (e) {
         console.warn("[rssBundle] IG load error:", e?.message || e);
       }
@@ -1923,9 +3021,9 @@ exports.rssBundle = fn
 
       for (const f of clientFeeds) {
         if (!f || !f.url) continue;
-        const kind = (f.kind === "news" ? "news" : "nightlife");
-        const url  = normalizeUrl(f.url);
-        const key  = `${kind}|${url}`;
+        const kind = f.kind === "news" ? "news" : "nightlife";
+        const url = normalizeUrl(f.url);
+        const key = `${kind}|${url}`;
         if (dedupFeeds.has(key)) continue;
         dedupFeeds.add(key);
         mergedFeeds.push({ url, kind });
@@ -1937,7 +3035,7 @@ exports.rssBundle = fn
         for (const [, b] of Object.entries(blogs)) {
           if (!b || b.enabled === false || typeof b.url !== "string") continue;
           let u = String(b.url).trim();
-          if (!/\/rss$/i.test(u)) u = u.replace(/\/+$/,"") + "/rss";
+          if (!/\/rss$/i.test(u)) u = u.replace(/\/+$/, "") + "/rss";
           u = normalizeUrl(u);
           const key = `nightlife|${u}`;
           if (dedupFeeds.has(key)) continue;
@@ -1950,120 +3048,346 @@ exports.rssBundle = fn
 
       // ---------- Fetch everything in parallel ----------
       const rssGroups = await Promise.all(
-        mergedFeeds.map(f => parseFeed(f.url, f.kind, perFeedLimit))
+        mergedFeeds.map((f) => parseFeed(f.url, f.kind, perFeedLimit))
       );
       const rssItems = rssGroups.flat();
 
-      const [aiCrew, xnews] = await Promise.all([
+      const [aiCrew, xnews, userPosts] = await Promise.all([
         fetchAICrewPosts(60),
-        fetchXNews(40)
+        fetchXNews(40),
+        fetchUserPosts(180),
       ]);
 
+      const nowMs = Date.now();
+
       // ---------- Normalize & guarantee thumbs ----------
-      const ensureThumb = (img) => thumbFor(img || ""); // always returns URL with logo fallback
 
- const igNorm = (Array.isArray(igItems) ? igItems : []).map((it) => ({
-  id: it.id || sha1(it.link || it.image || Math.random()),
-  title: String(it.title || it.caption || "Nightlife"),
-  link: String(it.link || ""),
-  summary: String(it.summary || it.caption || "").slice(0, 400),
-  pubDate: Number(it.pubDate || it.timestamp || Date.now()),
-  image: it.image || null,
-  kind: "nightlife",
-  source: String(it.source || "instagram"),
-  thumb: thumbFor(it.image, it.thumb, thumbWidth)   // <— don’t re-wrap if already a thumb
-}));
+      // IG (partners + hashtags) – STRICT visual rules
+      let igNorm = (Array.isArray(igItems) ? igItems : [])
+        .map((it) => {
+          const rawCandidate =
+            stripThumb(it.thumb || it.image || "") ||
+            it.image ||
+            "";
 
-const aiNorm = aiCrew.map((it) => ({
+          if (!rawCandidate || isLogoUrl(rawCandidate)) {
+            return null;
+          }
+
+          const hashtag = it.hashtag || null;
+          const tags = [];
+          if (hashtag) tags.push(`#${hashtag}`);
+          tags.push("nightlife");
+
+          const pub = Number(it.pubDate || it.timestamp || nowMs);
+          return {
+            id: it.id || sha1(it.link || it.image || Math.random()),
+            title: cleanText(String(it.title || it.caption || "Nightlife")),
+            link: String(
+              it.permalink ||
+                it.link ||
+                rawCandidate ||
+                ""
+            ),
+            summary: cleanText(
+              String(it.summary || it.caption || "").slice(0, 400)
+            ),
+            pubDate: pub,
+            image: rawCandidate,
+            thumb: thumbFor(rawCandidate),
+            kind: "nightlife",
+            source: String(it.source || "instagram-partner"),
+            platform: "instagram",
+            hashtag,
+            tags,
+          };
+        })
+        .filter(Boolean);
+
+      const aiNorm = (aiCrew || []).map((it) => ({
+        ...it,
+        thumb: thumbFor(it.image || it.thumb || ""),
+      }));
+
+      const rssNormRaw = (rssItems || []).map((it) => ({
+        ...it,
+        thumb: thumbFor(it.image || it.thumb || ""),
+      }));
+
+      const xNorm = (xnews || []).map((it) => ({
+        ...it,
+        thumb: thumbFor(it.image || it.thumb || ""),
+      }));
+
+      // For *user* posts we trust the original image URL that already works
+// on iOS / RTDB. Do NOT wrap it with imgThumb – just pass it through.
+const userNormRaw = (userPosts || []).map((it) => ({
   ...it,
-  thumb: thumbFor(it.image, it.thumb, thumbWidth)
+  thumb: it.image || it.thumb || null,
 }));
 
-const rssNorm = rssItems.map((it) => ({
-  ...it,
-  thumb: thumbFor(it.image, it.thumb, thumbWidth)
-}));
 
-const xNorm = (xnews || []).map((it) => ({
-  ...it,
-  thumb: thumbFor(it.image, it.thumb, thumbWidth)
-}));
+      // ---------- Split buckets & apply user tiers / IG caps ----------
 
-// Unwrap nested imgThumb?url=... chains to the original source (max 3 levels)
-const stripThumb = (u) => {
-  let s = String(u || "");
-  const re = /(cloudfunctions\.net\/imgThumb|blackapp\.io\/api\/imgThumb)/i;
-  let guard = 0;
-  while (re.test(s) && guard < 3) {
-    try {
-      const urlObj = new URL(s);
-      s = urlObj.searchParams.get("url") || "";
-    } catch {
-      break;
-    }
-    guard++;
+      // Split RSS/Tumblr
+      const tumblrNorm = rssNormRaw.filter((it) =>
+        /tumblr/.test(String(it.source || ""))
+      );
+      const pureRssNorm = rssNormRaw.filter(
+        (it) => !/tumblr/.test(String(it.source || ""))
+      );
+
+      // Age-based tiers for user posts
+      const userHigh = [];
+      const userMed = [];
+      const userLow = [];
+
+      for (const it of userNormRaw) {
+        const ts = Number(it.pubDate || it.timestamp || nowMs);
+        const ageDays = (nowMs - ts) / (1000 * 60 * 60 * 24);
+
+        if (ageDays < 7) {
+          userHigh.push({ ...it, pubDate: ts, _tier: "high" });
+        } else if (ageDays < 14) {
+          userMed.push({ ...it, pubDate: ts, _tier: "medium" });
+        } else if (ageDays < 21) {
+          userLow.push({ ...it, pubDate: ts, _tier: "low" });
+        } else {
+          // older than 3 weeks: excluded from bundle
+        }
+      }
+
+      const sortByDateDesc = (arr) =>
+        arr.sort((a, b) => (b.pubDate || 0) - (a.pubDate || 0));
+
+      sortByDateDesc(userHigh);
+      sortByDateDesc(userMed);
+      sortByDateDesc(userLow);
+      sortByDateDesc(aiNorm);
+      sortByDateDesc(tumblrNorm);
+      sortByDateDesc(pureRssNorm);
+      sortByDateDesc(xNorm);
+      sortByDateDesc(igNorm);
+
+      // IG extra constraints
+      const IG_MAX_ITEMS = 8;
+      const IG_MAX_AGE_DAYS = 3;
+
+      igNorm = igNorm.filter((it) => {
+        const ts = Number(it.pubDate || nowMs);
+        const ageDays = (nowMs - ts) / (1000 * 60 * 60 * 24);
+        return ageDays <= IG_MAX_AGE_DAYS;
+      });
+      if (igNorm.length > IG_MAX_ITEMS) {
+        igNorm = igNorm.slice(0, IG_MAX_ITEMS);
+      }
+
+      const otherNorm = []; // reserved for future
+
+      // ---------- Build user lane (high → med → low) ----------
+      const userLane = [...userHigh, ...userMed, ...userLow];
+
+      // ---------- Build non-user buckets for live round-robin ----------
+      const nonUserBuckets = [
+        { key: "ai",      arr: aiNorm,      idx: 0 },
+        { key: "tumblr",  arr: tumblrNorm,  idx: 0 },
+        { key: "rss",     arr: pureRssNorm, idx: 0 },
+        { key: "x",       arr: xNorm,       idx: 0 },
+        { key: "other",   arr: otherNorm,   idx: 0 },
+        { key: "ig",      arr: igNorm,      idx: 0 }, // IG last
+      ];
+
+      const makeKey = (it) =>
+        (it.link && it.link.toLowerCase()) ||
+        (it.id && `id:${String(it.id).toLowerCase()}`) ||
+        sha1(`${it.title}|${it.pubDate}|${it.source}`);
+
+// Stable interaction key used by iOS + Web for reactions
+const makeInteractionKey = (it) => {
+  if (it.source === "user") {
+    // user posts synced into the bundle
+    return `post:${it.id}`;
   }
-  return s || null;
+  return `bundle:${it.id}`;
 };
 
 
 
-      // ---------- Merge, filter, de-dupe ----------
-      // Filter: require a usable thumb URL (the fallback logo URL also counts)
-      const mergedAll = [...aiNorm, ...igNorm, ...rssNorm, ...xNorm].filter(x => !!x.thumb);
+      const TOTAL_ITEMS_CAP = 120;
+      const chosen = [];
+      const globalSeen = new Set();
 
-      // Global de-dupe by stable key (prefer link, else id, else title|pubDate)
-      const seen = new Set();
-      const uniq = [];
-      for (const it of mergedAll) {
-        const key = (it.link && it.link.toLowerCase())
-          || (it.id && `id:${it.id}`)
-          || sha1(`${it.title}|${it.pubDate}|${it.source}`);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        uniq.push(it);
+      let uIdx = 0;
+      let lastNonSource = null;
+
+      const anyNonUserAvailable = () =>
+        nonUserBuckets.some((b) => b.idx < b.arr.length);
+
+      function pickNextNonUser() {
+        if (!anyNonUserAvailable()) return null;
+
+        const bucketCount = nonUserBuckets.length;
+        // cursor rotates for fairness
+        let cursor = 0;
+        for (let attempts = 0; attempts < bucketCount * 2; attempts++) {
+          const b = nonUserBuckets[cursor];
+          cursor = (cursor + 1) % bucketCount;
+
+          if (b.idx >= b.arr.length) continue;
+
+          const othersHave = nonUserBuckets.some(
+            (o) => o.key !== b.key && o.idx < o.arr.length
+          );
+          // Avoid two in a row from same key if others still have content
+          if (lastNonSource && b.key === lastNonSource && othersHave) {
+            continue;
+          }
+
+          // Advance within this bucket until we find a candidate with real media & not dup
+          while (b.idx < b.arr.length) {
+            const candidate = b.arr[b.idx++];
+
+            if (!hasRealImage(candidate)) continue;
+
+            const key = makeKey(candidate);
+            if (globalSeen.has(key)) continue;
+
+            lastNonSource = b.key;
+            globalSeen.add(key);
+            return candidate;
+          }
+        }
+        return null;
       }
 
-      // ---------- Sort: IG partners first, then newest ----------
-      uniq.sort((a, b) => {
-        const aIG = typeof a.source === "string" && a.source.startsWith("instagram");
-        const bIG = typeof b.source === "string" && b.source.startsWith("instagram");
-        if (aIG !== bIG) return aIG ? -1 : 1;        // IG first
-        return (b.pubDate || 0) - (a.pubDate || 0);  // newest next
+          // Helper: attach stable interaction key for clients (iOS/Web)
+      const withInteractionKey = (item) => ({
+        ...item,
+        interactionKey: makeInteractionKey(item),
       });
 
-      // ---------- Optional cache write (fire-and-forget) ----------
-      if (wantCache && timeLeft() > 500) {
-        try {
-          const cacheKey = "latest";
-          rtdb.ref(`gossip/rssCache/${cacheKey}`).set({
-            ts: Date.now(),
-            items: uniq.slice(0, 120)
-          }).catch((e) => {
-            console.warn("[rssBundle] cache write (items) skipped:", e?.message || e);
-          });
+      // ---------- Final blend: user, non-user, user, non-user… ----------
+      let index = 0;
+      while (
+        chosen.length < TOTAL_ITEMS_CAP &&
+        (uIdx < userLane.length || anyNonUserAvailable())
+      ) {
+        const wantUserSlot = (index % 2 === 0); // 0,2,4,... → user; 1,3,5,... → non-user
 
-          rtdb.ref("gossip/rssCache/latestMeta").set({
-            ts: Date.now(),
-            counts: {
-              ai: aiNorm.length,
-              ig: igNorm.length,
-              rss: rssNorm.length,
-              x: xNorm.length
-            }
-          }).catch((e) => {
-            console.warn("[rssBundle] cache write (meta) skipped:", e?.message || e);
-          });
-        } catch (e) {
-          console.warn("[rssBundle] cache block skipped:", e?.message || e);
+        // Prefer a user item on even indices, if available & not yet seen
+        if (wantUserSlot && uIdx < userLane.length) {
+          const uItem = userLane[uIdx++];
+          const key = makeKey(uItem);
+          if (!globalSeen.has(key)) {
+            globalSeen.add(key);
+            chosen.push(withInteractionKey(uItem));
+            index++;
+            continue;
+          }
+        }
+
+        // Non-user slot (or fallback if no user left)
+        const nItem = pickNextNonUser();
+        if (nItem) {
+          // Note: non-user de-duping is handled inside pickNextNonUser()
+          // or earlier when building lanes; here we just attach interactionKey.
+          chosen.push(withInteractionKey(nItem));
+          index++;
+          continue;
+        }
+
+        // If we couldn't pick non-user (exhausted), but still have users,
+        // keep placing users in remaining slots.
+        if (uIdx < userLane.length) {
+          const uItem = userLane[uIdx++];
+          const key = makeKey(uItem);
+          if (!globalSeen.has(key)) {
+            globalSeen.add(key);
+            chosen.push(withInteractionKey(uItem));
+            index++;
+            continue;
+          }
+        } else {
+          break;
         }
       }
 
-      // ---------- Respond ----------
-      return res.status(200).json({
-        ok: true,
-        items: uniq.slice(0, 120)
+const counts = {
+  ai: aiNorm.length,
+  ig: igNorm.length,
+  rss: rssNormRaw.length,
+  x: xNorm.length,
+  user: userNormRaw.length,
+};
+
+// Final image/thumbnail sanitizer:
+// - Unwrap any imgThumb chains with stripThumb()
+// - Ensure `image` and `thumb` are clean, plain URLs
+// Final image/thumbnail sanitizer:
+// - For user posts: leave image/thumb EXACTLY as-is (they already
+//   work in My Posts, so the bundle should not touch them).
+// - For non-user content: unwrap any imgThumb chains for safety.
+const sanitized = chosen.slice(0, TOTAL_ITEMS_CAP).map((it) => {
+  if (it.source === "user") {
+    // Do NOT modify user images at all. Use the exact URL from RTDB,
+    // so My Posts and All see the same thing.
+    return it;
+  }
+
+  const rawImage = stripThumb(it.image || it.thumb || "") || it.image || null;
+  const rawThumb = stripThumb(it.thumb || "") || rawImage;
+
+  return {
+    ...it,
+    image: rawImage,
+    thumb: rawThumb || null,
+  };
+});
+
+
+// ---------- Optional cache write (fire-and-forget) ----------
+if (wantCache && timeLeft() > 500) {
+  try {
+    const cacheKey = "latest";
+    rtdb
+      .ref(`gossip/rssCache/${cacheKey}`)
+      .set({
+        ts: Date.now(),
+        items: sanitized,
+      })
+      .catch((e) => {
+        console.warn(
+          "[rssBundle] cache write (items) skipped:",
+          e?.message || e
+        );
       });
+
+    rtdb
+      .ref("gossip/rssCache/latestMeta")
+      .set({
+        ts: Date.now(),
+        counts,
+      })
+      .catch((e) => {
+        console.warn(
+          "[rssBundle] cache write (meta) skipped:",
+          e?.message || e
+        );
+      });
+  } catch (e) {
+    console.warn("[rssBundle] cache block skipped:", e?.message || e);
+  }
+}
+
+// ---------- Respond ----------
+return res.status(200).json({
+  ok: true,
+  items: sanitized,
+  meta: { counts },
+});
+
+
+
     } catch (e) {
       console.warn("[rssBundle] fatal:", e?.message || e);
       // best-effort cached response
@@ -2074,13 +3398,15 @@ const stripThumb = (u) => {
           return res.status(200).json({
             ok: true,
             items: Array.isArray(cached.items) ? cached.items : [],
-            cached: true
+            cached: true,
           });
         }
       } catch {}
       return res.status(200).json({ ok: false, items: [] });
     }
   });
+
+
 
 
 
@@ -2242,8 +3568,11 @@ exports.feedTicketmaster = fn.https.onRequest(async (req, res) => {
   return res.json(debug ? [{ _debug }, ...items] : items);
 });
 
-exports.feedEventbrite = fn.https.onRequest(async (req, res) => {
-  // CORS
+// ============================================================================
+// Eventbrite (Owned Events) → JSON + optional RTDB sync for All Events sub-tab
+// ============================================================================
+exports.feedEventbriteOwned = functions.https.onRequest(async (req, res) => {
+  // ---- CORS ----
   if (req.method === "OPTIONS") {
     res.set("Access-Control-Allow-Origin", "*");
     res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -2252,100 +3581,134 @@ exports.feedEventbrite = fn.https.onRequest(async (req, res) => {
   }
   res.set("Access-Control-Allow-Origin", "*");
 
-  // ---- Local helpers ----
+  // ---- Helpers ----
   const Q = (k) => (req.query && req.query[k]) || (req.body && req.body[k]) || null;
-  const toISO8601UTC = (d) => new Date(d).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const toISO = (d) => new Date(d).toISOString().replace(/\.\d{3}Z$/, "Z");
   const nightWindow = (days = 14) => {
-    const start = new Date(); start.setUTCHours(0,0,0,0);
-    const end = new Date(start); end.setUTCDate(end.getUTCDate() + days); end.setUTCHours(23,59,59,999);
+    const start = new Date(); start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(start); end.setUTCDate(end.getUTCDate() + days); end.setUTCHours(23, 59, 59, 999);
     return { start, end };
   };
 
-  // ---- Config
-  let EVENTBRITE_TOKEN = "";
+  // ---- Config ----
+  let EB_TOKEN = "";
+  let EB_ORG_ID_CFG = "";
   try {
     const c = functions.config();
-    EVENTBRITE_TOKEN = (c.eventbrite && c.eventbrite.token) || process.env.EVENTBRITE_TOKEN || "";
+    EB_TOKEN = (c.eventbrite && c.eventbrite.token) || process.env.EVENTBRITE_TOKEN || "";
+    EB_ORG_ID_CFG = (c.eventbrite && c.eventbrite.org_id) || process.env.EB_ORG_ID || "";
   } catch {
-    EVENTBRITE_TOKEN = process.env.EVENTBRITE_TOKEN || "";
+    EB_TOKEN = process.env.EVENTBRITE_TOKEN || "";
+    EB_ORG_ID_CFG = process.env.EB_ORG_ID || "";
   }
 
-  const debug = String(Q("debug") || "0") === "1";
   const rid = Math.random().toString(36).slice(2, 8);
-  const { start, end } = nightWindow(14);
-
-  if (!EVENTBRITE_TOKEN) {
-    console.warn(`🟠 [EB][${rid}] EVENTBRITE_TOKEN missing → []`);
-    return res.json(debug ? [{ _debug: [{ error: "Eventbrite token missing" }] }] : []);
-  }
-
-  const city = Q("city");
-  const within = Q("within") || "50mi"; // default radius to avoid empty results
+  const debug = String(Q("debug") || "0") === "1";
+  const days = Number(Q("days") || 14);
+  const { start, end } = nightWindow(days);
   const requireImage = (Q("requireImage") || "0") === "1";
   const imagesFirst = (Q("imagesFirst") ?? "1") !== "0";
+  const doSync = String(Q("sync") || Q("write") || "0") === "1";
 
-  const NIGHTLIFE_Q = [
-    "nightlife","party","club","lounge","dj","club night","rave",
-    "afrobeats","amapiano","hip hop","dancehall","soca",
-    "reggaeton","latin","salsa","bachata","kizomba"
-  ].join(" OR ");
-  const MUSIC_CATEGORY = "103";
+  const _debug = [{ rid, days, requireImage, imagesFirst, doSync }];
 
-  const _debug = [];
+  if (!EB_TOKEN) {
+    const msg = "🟠 EVENTBRITE_TOKEN missing";
+    console.warn(`[EB][${rid}] ${msg}`);
+    return res.json(debug ? [{ _debug: _debug.concat([{ error: msg }]) }] : []);
+  }
 
-  async function searchEB({ useCategory, useKeywords }) {
-    const url = new URL("https://www.eventbriteapi.com/v3/events/search/");
-    url.searchParams.set("sort_by", "date");
-    url.searchParams.set("expand", "venue,logo,organizer");
-    url.searchParams.set("page_size", "50");
-    url.searchParams.set("start_date.range_start", toISO8601UTC(start));
-    url.searchParams.set("start_date.range_end",   toISO8601UTC(end));
-    if (city) {
-      url.searchParams.set("location.address", city);
-      url.searchParams.set("location.within", within);
-    }
-    if (useCategory) url.searchParams.set("categories", MUSIC_CATEGORY);
-    if (useKeywords) url.searchParams.set("q", NIGHTLIFE_Q);
+  const headers = { Authorization: `Bearer ${EB_TOKEN}` };
 
+  // Small fetch helper with timeout + preview
+  async function jget(url) {
     const ac = new AbortController();
-    const t  = setTimeout(() => ac.abort(), 6000);
+    const t = setTimeout(() => ac.abort(), 8000);
     try {
-      const resp = await fetch(url.toString(), {
-        method: "GET",
-        headers: { Authorization: `Bearer ${EVENTBRITE_TOKEN}` },
-        signal: ac.signal,
-      });
+      const resp = await fetch(url, { headers, signal: ac.signal });
       const ct = resp.headers.get("content-type") || "";
-      if (!resp.ok || !/json/i.test(ct)) {
-        const txt = await resp.text().catch(() => "");
-        _debug.push({ try: { useCategory, useKeywords }, status: resp.status, ct, preview: txt.slice(0, 200) });
-        return [];
-      }
-      const data = await resp.json().catch(() => ({}));
-      const list = Array.isArray(data?.events) ? data.events : [];
-      _debug.push({ try: { useCategory, useKeywords }, found: list.length, rate: {
-        remaining: resp.headers.get("X-RateLimit-Remaining"),
-        limit: resp.headers.get("X-RateLimit-Limit")
-      }});
-      return list;
+      const txt = await resp.text().catch(() => "");
+      let json = null; try { json = /json/i.test(ct) ? JSON.parse(txt) : null; } catch {}
+      return { ok: resp.ok, status: resp.status, ct, json, preview: txt.slice(0, 240), resp };
     } catch (e) {
-      _debug.push({ try: { useCategory, useKeywords }, error: String(e?.message || e) });
-      return [];
+      return { ok: false, status: 0, ct: "", json: null, preview: String(e?.message || e) };
     } finally {
       clearTimeout(t);
     }
   }
 
-  // Try progressively broader searches
-  let events = await searchEB({ useCategory: true,  useKeywords: true  });
-  if (!events.length) events = await searchEB({ useCategory: true,  useKeywords: false });
-  if (!events.length) events = await searchEB({ useCategory: false, useKeywords: true  });
-  if (!events.length) events = await searchEB({ useCategory: false, useKeywords: false });
+  async function resolveOrgId() {
+    // 1) Prefer explicit org from query or config
+    const orgFromQuery = Q("org");
+    const org = orgFromQuery || EB_ORG_ID_CFG;
+    if (org) {
+      _debug.push({ org_hint: "using provided ORG_ID", org: String(org) });
+      return String(org);
+    }
 
-  // Map → ExternalFeedItem
+    // 2) Fallback: discover via users/me/organizations (requires real user OAuth token)
+    const r = await jget("https://www.eventbriteapi.com/v3/users/me/organizations/");
+    _debug.push({ me_orgs_status: r.status, preview: r.preview });
+    const list = Array.isArray(r?.json?.organizations) ? r.json.organizations : [];
+    return list[0]?.id ? String(list[0].id) : null;
+  }
+
+  async function fetchAllByOrg(orgId) {
+    let urlBase = `https://www.eventbriteapi.com/v3/organizations/${encodeURIComponent(orgId)}/events/`;
+    let results = [], continuation = null, page = 0;
+
+    do {
+      const u = new URL(urlBase);
+      u.searchParams.set("expand", "venue,logo,organizer");
+      u.searchParams.set("status", "live");
+      u.searchParams.set("order_by", "start_asc");
+      u.searchParams.set("page_size", "50");
+      if (continuation) u.searchParams.set("continuation", continuation);
+
+      const r = await jget(u.toString());
+      _debug.push({ page, url: u.toString(), status: r.status });
+      if (!r.ok || !r.json) break;
+
+      const list = Array.isArray(r.json.events) ? r.json.events : [];
+      results = results.concat(list);
+      continuation = r.json?.pagination?.continuation || null;
+
+      // rate info if present
+      _debug.push({
+        page_info: {
+          count: list.length,
+          rate: {
+            remaining: r.resp?.headers?.get("X-RateLimit-Remaining"),
+            limit: r.resp?.headers?.get("X-RateLimit-Limit"),
+          }
+        }
+      });
+
+      page++;
+    } while (continuation);
+
+    return results;
+  }
+
+  // --- Main flow ---
+  const orgId = await resolveOrgId();
+  if (!orgId) {
+    const msg = "❌ Could not resolve an Eventbrite organization. Provide ?org=YOUR_ORG_ID or set functions:config eventbrite.org_id.";
+    console.warn(`[EB][${rid}] ${msg}`);
+    return res.json(debug ? [{ _debug: _debug.concat([{ error: msg }]) }] : []);
+  }
+
+  let events = await fetchAllByOrg(orgId);
+
+  // Normalize + filter by date window
   let items = events.map((ev) => {
     const v = ev?.venue || {};
-    const when = ev?.start?.utc || ev?.start?.local || new Date();
+    const whenUTC = ev?.start?.utc || ev?.start?.local;
+    if (!whenUTC) return null;
+
+    const when = new Date(whenUTC);
+    if (when < start || when > end) return null;
+
     const address =
       v?.address?.localized_address_display ||
       v?.localized_address_display ||
@@ -2363,34 +3726,57 @@ exports.feedEventbrite = fn.https.onRequest(async (req, res) => {
       title: String(ev?.name?.text || ev?.name || ev?.summary || "Event"),
       venueName: String(v?.name || ""),
       address,
-      date: toISO8601UTC(new Date(when)),
+      date: toISO(when),
       price: null,
       externalURL: typeof ev?.url === "string" ? ev.url : null,
       source: "eventbrite",
       heroImage: hero,
+      imageURL: hero || null, // back-compat for existing UI
     };
-    item.imageURL = item.heroImage || null; // back-compat
     return item;
-  });
+  }).filter(Boolean);
 
-  // Apply requireImage after broadening
   if (requireImage) items = items.filter((x) => !!x.heroImage);
 
-  // Sort
-  if (imagesFirst) {
-    items.sort((a, b) => {
-      const ai = a.heroImage ? 1 : 0;
-      const bi = b.heroImage ? 1 : 0;
+  items.sort((a, b) => {
+    if (imagesFirst) {
+      const ai = a.heroImage ? 1 : 0, bi = b.heroImage ? 1 : 0;
       if (ai !== bi) return bi - ai;
-      return new Date(a.date) - new Date(b.date);
-    });
-  } else {
-    items.sort((a, b) => new Date(a.date) - new Date(b.date));
+    }
+    return new Date(a.date) - new Date(b.date);
+  });
+
+  // ---- Optional RTDB sync for All Events sub-tab ----
+  if (doSync && items.length) {
+    const db = admin.database();
+    const baseRef = db.ref("/externalEvents/eventbrite");
+    const idxRef = db.ref("/externalEvents/indexByDate");
+    const updates = {};
+    const idxUpdates = {};
+    const now = admin.database.ServerValue.TIMESTAMP;
+
+    const dateKey = (iso) => {
+      const d = new Date(iso);
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const da = String(d.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${da}`;
+    };
+
+    for (const it of items) {
+      updates[it.id] = { ...it, updatedAt: now };
+      const key = dateKey(it.date);
+      if (!idxUpdates[key]) idxUpdates[key] = {};
+      idxUpdates[key][it.id] = true;
+    }
+
+    await baseRef.update(updates);
+    await idxRef.update(idxUpdates);
+    _debug.push({ wrote_to_rtdb: Object.keys(updates).length });
   }
 
   return res.json(debug ? [{ _debug }, ...items] : items);
 });
-
 // =========================
 // Firestore + RTDB triggers
 // =========================
@@ -5337,96 +6723,1277 @@ function unwrapImgThumb(u) {
   return curr;
 }
 
+// ===============================
+// Life Sync AI — end-to-end flow
+// ===============================
+
+let runAI = null; // optional driver (OpenRouter)
+try { ({ runAI } = require("./aiDriver")); } catch { /* ai optional */ }
+
+function allowCORS(req, res) {
+  const origin = req.headers.origin || "*";
+  res.set("Access-Control-Allow-Origin", origin);
+  res.set("Vary", "Origin");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-User-Id, X-Requested-With");
+  res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // **Always declare JSON for non-OPTIONS responses**
+  res.set("Content-Type", "application/json; charset=utf-8");
+  if (req.method === "OPTIONS") {
+    // OPTIONS must be empty with 204
+    res.removeHeader("Content-Type");
+    return res.status(204).end();
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Card schema used by iOS
+// ─────────────────────────────────────────────────────────────────────────────
+const Cards = {
+  title: (text) => ({ type: "title", text }),
+  subtitle: (text) => ({ type: "subtitle", text }),
+  bullets: (items) => ({ type: "bullets", items }),
+  cta: (label, action) => ({ type: "cta", label, action }),
+  eventCard: (card) => ({ type: "card", card }),
+};
+
+const Action = {
+  openURL: (url) => ({ type: "open_url", url }),
+  openEvent: (id) => ({ type: "open_event", id }),
+  intent: (name, payload) => ({ type: "intent", name, payload }),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firestore helpers
+// Path: users/{uid}/system/life_profile (answers + persona)
+// Path: users/{uid}/ai/memory/{autoId} (rolling memory)
+// ─────────────────────────────────────────────────────────────────────────────
+const fs = () => admin.firestore();
+const lifeProfileRef = (uid) => fs().collection("users").doc(uid).collection("system").doc("life_profile");
+const aiMemoryCol  = (uid) => fs().collection("users").doc(uid).collection("ai").doc("state").collection("memory");
+
+async function getLifeProfile(uid) {
+  const doc = await lifeProfileRef(uid).get();
+  return doc.exists ? (doc.data() || {}) : {};
+}
+async function setLifeProfile(uid, patch) {
+  await lifeProfileRef(uid).set(patch, { merge: true });
+}
+async function getUserProfile(uid) {
+  if (!uid) return null;
+  try {
+    const snap = await fs().collection("users").doc(uid).get();
+    return { uid, ...(snap.exists ? snap.data() : {}) };
+  } catch (e) {
+    console.error("getUserProfile error", e);
+    return { uid };
+  }
+}
+
+// AI memory
+async function appendAIMemory(uid, userText, zoraText) {
+  try {
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    await aiMemoryCol(uid).add({ role: "user", text: userText, ts: now });
+    await aiMemoryCol(uid).add({ role: "zora", text: zoraText, ts: now });
+
+    // trim oldest > 50
+    const q = await aiMemoryCol(uid).orderBy("ts", "desc").get();
+    const docs = q.docs;
+    if (docs.length > 50) {
+      const toDelete = docs.slice(50);
+      await Promise.allSettled(toDelete.map(d => d.ref.delete()));
+    }
+  } catch (e) {
+    console.log("[memory] append failed:", e.message);
+  }
+}
+async function getAIMemory(uid) {
+  try {
+    const q = await aiMemoryCol(uid).orderBy("ts", "desc").limit(12).get();
+    const lines = q.docs.reverse().map(d => {
+      const v = d.data() || {};
+      return `${v.role === "user" ? "User" : "Zora"}: ${v.text || ""}`;
+    });
+    return lines.join("\n");
+  } catch { return ""; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Questions & Onboarding
+// ─────────────────────────────────────────────────────────────────────────────
+const CATEGORIES = ["morning", "productivity", "wellness", "money", "events", "social"];
+
+const QUESTIONS = {
+  morning: [
+    { id: "wake_window", prompt: "What’s your usual wake window?",
+      choices: [{id:"early",label:"5–7 AM"},{id:"standard",label:"7–9 AM"},{id:"late",label:"After 9 AM"}] },
+    { id: "movement", prompt: "Morning movement preference?",
+      choices: [{id:"light",label:"Light stretch / walk"},{id:"moderate",label:"Short workout"},{id:"intense",label:"Hard workout"}] },
+    { id: "caffeine", prompt: "Caffeine habit?",
+      choices: [{id:"none",label:"None"},{id:"coffee",label:"Coffee"},{id:"tea",label:"Tea / Alternative"}] },
+  ],
+  productivity: [
+    { id: "focus_blocks", prompt: "How do you like your focus blocks?",
+      choices: [{id:"25min",label:"Pomodoro 25/5"},{id:"50min",label:"50/10 deep work"},{id:"flex",label:"Flexible windows"}] },
+    { id: "work_hours", prompt: "Core work hours?",
+      choices: [{id:"morning",label:"Morning"},{id:"midday",label:"Mid-day"},{id:"evening",label:"Evening"}] },
+  ],
+  wellness: [
+    { id: "move_goal", prompt: "Daily movement goal?",
+      choices: [{id:"light",label:"Light (walk, stretch)"},{id:"standard",label:"Standard (30–45m)"},{id:"high",label:"High (60m+)"}] },
+    { id: "wind_down", prompt: "Evening wind-down?",
+      choices: [{id:"screen_off",label:"Screens off, read"},{id:"light_tv",label:"Light TV/music"},{id:"social",label:"Social / outside"}] },
+  ],
+  money: [
+    { id: "budget_tier", prompt: "Budget stance?",
+      choices: [{id:"lean",label:"Lean (save first)"},{id:"balanced",label:"Balanced"},{id:"premium",label:"Premium (treats ok)"}] },
+    { id: "alerts", prompt: "Money alerts?",
+      choices: [{id:"none",label:"No alerts"},{id:"weekly",label:"Weekly digest"},{id:"instant",label:"Instant large spend"}] },
+  ],
+  events: [
+    { id: "music_vibes", prompt: "Preferred event vibe?",
+      choices: [{id:"afrobeats",label:"Afrobeats"},{id:"amapiano",label:"Amapiano"},{id:"hiphop",label:"Hip-Hop"},{id:"mixed",label:"Mixed"}] },
+    { id: "distance", prompt: "Max distance to travel?",
+      choices: [{id:"2",label:"~2 km"},{id:"6",label:"~6 km"},{id:"12",label:"~12 km"},{id:"25",label:"~25+ km"}] },
+  ],
+  social: [
+    { id: "quiet_hours", prompt: "Quiet hours?",
+      choices: [{id:"none",label:"None"},{id:"21-07",label:"9 PM – 7 AM"},{id:"22-08",label:"10 PM – 8 AM"}] },
+  ],
+};
+
+function categoryLabel(cat) {
+  return ({
+    morning: "Morning Routine",
+    productivity: "Productivity",
+    wellness: "Personal Health",
+    money: "Finance",
+    events: "Events / Entertainment",
+    social: "Social",
+  }[cat] || cat);
+}
+
+function firstUnanswered(profile, category) {
+  const answered = (profile?.[category]) || {};
+  const list = QUESTIONS[category] || [];
+  return list.find(q => answered[q.id] == null) || null;
+}
+
+function questionToCards(category, q) {
+  const cards = [Cards.title(categoryLabel(category)), Cards.subtitle(q.prompt)];
+  for (const c of q.choices) {
+    cards.push(Cards.cta(c.label, Action.intent("life_sync.onboard.answer", {
+      category, questionId: q.id, choiceId: c.id
+    })));
+  }
+  return cards;
+}
+
+function categoriesGrid(profile) {
+  const cards = [Cards.title("Let’s tailor this to you")];
+  for (const cat of CATEGORIES) {
+    const q = firstUnanswered(profile, cat);
+    cards.push(
+      Cards.cta(q ? categoryLabel(cat) : `${categoryLabel(cat)} ✅`,
+        Action.intent("life_sync.onboard.category", { category: cat }))
+    );
+  }
+  // Always surface direct entry to companion + brief
+  cards.push(Cards.cta("Open Companion", Action.intent("zora.chat", { text: "Based on my profile, give me a plan for today." })));
+  cards.push(Cards.cta("I’m done—show my day", Action.intent("life_sync.brief", {})));
+  return cards;
+}
+
+// Persona context
+function buildPromptFromProfile(profile = {}) {
+  const p = [];
+  const S = (k) => profile[k] || {};
+  if (profile.morning)      p.push(`Morning: wake=${S("morning").wake_window||"n/a"}, move=${S("morning").movement||"n/a"}, caffeine=${S("morning").caffeine||"n/a"}`);
+  if (profile.productivity) p.push(`Productivity: focus=${S("productivity").focus_blocks||"n/a"}, hours=${S("productivity").work_hours||"n/a"}`);
+  if (profile.wellness)     p.push(`Wellness: move_goal=${S("wellness").move_goal||"n/a"}, wind_down=${S("wellness").wind_down||"n/a"}`);
+  if (profile.money)        p.push(`Money: budget=${S("money").budget_tier||"n/a"}, alerts=${S("money").alerts||"n/a"}`);
+  if (profile.events)       p.push(`Events: vibe=${S("events").music_vibes||"n/a"}, distance_km=${S("events").distance||"n/a"}`);
+  if (profile.social)       p.push(`Social: quiet_hours=${S("social").quiet_hours||"n/a"}`);
+  return p.join(" | ");
+}
+
+async function recomputePersona(uid, profileNow) {
+  const ref = lifeProfileRef(uid);
+  const profile = profileNow || (await getLifeProfile(uid));
+  const context = buildPromptFromProfile(profile);
+
+  let summary;
+  if (runAI) {
+    try {
+      const sys = "Summarize a user's lifestyle into 3–5 crisp, practical bullets and add 1–2 nudges for today. Keep it first-person where possible.";
+      const { text } = await runAI({
+        system: sys,
+        user: `Profile context:\n${context}\n\nReturn up to 6 bullets.`,
+        strength: "fast",
+      });
+      summary = (text || "").trim();
+    } catch (e) {
+      console.log("[persona] runAI failed:", e.message);
+    }
+  }
+  if (!summary) {
+    // fallback rule-based
+    const lines = [];
+    const S = (k) => profile[k] || {};
+    if (profile.morning)      lines.push(`I prefer a ${S("morning").wake_window||"standard"} wake and ${S("morning").movement||"light"} movement.`);
+    if (profile.productivity) lines.push(`My focus style is ${S("productivity").focus_blocks||"flex"}; best hours: ${S("productivity").work_hours||"midday"}.`);
+    if (profile.wellness)     lines.push(`Wellness: ${S("wellness").move_goal||"standard"} goal; I wind down with ${S("wellness").wind_down||"screen_off"}.`);
+    if (profile.money)        lines.push(`Budget: ${S("money").budget_tier||"balanced"}; alerts: ${S("money").alerts||"weekly"}.`);
+    if (profile.events)       lines.push(`Vibe: ${S("events").music_vibes||"mixed"}; distance around ${S("events").distance||"6"} km.`);
+    if (profile.social)       lines.push(`Quiet hours: ${S("social").quiet_hours||"none"}.`);
+    summary = lines.slice(0, 6).join("\n");
+  }
+
+  await ref.set(
+    { persona: { summary, promptContext: context, ts: admin.firestore.FieldValue.serverTimestamp() } },
+    { merge: true }
+  );
+  return summary;
+}
+
+// Save an answer and compute next
+async function saveAnswer(uid, category, questionId, choiceId) {
+  const patch = {}; // nested field path is valid in Firestore
+  patch[`${category}.${questionId}`] = choiceId;
+  await setLifeProfile(uid, patch);
+
+  // Re-read to avoid stale cache
+  const updated = await lifeProfileRef(uid).get().then(d => (d.exists ? d.data() : {}));
+
+  // Tag category complete if no remaining questions
+  if (!firstUnanswered(updated, category)) {
+    await lifeProfileRef(uid).set(
+      { meta: { completedCategories: admin.firestore.FieldValue.arrayUnion(category) } },
+      { merge: true }
+    );
+  }
+
+  // Refresh persona (async but awaited so UI can use it immediately)
+  await recomputePersona(uid, updated);
+
+  // Determine global setup completion
+  const needsAny = CATEGORIES.some(cat => firstUnanswered(updated, cat));
+  return { updated, needsAny };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Briefs
+// ─────────────────────────────────────────────────────────────────────────────
+async function morningBrief(uid, profile) {
+  const q = firstUnanswered(profile, "morning");
+  if (q) return questionToCards("morning", q);
+
+  const pref = profile?.morning || {};
+  const mapper = { early: "5–7 AM", standard: "7–9 AM", late: "after 9 AM" };
+  const wake = mapper[pref.wake_window] || "your window";
+  const persona = profile?.persona?.summary || "";
+
+  return [
+    Cards.title("Tomorrow morning"),
+    Cards.bullets([`Wake: ${wake}`, `Movement: ${pref.movement || "your call"}`, `Caffeine: ${pref.caffeine || "as usual"}`]),
+    ...(persona ? [Cards.subtitle("Based on your profile"), Cards.bullets(persona.split("\n").slice(0,2))] : []),
+    Cards.cta("Lock it in", Action.intent("morning.plan.lock", {})),
+  ];
+}
+
+async function productivityBrief(uid, profile) {
+  const q = firstUnanswered(profile, "productivity");
+  if (q) return questionToCards("productivity", q);
+
+  const p = profile?.productivity || {};
+  const persona = profile?.persona?.summary || "";
+  return [
+    Cards.title("Focus snapshot"),
+    Cards.bullets([`Blocks: ${p.focus_blocks || "flex"}`, `Core hours: ${p.work_hours || "mid-day"}`]),
+    ...(persona ? [Cards.subtitle("Based on your profile"), Cards.bullets(persona.split("\n").slice(0,2))] : []),
+    Cards.cta("Start 25-min sprint", Action.intent("focus.timer.start", { minutes: "25" })),
+  ];
+}
+
+async function wellnessBrief(uid, profile) {
+  const q = firstUnanswered(profile, "wellness");
+  if (q) return questionToCards("wellness", q);
+
+  const w = profile?.wellness || {};
+  const persona = profile?.persona?.summary || "";
+  return [
+    Cards.title("Wellness check-in"),
+    Cards.bullets([`Daily goal: ${w.move_goal || "standard"}`, `Wind-down: ${w.wind_down || "screen_off"}`]),
+    ...(persona ? [Cards.subtitle("Based on your profile"), Cards.bullets(persona.split("\n").slice(0,2))] : []),
+    Cards.cta("Log it", Action.intent("wellness.log", { set: "hydration,walk,breath" })),
+  ];
+}
+
+async function moneyBrief(uid, profile) {
+  const q = firstUnanswered(profile, "money");
+  if (q) return questionToCards("money", q);
+
+  const m = profile?.money || {};
+  const persona = profile?.persona?.summary || "";
+  return [
+    Cards.title("Money digest"),
+    Cards.bullets([`Budget: ${m.budget_tier || "balanced"}`, `Alerts: ${m.alerts || "weekly"}`]),
+    ...(persona ? [Cards.subtitle("Based on your profile"), Cards.bullets(persona.split("\n").slice(0,2))] : []),
+    Cards.cta("Open AG | Bank", Action.openURL("blackappios://agbank")),
+  ];
+}
+
+async function socialBrief(uid, profile) {
+  const q = firstUnanswered(profile, "social");
+  if (q) return questionToCards("social", q);
+
+  const s = profile?.social || {};
+  const persona = profile?.persona?.summary || "";
+  return [
+    Cards.title("Inbox & social"),
+    Cards.bullets([`Quiet hours: ${s.quiet_hours || "none"}`]),
+    ...(persona ? [Cards.subtitle("Based on your profile"), Cards.bullets(persona.split("\n").slice(0,2))] : []),
+    Cards.cta("Open messages", Action.openURL("blackappios://chat")),
+  ];
+}
+
+// Nightlife (defensive)
+async function nightlifeSuggest(uid, profile) {
+  let events = [];
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const startFrom = now - 2 * 3600, endTo = now + 6 * 3600;
+    const qs = await fs().collection("events")
+      .where("start", "<=", endTo)
+      .where("end", ">=", startFrom)
+      .where("status", "==", "open")
+      .limit(200).get();
+    events = qs.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch (e) {
+    console.log("nightlife.suggest query skipped:", e.message);
+  }
+
+  const score = (e) => Math.min(3, Number(e.scoreTrending) || 0);
+  const top = (events || []).map(e => ({ e, s: score(e) }))
+    .sort((a,b) => b.s - a.s).slice(0,5).map(x => x.e);
+
+  if (top.length) {
+    const toCard = (e) => Cards.eventCard({
+      id: e.id,
+      title: e.title || "Untitled",
+      subtitle: [e.neighborhood, e.cover ? `$${e.cover}` : null, e.doors ? `${e.doors}` : null].filter(Boolean).join(" • "),
+      image: e.image || null,
+      chips: (e.tags || []).slice(0,3),
+      ctas: [
+        { label: "Open", action: Action.openEvent(e.id) },
+        { label: "Map",  action: Action.openURL(`https://maps.apple.com/?q=${encodeURIComponent(e.title || "Venue")}`) }
+      ]
+    });
+    return [ Cards.title("Tonight’s picks 🔥"), Cards.subtitle("Based on vibe & trending"), ...top.map(toCard),
+      Cards.cta("Open Companion", Action.intent("zora.chat", { text: "Any last-minute tips for tonight?" })) ];
+  }
+  return [ Cards.title("No live events found nearby"), Cards.cta("Try again", Action.intent("nightlife.suggest", {})) ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health / Config
+// ─────────────────────────────────────────────────────────────────────────────
+exports.aiOrbHealth = functions.region("us-central1").https.onRequest(async (req, res) => {
+  allowCORS(req, res);
+  const aiConfigured = !!runAI;
+  if (!aiConfigured) return res.json({ ok: false, aiConfigured: false, error: "AI driver not loaded" });
+  // quick ping
+  try {
+    await runAI({ user: "ping", strength: "fast" });
+    return res.json({ ok: true, aiConfigured: true });
+  } catch (e) {
+    return res.json({ ok: false, aiConfigured: true, error: e.message });
+  }
+});
+
+exports.aiOrbConfig = functions.region("us-central1").https.onRequest(async (req, res) => {
+  allowCORS(req, res);
+  const uid = req.get("x-user-id") || null;
+  await getUserProfile(uid).catch(()=>{});
+  res.set("Cache-Control", "private, max-age=60");
+  res.json({
+    ok: true,
+    version: "openrouter-v1",
+    release: {
+      phaseFlags: {
+        life_sync_enabled: true,
+        nightlife_concierge_enabled: true,
+        ai_assistant_enabled: true,
+      },
+      ui: { theme: "orb_neon", glow: true, cards: ["title", "subtitle", "bullets", "cta", "card"] },
+    },
+    userProfile: {},
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Intent Router (includes zora.chat + onboarding + briefs)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.aiOrbHandle = functions
+  .region("us-central1")
+  .runWith({ timeoutSeconds: 20, memory: "512MB" })
+  .https.onRequest(async (req, res) => {
+    allowCORS(req, res);
+    if (req.method === "OPTIONS") return;
+
+    const soft = (msg, hints=[]) => res.json({
+      ok: false, tookMs: 0,
+      cards: [Cards.title("One quick thing"), Cards.subtitle(msg), ...hints.map(h => Cards.bullets([h])),
+              Cards.cta("Start setup", Action.intent("life_sync.onboard.start", {}))],
+      error: msg
+    });
+
+    try {
+      if (req.method !== "POST") return soft("Use POST for intents.");
+      const headerUid = req.get("x-user-id");
+      const body = req.body || {};
+      const uid = (body.uid && String(body.uid)) || (headerUid && String(headerUid)) || "";
+      const intent = body.intent ? String(body.intent) : "";
+      const payload = (body.payload && typeof body.payload === "object") ? body.payload : {};
+      if (!uid)    return soft("Missing user ID.");
+      if (!intent) return soft("Missing intent name.");
+
+      const t0 = Date.now();
+      const profile = await getLifeProfile(uid);
+
+      // Conversational companion
+      if (intent === "zora.chat") {
+        const userText = (payload?.text || "").trim() || "Give me a quick plan for the next hour.";
+        const memory = await getAIMemory(uid);
+        const context = buildPromptFromProfile(profile);
+        let answer = "I’m here.";
+        if (runAI) {
+          const systemPrompt = [
+            "You are Zora — the personal AI companion in BlackApp.",
+            "Help with daily life, productivity, nightlife, money, health, and social plans.",
+            "Keep replies short, lively, and futuristic. Respond like a smart friend.",
+            "Prefer bullets and concrete next-actions.",
+            "",
+            "User Profile Context:",
+            context || "(none yet)",
+            "",
+            "Recent Memory:",
+            memory || "(no history)"
+          ].join("\n");
+
+          try {
+            const { text } = await runAI({ system: systemPrompt, user: userText, strength: "creative" });
+            answer = (text || "").trim() || answer;
+          } catch (e) {
+            answer = "I’m online but couldn’t reach the model right now. I’ll still help.";
+          }
+        } else {
+          answer = "AI model isn’t configured yet, but I’m still here for quick actions.";
+        }
+        await appendAIMemory(uid, userText, answer);
+        return res.json({
+          ok: true, tookMs: Date.now()-t0,
+          cards: [
+            Cards.title("Zora 🤖"),
+            Cards.subtitle(answer),
+            Cards.cta("Plan my day", Action.intent("life_sync.brief", {})),
+            Cards.cta("Tonight’s picks", Action.intent("nightlife.suggest", {})),
+          ]
+        });
+      }
+
+      // Onboarding entry
+      if (intent === "life_sync.onboard.start") {
+        const cards = categoriesGrid(profile);
+        return res.json({ ok: true, tookMs: Date.now() - t0, cards });
+      }
+
+      // Pick category
+      if (intent === "life_sync.onboard.category") {
+        const category = String(payload?.category || "");
+        if (!CATEGORIES.includes(category)) return soft("Unknown setup category.", ["Pick Morning, Productivity, Wellness, Money, Events or Social."]);
+        const q = firstUnanswered(profile, category) || (QUESTIONS[category] || [])[0];
+        const cards = q
+          ? questionToCards(category, q)
+          : [
+              Cards.title(`${categoryLabel(category)} ✅`),
+              Cards.cta("Continue setup", Action.intent("life_sync.onboard.start", {})),
+              Cards.cta("Open Companion", Action.intent("zora.chat", { text: `Summarize my ${categoryLabel(category)} plan for today.` })),
+              Cards.cta("Show my day", Action.intent("life_sync.brief", {})),
+            ];
+        return res.json({ ok: true, tookMs: Date.now() - t0, cards });
+      }
+
+      // Save answer
+      if (intent === "life_sync.onboard.answer") {
+        const category   = String(payload?.category   || "");
+        const questionId = String(payload?.questionId || "");
+        const choiceId   = String(payload?.choiceId   || "");
+        if (!CATEGORIES.includes(category)) return soft("Unknown setup category.");
+        const qdef = (QUESTIONS[category] || []).find(q => q.id === questionId);
+        if (!qdef) return soft("Unknown question for this category.");
+        const cdef = (qdef.choices || []).find(c => c.id === choiceId);
+        if (!cdef) return soft("Unknown answer choice.");
+
+        const { updated, needsAny } = await saveAnswer(uid, category, questionId, choiceId);
+        const next = firstUnanswered(updated, category);
+
+        if (next) {
+          // proceed to next question in same category
+          return res.json({ ok: true, tookMs: Date.now()-t0, cards: questionToCards(category, next) });
+        }
+
+        // category finished: show “set” confirmation and either next categories or finish
+        const persona = updated?.persona?.summary || "";
+        const doneCards = [
+          Cards.title(`${categoryLabel(category)} set ✅`),
+          ...(persona ? [Cards.bullets(persona.split("\n").slice(0, 5))] : []),
+        ];
+
+        if (needsAny) {
+          doneCards.push(
+            ...[
+              Cards.cta("Continue setup", Action.intent("life_sync.onboard.start", {})),
+              Cards.cta("Open Companion", Action.intent("zora.chat", { text: "Based on my profile, what should I do next?" })),
+              Cards.cta("Show my day", Action.intent("life_sync.brief", {})),
+            ]
+          );
+        } else {
+          // everything answered → auto-finish cards
+          doneCards.push(
+            Cards.cta("Open Companion", Action.intent("zora.chat", { text: "Use my profile to plan my day." })),
+            Cards.cta("Show my day", Action.intent("life_sync.brief", {}))
+          );
+        }
+        return res.json({ ok: true, tookMs: Date.now()-t0, cards: doneCards });
+      }
+
+      // Day brief (persona-aware + tiles)
+      if (intent === "life_sync.brief") {
+        // If onboarding still needed, show categories immediately
+        const needsOnboarding = CATEGORIES.some(cat => firstUnanswered(profile, cat));
+        if (needsOnboarding) {
+          return res.json({ ok: true, tookMs: Date.now()-t0, cards: categoriesGrid(profile) });
+        }
+
+        const persona = profile?.persona?.summary || "";
+        const cards = [
+          Cards.title("Here’s your day at a glance ✨"),
+          ...(persona ? [Cards.subtitle("Personalized snapshot"), Cards.bullets(persona.split("\n").slice(0, 4))] : []),
+          Cards.cta("Open Companion", Action.intent("zora.chat", { text: "Give me 3 high-impact actions for today." })),
+          Cards.cta("Morning", Action.intent("morning.brief", {})),
+          Cards.cta("Focus", Action.intent("productivity.brief", {})),
+          Cards.cta("Wellness", Action.intent("wellness.checkin", {})),
+          Cards.cta("Money", Action.intent("money.digest", {})),
+          Cards.cta("Tonight", Action.intent("nightlife.suggest", {})),
+        ];
+        return res.json({ ok: true, tookMs: Date.now()-t0, cards });
+      }
+
+      // Category briefs
+      if (intent === "morning.brief")        return res.json({ ok: true, tookMs: Date.now()-t0, cards: await morningBrief(uid, profile) });
+      if (intent === "productivity.brief")   return res.json({ ok: true, tookMs: Date.now()-t0, cards: await productivityBrief(uid, profile) });
+      if (intent === "wellness.checkin")     return res.json({ ok: true, tookMs: Date.now()-t0, cards: await wellnessBrief(uid, profile) });
+      if (intent === "money.digest")         return res.json({ ok: true, tookMs: Date.now()-t0, cards: await moneyBrief(uid, profile) });
+      if (intent === "social.brief")         return res.json({ ok: true, tookMs: Date.now()-t0, cards: await socialBrief(uid, profile) });
+
+      // Nightlife
+      if (intent === "nightlife.suggest")    return res.json({ ok: true, tookMs: Date.now()-t0, cards: await nightlifeSuggest(uid, profile) });
+
+      // Ask-anything (legacy simple)
+      if (intent === "zora.ask") {
+        const text = (payload && payload.text) || "";
+        if (runAI && text.trim()) {
+          const { text: answer } = await runAI({ user: text.trim(), strength: "fast" });
+          const lines = (answer || "").split("\n").filter(Boolean).slice(0, 6);
+          return res.json({ ok: true, tookMs: Date.now()-t0, cards: [Cards.title("Zora 🤖"), Cards.bullets(lines.length?lines:["I’m here."])] });
+        }
+        return res.json({
+          ok: true, tookMs: Date.now()-t0,
+          cards: [Cards.title("Zora 🤖"), Cards.subtitle("Model not configured yet."), Cards.bullets(["Example: “Plan my day”","Example: “Help me focus for 1 hour”"])]
+        });
+      }
+
+      return soft(`Unknown intent: ${intent}`, ["Try 'Start setup' or 'Show my day'."]);
+
+    } catch (e) {
+      console.error("aiOrbHandle error", e);
+      return res.json({
+        ok: false, error: e.message || String(e),
+        cards: [Cards.title("Something went wrong"), Cards.subtitle("I’ll keep this graceful so you can continue."), Cards.cta("Start setup", Action.intent("life_sync.onboard.start", {}))]
+      });
+    }
+  });
 
 
 
-// ADMIN: Fix historic IG thumbs/images in RTDB (unwrap, https, rebuild single thumb)
-// GET /fixOldIgThumbs?key=ADMIN_INIT_KEY&dry=1
-// Fix older IG items that have nested/blank thumbs by rewriting to a clean imgThumb with 25% logo fallback.
-// GET /fixOldIgThumbs?key=ADMIN_INIT_KEY&dry=1   (dry run)
-// GET /fixOldIgThumbs?key=ADMIN_INIT_KEY&dry=0   (writes)
-exports.fixOldIgThumbs = fn.https.onRequest(async (req, res) => {
+
+
+exports.ebWebhook = fn.https.onRequest(async (req, res) => {
+  // Basic allow CORS + only POSTs from EB
+  res.set("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") { return res.status(204).end(); }
+  if (req.method !== "POST") return res.status(405).json({error:"method"});
+
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    const { api_url, action, endpoint_url, resource_id, config } = body || {};
+    // action examples: order.placed, attendee.updated...
+    // api_url: direct REST URL for the resource that changed
+
+    // Pull the full object with your org token
+    const EVENTBRITE_TOKEN =
+      (functions.config().eventbrite && functions.config().eventbrite.token) || process.env.EVENTBRITE_TOKEN || "";
+    const r = await fetch(api_url, { headers: { Authorization: `Bearer ${EVENTBRITE_TOKEN}` }});
+    const data = await r.json();
+
+    // Normalize → write to /purchases and /externalTicketsIndex
+    await upsertFromEventbrite({ action, data });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[ebWebhook] error", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Replace your current upsertFromEventbrite with this:
+async function upsertFromEventbrite({ action, data }) {
+  const a = String(action || "").toLowerCase();
+
+  // Heuristics
+  const isOrderPayload =
+    data?.object === "order" ||
+    data?.resource === "order" ||
+    (data?.id && data?.event_id && typeof data?.status === "string");
+
+  const isAttendeeLike =
+    Array.isArray(data?.attendees) ||
+    !!data?.profile ||
+    !!data?.barcode ||
+    !!data?.ticket_class_id ||
+    !!data?.checked_in ||
+    (Array.isArray(data) && data[0]?.profile);
+
+  // Orders: action prefix or order-shaped payload
+  if (a.startsWith("order.") || isOrderPayload) {
+    await mapOrderToPurchase(data);
+  }
+
+  // Attendees / barcodes: support both naming variants + shape heuristic
+  if (
+    a === "attendee.updated" ||
+    a === "attendee.checked_in" ||
+    a === "attendee.checked_out" ||
+    a === "barcode.checked_in" ||
+    a === "barcode.checked_out" ||
+    isAttendeeLike
+  ) {
+    await mapAttendees(data);
+  }
+}
+
+
+async function mapOrderToPurchase(order) {
+  const eventId = String(order.event_id || "");
+  const orderId = String(order.id || "");
+  const email   = order.email || order.profile?.email || null;
+
+  // quantities & amounts
+  const qty = Number(
+    order.quantity ??
+    (Array.isArray(order.attendees) ? order.attendees.length : 0)
+  ) || 0;
+
+  // Eventbrite amounts are in minor units (e.g., cents)
+  const totalAmount =
+    typeof order?.costs?.gross?.value === "number"
+      ? order.costs.gross.value / 100
+      : (typeof order?.costs?.gross?.major_value === "string"
+          ? parseFloat(order.costs.gross.major_value)
+          : 0);
+
+  const currency = order?.costs?.gross?.currency || "USD";
+
+  // place time as UNIX seconds for your Swift TimeInterval
+  const ts = Math.floor(new Date(order.created || Date.now()).getTime() / 1000);
+
+  // map to Firebase user by email (if we can)
+  let userId = await userIdByEmail(email);
+
+  // base payload your iOS expects
+  const payload = {
+    source: "eventbrite",
+    userId: userId || null,
+    eventId,
+    orderId,
+    eventTitle: "",                // filled by enrichment later
+    eventImagePath: "",            // filled by enrichment later (hero URL)
+    externalURL: order.resource_uri || null,  // optional; enrichment can set canonical event URL
+    quantity: qty,
+    type: "ticket",
+    totalAmount,
+    currency,
+    timestamp: ts,                 // <— important: number, not ISO string
+    placedAt: order.created || null
+  };
+
+  // write under purchases/{uid} or purchases_unclaimed
+  if (userId) {
+    await admin.database().ref("purchases").child(userId).child(orderId).update(payload);
+  } else {
+    await admin.database().ref("purchases_unclaimed").child(orderId).update(payload);
+  }
+
+  // index by event (optional)
+  if (userId && eventId) {
+    await admin.database().ref("externalTicketsIndex").child(eventId).child(orderId)
+      .set({ userId, source: "eventbrite" });
+  }
+}
+
+
+async function mapAttendees(obj) {
+  const attendees = Array.isArray(obj.attendees) ? obj.attendees : [obj].filter(Boolean);
+
+  for (const a of attendees) {
+    const orderId = String(a.order_id || obj.id || "");
+    const eventId = String(a.event_id || obj.event_id || "");
+    const email   = a.profile?.email || a.email || null;
+
+    let userId = await userIdByEmail(email);
+
+    // read existing (so we don't wipe amounts)
+    const baseRef = userId
+      ? admin.database().ref("purchases").child(userId).child(orderId)
+      : admin.database().ref("purchases_unclaimed").child(orderId);
+
+    const snap = await baseRef.get();
+    const existing = snap.exists() ? (snap.val() || {}) : {};
+
+    const barcode = (a.barcodes && a.barcodes[0]?.barcode) || a.barcode || null;
+    const barcodeStatus = (a.barcodes && a.barcodes[0]?.status) || a.barcode_status || null;
+
+    // try to enrich from /externalEvents/eventbrite/{eventId}
+    let title = existing.eventTitle || "";
+    let hero  = existing.eventImagePath || "";
+    let dateISO = existing.eventISODate || null;
+    try {
+      const evSnap = await admin.database().ref("externalEvents/eventbrite").child(eventId).get();
+      if (evSnap.exists()) {
+        const m = evSnap.val() || {};
+        if (!title && m.title) title = m.title;
+        if (!hero && (m.imageURL || m.heroImage)) hero = m.imageURL || m.heroImage;
+        if (!dateISO && m.date) dateISO = m.date;
+      }
+    } catch (_) {}
+
+    const update = {
+      source: "eventbrite",
+      userId: userId || existing.userId || null,
+      eventId,
+      orderId,
+      eventTitle: title,
+      eventImagePath: hero,
+      eventISODate: dateISO || null,
+      barcode: barcode,
+      barcodeStatus: barcodeStatus,
+      timestamp: existing.timestamp || Math.floor(Date.now()/1000)  // keep old or set now
+    };
+
+    await baseRef.update(update);
+
+    // move from unclaimed → claimed if we now have a userId
+    if (!snap.exists() && userId) {
+      // nothing to move
+    } else if (userId && baseRef.key && baseRef.ref.path.parent?.key === "purchases_unclaimed") {
+      const data = (await baseRef.get()).val() || {};
+      await admin.database().ref("purchases").child(userId).child(orderId).set(data);
+      await baseRef.remove();
+    }
+
+    if (userId && eventId) {
+      await admin.database().ref("externalTicketsIndex").child(eventId).child(orderId)
+        .set({ userId, source: "eventbrite" });
+    }
+  }
+}
+
+async function userIdByEmail(email) {
+  if (!email) return null;
+  try {
+    const user = await admin.auth().getUserByEmail(email);
+    return user.uid;
+  } catch { return null; }
+}
+
+
+exports.ebOrderComplete = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin","*");
+  const eventId = String(req.query.eventId || "");
+  if (!eventId) return res.json({ok:true});
+  await queueReconcile(eventId);
+  return res.json({ok:true});
+});
+
+async function queueReconcile(eventId) {
+  return admin.database().ref("jobs/reconcile_eventbrite").push({
+    eventId, ts: Date.now()
+  });
+}
+
+
+
+exports.ebReconcileNightly = fn.pubsub.schedule("every day 03:15").timeZone("America/New_York").onRun(async () => {
+  const ORG = (functions.config().eventbrite && functions.config().eventbrite.org_id) || process.env.EB_ORG_ID;
+  const TOKEN = (functions.config().eventbrite && functions.config().eventbrite.token) || process.env.EVENTBRITE_TOKEN;
+  if (!ORG || !TOKEN) return null;
+
+  const since = new Date(Date.now() - 1000*60*60*24*30).toISOString(); // last 30 days
+  // 1) list events
+  const evs = await ebPaged(`https://www.eventbriteapi.com/v3/organizations/${ORG}/events/?order_by=start_desc`, TOKEN);
+  for (const ev of evs) {
+    if (!ev.id) continue;
+    // 2) list orders
+    const orders = await ebPaged(`https://www.eventbriteapi.com/v3/events/${ev.id}/orders/?changed_since=${encodeURIComponent(since)}`, TOKEN);
+    for (const o of orders) await mapOrderToPurchase(o);
+    // 3) list attendees
+    const atts = await ebPaged(`https://www.eventbriteapi.com/v3/events/${ev.id}/attendees/?changed_since=${encodeURIComponent(since)}`, TOKEN);
+    await mapAttendees({ attendees: atts });
+  }
+  return null;
+});
+
+async function ebPaged(url, token) {
+  let out = [];
+  let pageUrl = url;
+  for (let i=0; i<30 && pageUrl; i++) {
+    const r = await fetch(pageUrl, { headers: { Authorization: `Bearer ${token}` }});
+    const j = await r.json();
+    const list = j.events || j.orders || j.attendees || [];
+    out = out.concat(list);
+    const pagination = j.pagination || j.pagination || {};
+    pageUrl = (pagination.has_more_items && pagination.page_number && pagination.page_count && pagination.page_number < pagination.page_count)
+      ? (new URL(pageUrl)).toString().replace(/([?&])page=\d+/, "") + (pageUrl.includes("?") ? "&" : "?") + `page=${(pagination.page_number+1)}`
+      : null;
+  }
+  return out;
+}
+
+
+// HTTP wrapper that runs the same reconcile logic with optional ?days= and ?since=
+exports.ebReconcileNow = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  try {
+    const ORG =
+      (functions.config().eventbrite && functions.config().eventbrite.org_id) ||
+      process.env.EB_ORG_ID;
+    const TOKEN =
+      (functions.config().eventbrite && functions.config().eventbrite.token) ||
+      process.env.EVENTBRITE_TOKEN;
+
+    if (!ORG || !TOKEN) {
+      return res.status(400).json({ ok: false, error: "Missing ORG/TOKEN" });
+    }
+
+    const days = Number(req.query.days || 30);
+    const sinceISO = req.query.since || new Date(Date.now() - days*24*60*60*1000).toISOString();
+
+    // Reuse your same helpers
+    const events = await ebPaged(`https://www.eventbriteapi.com/v3/organizations/${ORG}/events/?order_by=start_desc`, TOKEN);
+
+    let ordersProcessed = 0, attendeesProcessed = 0, errors = [];
+    for (const ev of events) {
+      if (!ev?.id) continue;
+      try {
+        const orders = await ebPaged(`https://www.eventbriteapi.com/v3/events/${ev.id}/orders/?changed_since=${encodeURIComponent(sinceISO)}`, TOKEN);
+        for (const o of orders) { await mapOrderToPurchase(o); ordersProcessed++; }
+
+        const atts = await ebPaged(`https://www.eventbriteapi.com/v3/events/${ev.id}/attendees/?changed_since=${encodeURIComponent(sinceISO)}`, TOKEN);
+        await mapAttendees({ attendees: atts }); attendeesProcessed += atts.length;
+      } catch (e) {
+        errors.push({ eventId: ev.id, message: String(e?.message || e) });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      org: ORG,
+      since: sinceISO,
+      stats: { events: events.length, ordersProcessed, attendeesProcessed },
+      errors
+    });
+  } catch (e) {
+    console.error("[ebReconcileNow]", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+exports.ebNormalizePurchases = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  const root = admin.database().ref("purchases");
+  const snap = await root.get();
+  if (!snap.exists()) return res.json({ ok: true, updated: 0 });
+
+  let updated = 0;
+  const updates = [];
+
+  snap.forEach(userSnap => {
+    const userId = userSnap.key;
+    userSnap.forEach(orderSnap => {
+      const v = orderSnap.val() || {};
+      const needs =
+        !v.source ||
+        typeof v.timestamp !== "number" ||
+        v.totalAmount === undefined ||
+        v.quantity === undefined;
+
+      if (needs) {
+        const patch = {
+          source: v.source || "eventbrite",
+          userId: v.userId || userId,
+          quantity: typeof v.quantity === "number" ? v.quantity : (v.qty || 0),
+          totalAmount: typeof v.totalAmount === "number" ? v.totalAmount :
+                       (typeof v.total === "number" ? v.total : 0),
+          timestamp: typeof v.timestamp === "number"
+            ? v.timestamp
+            : (v.placedAt ? Math.floor(new Date(v.placedAt).getTime()/1000) : Math.floor(Date.now()/1000))
+        };
+        updates.push(root.child(userId).child(orderSnap.key).update(patch));
+        updated++;
+      }
+    });
+  });
+
+  await Promise.all(updates);
+  return res.json({ ok: true, updated });
+});
+
+
+
+// Moves any "loose" purchases under /purchases/{orderId} into /purchases/{uid}/{orderId}
+// Uses email → Firebase Auth lookup. Safe to re-run.
+exports.ebMigrateLoosePurchases = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  const root = admin.database().ref("purchases");
+  const snap = await root.get();
+  if (!snap.exists()) return res.json({ ok: true, moved: 0, skipped: 0 });
+
+  let moved = 0, skipped = 0, checked = 0;
+  const ops = [];
+
+  // Anything whose key looks like an orderId (all digits) and not a known UID branch gets migrated
+  snap.forEach(child => {
+    const key = child.key || "";
+    const val = child.val() || {};
+    const looksLikeOrderId = /^\d+$/.test(key); // e.g. "22511248823"
+
+    // if child contains nested objects keyed by push-ids, it's likely already a user branch; skip
+    const isUserBranch = !!val && typeof val === "object" && Object.values(val).some(
+      v => v && typeof v === "object" && (v.eventId || v.orderId || v.source)
+    );
+
+    if (looksLikeOrderId && !isUserBranch) {
+      ops.push((async () => {
+        checked++;
+        const email = val.email || val.profile?.email || null;
+        if (!email) { skipped++; return; }
+        let uid = null;
+        try {
+          const user = await admin.auth().getUserByEmail(email);
+          uid = user.uid;
+        } catch (_) {}
+
+        if (!uid) { skipped++; return; }
+
+        const target = admin.database().ref("purchases").child(uid).child(key);
+        await target.update({
+          source: "eventbrite",
+          userId: uid,
+          eventId: val.eventId || "",
+          orderId: key,
+          eventTitle: val.eventTitle || "",
+          eventImagePath: val.eventImagePath || "",
+          eventISODate: val.eventISODate || null,
+          quantity: typeof val.quantity === "number" ? val.quantity : (val.qty || 0),
+          type: val.type || "ticket",
+          totalAmount: typeof val.totalAmount === "number" ? val.totalAmount :
+                       (typeof val.total === "number" ? val.total : 0),
+          currency: val.currency || "USD",
+          timestamp: typeof val.timestamp === "number"
+            ? val.timestamp
+            : (val.placedAt ? Math.floor(new Date(val.placedAt).getTime()/1000) : Math.floor(Date.now()/1000)),
+          placedAt: val.placedAt || null,
+          status: val.status || null,
+          barcode: val.barcode || null,
+          barcodeStatus: val.barcodeStatus || null
+        });
+
+        await child.ref.remove();
+        moved++;
+      })());
+    }
+  });
+
+  await Promise.all(ops);
+  return res.json({ ok: true, moved, skipped, checked });
+});
+
+
+
+
+// --- util: verify auth (ID token or admin key override) ---
+async function requireAuthOrAdmin(req) {
+  const hdr = req.get("Authorization") || "";
+  const m = hdr.match(/^Bearer\s+(.+)$/i);
+  const idToken = m?.[1] || req.query.idToken || req.body?.idToken;
+
+  const cfg = (() => {
+    try { return functions.config(); } catch { return {}; }
+  })();
+  const ADMIN_KEY = (cfg.admin && cfg.admin.init_key) || process.env.ADMIN_INIT_KEY || "";
+
+  if (idToken) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      return { uid: decoded.uid, email: decoded.email || null, isAdmin: false };
+    } catch (e) {
+      throw new Error("AUTH_INVALID_TOKEN");
+    }
+  }
+  // Admin override (CLI/testing): ?key=...&userId=...
+  if (ADMIN_KEY && (req.query.key === ADMIN_KEY || req.body?.key === ADMIN_KEY)) {
+    const uid = req.query.userId || req.body?.userId;
+    if (!uid) throw new Error("ADMIN_NEEDS_USERID");
+    return { uid, email: null, isAdmin: true };
+  }
+  throw new Error("AUTH_REQUIRED");
+}
+
+// normalize + safe number cast
+function toUnix(ts) {
+  if (typeof ts === "number") return ts;
+  if (typeof ts === "string") {
+    const n = Date.parse(ts);
+    if (!Number.isNaN(n)) return Math.floor(n / 1000);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+exports.ebClaimTicket = fn.https.onRequest(async (req, res) => {
   // CORS
   if (req.method === "OPTIONS") {
     res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.set("Access-Control-Allow-Headers", "Content-Type");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
     return res.status(204).end();
   }
   res.set("Access-Control-Allow-Origin", "*");
 
   try {
-    const key = String(req.query.key || "");
-    const adminKey = process.env.ADMIN_INIT_KEY || (functions.config().admin && functions.config().admin.init_key);
-    if (!key || key !== adminKey) return res.status(401).json({ error: "unauthorized" });
+    const { uid } = await requireAuthOrAdmin(req);
+    const orderId = String(req.query.orderId || req.body?.orderId || "").trim();
+    if (!orderId) return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID" });
 
-    const dry = String(req.query.dry || "1") !== "0";
-    const limitPerPartner = Math.max(parseInt(req.query.limit || "0", 10) || 0, 0); // 0 = scan all
+    const unclaimedRef = admin.database().ref("purchases_unclaimed").child(orderId);
+    const snap = await unclaimedRef.get();
+    if (!snap.exists()) {
+      return res.status(404).json({ ok: false, error: "ORDER_NOT_FOUND_UNCLAIMED" });
+    }
+    const val = snap.val() || {};
+    // minimal sanity
+    const eventId = String(val.eventId || "");
+    const payload = {
+      source: val.source || "eventbrite",
+      userId: uid,
+      eventId,
+      orderId,
+      eventTitle: val.eventTitle || "",
+      eventImagePath: val.eventImagePath || "",
+      eventISODate: val.eventISODate || null,
+      quantity: typeof val.quantity === "number" ? val.quantity : (val.qty || 0),
+      type: val.type || "ticket",
+      totalAmount: typeof val.totalAmount === "number" ? val.totalAmount :
+                   (typeof val.total === "number" ? val.total : 0),
+      currency: val.currency || "USD",
+      timestamp: toUnix(val.timestamp ?? val.placedAt),
+      placedAt: val.placedAt || null,
+      status: val.status || null,
+      barcode: val.barcode || null,
+      barcodeStatus: val.barcodeStatus || null,
+      externalURL: val.externalURL || null
+    };
 
-    const partnersSnap = await rtdb.ref("gossip/partners").get();
-    const partners = partnersSnap.exists() ? partnersSnap.val() : {};
-    const partnerIds = Object.keys(partners);
+    // write to purchases/{uid}/{orderId}
+    const userRef = admin.database().ref("purchases").child(uid).child(orderId);
+    await userRef.update(payload);
 
-    let scanned = 0, rewrote = 0;
-    const updates = {};
+    // optional index by event
+    if (eventId) {
+      await admin.database().ref("externalTicketsIndex").child(eventId).child(orderId)
+        .set({ userId: uid, source: payload.source });
+    }
 
-    for (const partnerId of partnerIds) {
-      // Pull all items (or capped) newest-first by timestamp
-      let q = rtdb.ref(`gossip/items/${partnerId}`).orderByChild("timestamp");
-      const snap = await q.get();
-      if (!snap.exists()) continue;
+    // remove unclaimed
+    await unclaimedRef.remove();
 
-      const rows = [];
-      snap.forEach(cs => rows.push(cs));
-      rows.sort((a, b) => (b.val()?.timestamp || 0) - (a.val()?.timestamp || 0));
-      const slice = limitPerPartner > 0 ? rows.slice(0, limitPerPartner) : rows;
+    return res.json({ ok: true, movedTo: `purchases/${uid}/${orderId}` });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const code = (msg === "AUTH_REQUIRED" || msg === "AUTH_INVALID_TOKEN") ? 401 : 400;
+    return res.status(code).json({ ok: false, error: msg });
+  }
+});
 
-      for (const cs of slice) {
-        scanned++;
-        const v = cs.val() || {};
-        const keyPath = `gossip/items/${partnerId}/${cs.key}`;
-        const currentThumb = v.thumb || "";
-        const currentImage = v.image || v.rawThumbUrl || v.rawMediaUrl || "";
 
-        // Figure out the best upstream image we can point at (unwrapping nested imgThumb → original)
-        const baseUrl = unwrapImgThumb(currentThumb || currentImage || "");
-        const hasBase = !!baseUrl;
+exports.ebListUnclaimed = fn.https.onRequest(async (req, res) => {
+  if (req.method === "OPTIONS") {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+    return res.status(204).end();
+  }
+  res.set("Access-Control-Allow-Origin", "*");
 
-        // Compute what the new thumb should be (always 25% logo fallback)
-        const newThumb = cfUrl("imgThumb", {
-          url: hasBase ? baseUrl : "",
-          w: 900,
-          fallback: getLogoFallback(),
-          fallbackScale: 0.25,
+  try {
+    const auth = await requireAuthOrAdmin(req);
+    const emailQ = (req.query.email || req.body?.email || auth.email || "").toLowerCase();
+
+    const ref = admin.database().ref("purchases_unclaimed");
+    const snap = await ref.get();
+    if (!snap.exists()) return res.json({ ok: true, items: [] });
+
+    const items = [];
+    snap.forEach(child => {
+      const v = child.val() || {};
+      const recEmail = (v.email || v.profile?.email || "").toLowerCase();
+      if (!emailQ || auth.isAdmin || (recEmail && recEmail === emailQ)) {
+        items.push({
+          orderId: child.key,
+          eventId: v.eventId || "",
+          email: recEmail || null,
+          placedAt: v.placedAt || null,
+          quantity: v.quantity ?? v.qty ?? 0,
+          totalAmount: typeof v.totalAmount === "number" ? v.totalAmount :
+                       (typeof v.total === "number" ? v.total : 0),
+          currency: v.currency || "USD",
+          status: v.status || null,
+          eventTitle: v.eventTitle || "",
+          eventImagePath: v.eventImagePath || ""
         });
+      }
+    });
 
-        // Rewrite if:
-        //  - thumb is empty, OR
-        //  - thumb is clearly an imgThumb-within-imgThumb chain, OR
-        //  - thumb URL differs from the desired rebuilt one
-        const needsRewrite =
-          !currentThumb ||
-          /\/imgThumb$/.test(currentThumb) && currentThumb.includes("url=") && decodeURIComponent(currentThumb).includes("/imgThumb?url=") ||
-          currentThumb !== newThumb;
+    return res.json({ ok: true, items });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const code = (msg.startsWith("AUTH")) ? 401 : 400;
+    return res.status(code).json({ ok: false, error: msg });
+  }
+});
 
-        if (needsRewrite) {
-          rewrote++;
-          if (!dry) {
-            updates[`${keyPath}/thumb`] = newThumb;
-            // also fix image if it was empty and we found a base
-            if (!v.image && hasBase) updates[`${keyPath}/image`] = baseUrl;
-          }
-        }
+
+
+
+exports.adminMoveWallet = fn.https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  try {
+    const cfg = (() => { try { return functions.config(); } catch { return {}; }})();
+    const ADMIN_KEY = (cfg.admin && cfg.admin.init_key) || process.env.ADMIN_INIT_KEY || "";
+    const key = String(req.query.key || req.body?.key || "");
+    if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(401).json({ ok:false, error:"UNAUTHORIZED" });
+
+    const from = String(req.query.from || req.body?.from || "").trim();
+    const to   = String(req.query.to   || req.body?.to   || "").trim();
+    if (!from || !to) return res.status(400).json({ ok:false, error:"MISSING_from_or_to" });
+    if (from === to)  return res.status(400).json({ ok:false, error:"SAME_UID" });
+
+    const db = admin.database();
+    const srcSnap = await db.ref("purchases").child(from).get();
+    const data = srcSnap.val();
+    if (!data) return res.json({ ok:true, moved:false, reason:"SOURCE_EMPTY" });
+
+    // merge into dest (preserve any existing)
+    await db.ref("purchases").child(to).update(data);
+
+    // optional: delete source after copy
+    await db.ref("purchases").child(from).remove();
+
+    return res.json({ ok:true, moved:true, from, to, count: Object.keys(data).length });
+  } catch (e) {
+    console.error("adminMoveWallet error:", e);
+    return res.status(500).json({ ok:false, error:String(e?.message || e) });
+  }
+});
+
+
+exports.adminEnrichWallet = functions.region("us-central1").https.onRequest(async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  try {
+    const cfg = (() => { try { return functions.config() } catch { return {} } })();
+    const ADMIN_KEY = (cfg.admin && cfg.admin.init_key) || process.env.ADMIN_INIT_KEY || "";
+    const key = String(req.query.key || req.body?.key || "");
+    if (!ADMIN_KEY || key !== ADMIN_KEY) return res.status(401).json({ ok:false, error:"UNAUTHORIZED" });
+
+    const userId = String(req.query.userId || req.body?.userId || "").trim();
+    if (!userId) return res.status(400).json({ ok:false, error:"MISSING_userId" });
+
+    const db = admin.database();
+    const walletRef = db.ref("purchases").child(userId);
+    const snap = await walletRef.get();
+    const wallet = snap.val() || {};
+    let touched = 0;
+
+    // pull external cache once
+    const extRef = db.ref("externalEvents").child("eventbrite");
+    const extSnap = await extRef.get();
+    const ebCache = extSnap.val() || {};
+
+    const updates = {};
+    for (const [orderId, obj] of Object.entries(wallet)) {
+      if (typeof obj !== "object" || obj === null) continue;
+      const p = obj;
+      const isEB = (p.source === "eventbrite" || p.provider === "eventbrite");
+      if (!isEB) continue;
+
+      // compute timestamp if missing via placedAt
+      let timestamp = p.timestamp;
+      if (!timestamp && p.placedAt) {
+        const t = Date.parse(p.placedAt);
+        if (!Number.isNaN(t)) timestamp = Math.floor(t / 1000);
+      }
+      const ev = p.eventId && ebCache[p.eventId] ? ebCache[p.eventId] : null;
+      const title = p.eventTitle || (ev && ev.title) || "";
+      const image = p.eventImagePath || (ev && (ev.imageURL || ev.heroImage)) || "";
+      const isoDate = p.eventISODate || (ev && ev.date) || null;
+
+      // if any improvement, write it
+      const patch = {};
+      if (!p.timestamp && timestamp) patch.timestamp = timestamp;
+      if (!p.eventTitle && title) patch.eventTitle = title;
+      if (!p.eventImagePath && image) patch.eventImagePath = image;
+      if (!p.eventISODate && isoDate) patch.eventISODate = isoDate;
+
+      if (Object.keys(patch).length) {
+        updates[`${orderId}`] = { ...p, ...patch };
+        touched++;
       }
     }
 
-    if (!dry && Object.keys(updates).length) {
-      await rtdb.ref().update(updates);
-    }
-
-    return res.json({ ok: true, dry, partners: partnerIds.length, scanned, rewrote, wrote: dry ? 0 : Object.keys(updates).length });
+    if (touched) await walletRef.update(updates);
+    return res.json({ ok:true, userId, touched });
   } catch (e) {
-    console.error("fixOldIgThumbs error", e);
-    return res.status(500).json({ error: String(e?.message || e) });
+    console.error("adminEnrichWallet error:", e);
+    return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });

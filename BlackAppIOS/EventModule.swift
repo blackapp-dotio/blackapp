@@ -268,21 +268,141 @@ private struct HintChip: View {
 }
 
 
+import SwiftUI
+import Firebase
+import FirebaseAuth
+import FirebaseDatabase
+import CoreImage.CIFilterBuiltins
+
+// MARK: - Unified ticket model for wallet
+struct UnifiedPurchase: Identifiable, Equatable {
+    let id: String                      // purchase/order id
+    let userId: String
+    let eventId: String
+    var eventTitle: String
+    var eventImagePath: String          // for platform; for EB we store external image URL here
+    var quantity: Int
+    var type: String                    // "ticket" | "table" | etc.
+    var totalAmount: Double
+    var timestamp: TimeInterval         // purchase time or event time fallback
+
+    // Enrichment / external
+    var source: String?                 // "eventbrite" for EB; nil or "platform" otherwise
+    var orderId: String?                // EB order id
+    var externalURL: String?            // EB event URL
+    var barcode: String?                // EB attendee/order barcode (if present)
+    var barcodeStatus: String?          // EB barcode status (optional)
+    var eventISODate: String?           // EB imported event ISO date (if available)
+
+    // Convenience
+    var isEventbrite: Bool { (source ?? "").lowercased() == "eventbrite" }
+}
+
+
+
+
+
+/// Simple representation of an unclaimed EB order (from /api/eb/list-unclaimed)
+fileprivate struct UnclaimedItem: Identifiable, Hashable, Decodable {
+    var id: String { orderId }
+    let orderId: String
+    let eventId: String
+    let email: String?
+    let placedAt: String?
+    let quantity: Int
+    let totalAmount: Double
+    let currency: String
+    let status: String?
+    let eventTitle: String?
+    let eventImagePath: String?
+}
+
+
 // MARK: - MyEventsView (NO inner NavigationView; tighter spacing)
 
 struct MyEventsView: View {
     @State private var myCreatedEvents: [EventModel] = []
-    @State private var myPurchasedEvents: [PurchaseModel] = []
+    @State private var myPurchased: [UnifiedPurchase] = []
+
+    // Unclaimed EB
+    @State private var unclaimed: [UnclaimedItem] = []
+    @State private var isClaimWorking = false
+    @State private var claimError: String? = nil
+
+    // Sheets / selections
     @State private var selectedURL: URL? = nil
     @State private var showWebView = false
-
     @State private var selectedEventToEdit: EventModel? = nil
     @State private var selectedEventForStats: EventModel? = nil
-    @State private var selectedPurchase: PurchaseModel? = nil
+
+    // Platform ticket proof
+    @State private var selectedPlatformPurchase: PurchaseModel? = nil
+    // Eventbrite ticket proof
+    @State private var selectedEBProof: UnifiedPurchase? = nil
+
+    // 🔍 Debug banner
+    @State private var debugWalletLoadedCount: Int = -1
+    @State private var debugLastFetchNote: String = "–"
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+
+                // ===== Debug banner =====
+                VStack(spacing: 6) {
+                    Text("Wallet v2025-11-12").font(.caption2).foregroundColor(.gray)
+                    Text("Loaded: \(debugWalletLoadedCount >= 0 ? String(debugWalletLoadedCount) : "…") • \(debugLastFetchNote)")
+                        .font(.caption2).foregroundColor(.gray)
+                }
+                .padding(.top, 8)
+
+                // ===== Unclaimed banner (if any) =====
+                if !unclaimed.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Eventbrite tickets found")
+                            .font(.headline)
+                        Text("We found \(unclaimed.count) Eventbrite order\(unclaimed.count == 1 ? "" : "s") for your email. Claim them to add to your wallet.")
+                            .font(.subheadline)
+                            .foregroundColor(.gray)
+                        HStack(spacing: 8) {
+                            Button {
+                                claimAllUnclaimed()
+                            } label: {
+                                Label(isClaimWorking ? "Claiming…" : "Claim all", systemImage: "arrow.down.doc")
+                                    .font(.footnote)
+                                    .padding(.horizontal, 10).padding(.vertical, 8)
+                                    .background(Color.blue.opacity(0.9))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                            }
+                            .disabled(isClaimWorking)
+
+                            Menu {
+                                ForEach(unclaimed) { item in
+                                    Button("Claim \(item.orderId)") {
+                                        claim(orderId: item.orderId)
+                                    }
+                                }
+                            } label: {
+                                Label("Claim individually", systemImage: "list.bullet")
+                                    .font(.footnote)
+                                    .padding(.horizontal, 10).padding(.vertical, 8)
+                                    .background(Color.secondary.opacity(0.2))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                            }
+                        }
+                        if let err = claimError {
+                            Text(err).font(.footnote).foregroundColor(.red)
+                        }
+                    }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(12)
+                    .padding([.leading, .trailing]) // avoid rare .horizontal inference error
+                }
+
+                // ===== Created by me =====
                 Text("Events I’ve Created")
                     .font(.headline)
                     .padding(.horizontal)
@@ -322,54 +442,57 @@ struct MyEventsView: View {
                         }
                         .padding(.horizontal)
                         .padding(.bottom, 4)
-
                     }
                 }
 
                 Divider().padding(.vertical, 6)
 
-                Text("Events I’ve Purchased")
+                // ===== Purchased by me (platform + EB) =====
+                Text("My Tickets & Purchases")
                     .font(.headline)
                     .padding(.horizontal)
 
-                ForEach(myPurchasedEvents) { purchase in
+                ForEach(myPurchased) { p in
+                    WalletPurchaseCard(p: p,
+                                       openPlatform: { platformPurchase in
+                        selectedPlatformPurchase = platformPurchase
+                    }, openEventbrite: { ebPurchase in
+                        selectedEBProof = ebPurchase
+                    })
+                    .padding(.horizontal)
+                }
+
+                // Raw fallback renderer so you SEE rows even if a card view silently fails
+                if debugWalletLoadedCount == 0 {
                     VStack(alignment: .leading, spacing: 8) {
-                        EventImageView(imagePath: purchase.eventImagePath)
-                            .frame(height: 200)
-                            .cornerRadius(10)
-
-                        Text(purchase.eventTitle)
-                            .font(.headline)
-
-                        Text("Date: \(formattedDate(from: purchase.timestamp))")
-                            .font(.subheadline)
-                            .foregroundColor(.gray)
-
-                        Button("View Ticket") {
-                            selectedPurchase = purchase
+                        Text("Raw Wallet (fallback)").font(.subheadline).foregroundColor(.gray)
+                        ForEach(myPurchased) { p in
+                            Text("• \(p.orderId ?? p.id) • \(p.eventTitle.isEmpty ? "(no title)" : p.eventTitle)")
+                                .font(.caption).foregroundColor(.gray)
                         }
-                        .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(Color.green.opacity(0.9))
-                        .foregroundColor(.white)
-                        .cornerRadius(8)
                     }
                     .padding(.horizontal)
                 }
             }
-            .padding(.top, 4) // closer to segment
+            .padding(.top, 4)
         }
         .onAppear {
             fetchMyEvents()
-            fetchMyPurchasedEvents()
+            fetchMyPurchasedEventsUnified()
+            fetchUnclaimedForUser()
         }
+        // Sheets
         .sheet(item: $selectedEventToEdit) { event in
             EditEventView(event: event)
         }
         .sheet(item: $selectedEventForStats) { event in
             EventStatsView(event: event)
         }
-        .sheet(item: $selectedPurchase) { purchase in
+        .sheet(item: $selectedPlatformPurchase) { purchase in
             ShowTicketView(purchase: purchase)
+        }
+        .sheet(item: $selectedEBProof) { (eb: UnifiedPurchase) in
+            EBTicketProofView(purchase: eb)
         }
         .sheet(isPresented: $showWebView) {
             if let url = selectedURL {
@@ -378,55 +501,203 @@ struct MyEventsView: View {
         }
     }
 
+    // MARK: Fetch Created
     private func fetchMyEvents() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("events")
 
         ref.observeSingleEvent(of: .value) { snapshot in
             var createdEvents: [EventModel] = []
-
-            for child in snapshot.children {
-                if let childSnapshot = child as? DataSnapshot,
-                   let event = EventModel.from(snapshot: childSnapshot),
+            for case let child as DataSnapshot in snapshot.children {
+                if let event = EventModel.from(snapshot: child),
                    event.userId == userId {
                     createdEvents.append(event)
                 }
             }
-
             self.myCreatedEvents = createdEvents.sorted { $0.date > $1.date }
         }
     }
 
-    private func fetchMyPurchasedEvents() {
+    // MARK: Fetch Purchases (unified)
+    private func fetchMyPurchasedEventsUnified() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
+        print("👜 [Wallet] fetching for uid:", userId)
+
         let ref = Database.database().reference().child("purchases").child(userId)
 
         ref.observeSingleEvent(of: .value) { snapshot in
-            var purchases: [PurchaseModel] = []
+            print("👜 [Wallet] snapshot.exists =", snapshot.exists(), "children =", snapshot.childrenCount)
+            self.debugLastFetchNote = "exists=\(snapshot.exists()) children=\(snapshot.childrenCount)"
 
+            var unified: [UnifiedPurchase] = []
+            var enrichRequests: [(index: Int, eventId: String)] = []
+
+            var idx = 0
             for case let child as DataSnapshot in snapshot.children {
                 guard let value = child.value as? [String: Any] else { continue }
 
-                let model = PurchaseModel(
-                    id: child.key,
-                    userId: value["userId"] as? String ?? "",
-                    eventId: value["eventId"] as? String ?? "",
-                    eventTitle: value["eventTitle"] as? String ?? "Untitled Event",
-                    eventImagePath: value["eventImagePath"] as? String ?? "",
-                    quantity: value["quantity"] as? Int ?? 0,
-                    type: value["type"] as? String ?? "ticket",
-                    totalAmount: value["totalAmount"] as? Double ?? 0.0,
-                    timestamp: value["timestamp"] as? TimeInterval ?? 0.0
-                )
+                let orderId = child.key
+                let eventId = (value["eventId"] as? String) ?? ""
+                let source  = (value["source"] as? String) ?? (value["provider"] as? String)
+                let qty     = (value["quantity"] as? Int) ?? (value["qty"] as? Int) ?? 0
 
-                purchases.append(model)
+                // timestamp preference: explicit → ISO placedAt → now
+                let ts: TimeInterval = {
+                    if let t = value["timestamp"] as? TimeInterval { return t }
+                    if let iso = value["placedAt"] as? String,
+                       let d = ISO8601DateFormatter().date(from: iso) {
+                        return d.timeIntervalSince1970
+                    }
+                    return Date().timeIntervalSince1970
+                }()
+
+                let eventISO = (value["eventISODate"] as? String)
+                    ?? (value["start"] as? String)
+                    ?? (value["starts_at"] as? String)
+
+                var up = UnifiedPurchase(
+                    id: orderId,
+                    userId: userId,
+                    eventId: eventId,
+                    eventTitle: (value["eventTitle"] as? String) ?? (value["title"] as? String) ?? "",
+                    eventImagePath: (value["eventImagePath"] as? String) ?? (value["imageURL"] as? String) ?? "",
+                    quantity: qty,
+                    type: (value["type"] as? String) ?? "ticket",
+                    totalAmount: (value["totalAmount"] as? Double) ?? (value["total"] as? Double) ?? 0.0,
+                    timestamp: ts,
+                    source: source,
+                    orderId: (value["orderId"] as? String) ?? orderId,
+                    externalURL: value["externalURL"] as? String,
+                    barcode: value["barcode"] as? String,
+                    barcodeStatus: value["barcodeStatus"] as? String,
+                    eventISODate: eventISO
+                )
+                unified.append(up)
+
+                // Enrich EB items missing title/image/date
+                if (up.source == "eventbrite" || up.isEventbrite),
+                   (up.eventTitle.isEmpty || up.eventImagePath.isEmpty || up.eventISODate == nil),
+                   !eventId.isEmpty {
+                    enrichRequests.append((index: idx, eventId: eventId))
+                }
+                idx += 1
             }
 
-            let sortedPurchases = purchases.sorted { $0.timestamp > $1.timestamp }
-            self.myPurchasedEvents = sortedPurchases
+            guard !enrichRequests.isEmpty else {
+                let final = unified.sorted { $0.timestamp > $1.timestamp }
+                self.myPurchased = final
+                self.debugWalletLoadedCount = final.count
+                print("👜 [Wallet] myPurchased count =", final.count)
+                return
+            }
+
+            let db = Database.database().reference()
+            let group = DispatchGroup()
+            var enriched = unified
+
+            for req in enrichRequests {
+                group.enter()
+                db.child("externalEvents").child("eventbrite").child(req.eventId)
+                    .observeSingleEvent(of: .value) { snap in
+                        defer { group.leave() }
+                        guard let m = snap.value as? [String: Any] else { return }
+                        if req.index < enriched.count {
+                            var u = enriched[req.index]
+                            if u.eventTitle.isEmpty, let t = m["title"] as? String { u.eventTitle = t }
+                            if u.eventImagePath.isEmpty {
+                                let img = (m["imageURL"] as? String) ?? (m["heroImage"] as? String) ?? ""
+                                if !img.isEmpty { u.eventImagePath = img }
+                            }
+                            if u.eventISODate == nil, let d = m["date"] as? String { u.eventISODate = d }
+                            enriched[req.index] = u
+                        }
+                    }
+            }
+
+            group.notify(queue: .main) {
+                let final = enriched.sorted { $0.timestamp > $1.timestamp }
+                self.myPurchased = final
+                self.debugWalletLoadedCount = final.count
+                print("👜 [Wallet] myPurchased count =", final.count)
+            }
         }
     }
 
+    // MARK: Unclaimed: list and claim
+
+    private func fetchUnclaimedForUser() {
+        guard let user = Auth.auth().currentUser else { return }
+        user.getIDToken { token, err in
+            guard let token = token else {
+                print("❌ Unable to get ID token:", err?.localizedDescription ?? "")
+                return
+            }
+            var req = URLRequest(url: URL(string: "https://blackappios.web.app/api/eb/list-unclaimed")!)
+            req.httpMethod = "GET"
+            req.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            URLSession.shared.dataTask(with: req) { data, resp, error in
+                guard let data = data, error == nil else { return }
+                struct Resp: Decodable { let ok: Bool; let items: [UnclaimedItem]? }
+                if let r = try? JSONDecoder().decode(Resp.self, from: data), r.ok {
+                    DispatchQueue.main.async { self.unclaimed = r.items ?? [] }
+                }
+            }.resume()
+        }
+    }
+
+    private func claimAllUnclaimed() {
+        guard !unclaimed.isEmpty else { return }
+        isClaimWorking = true
+        claimError = nil
+
+        let group = DispatchGroup()
+        var failures: [String] = []
+        for item in unclaimed {
+            group.enter()
+            claim(orderId: item.orderId) { ok in
+                if !ok { failures.append(item.orderId) }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            self.isClaimWorking = false
+            if failures.isEmpty {
+                self.fetchMyPurchasedEventsUnified()
+                self.unclaimed.removeAll()
+            } else {
+                self.claimError = "Some orders failed to claim: \(failures.joined(separator: ", "))"
+            }
+        }
+    }
+
+    private func claim(orderId: String, completion: ((Bool) -> Void)? = nil) {
+        Auth.auth().currentUser?.getIDToken(completion: { token, err in
+            guard let token = token else {
+                DispatchQueue.main.async {
+                    self.claimError = "Auth error getting ID token."
+                    completion?(false)
+                }
+                return
+            }
+            var req = URLRequest(url: URL(string: "https://blackappios.web.app/api/eb/claim")!)
+            req.httpMethod = "POST"
+            req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let body = ["orderId": orderId]
+            req.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
+            URLSession.shared.dataTask(with: req) { data, resp, error in
+                let ok = (error == nil)
+                DispatchQueue.main.async {
+                    if !ok { self.claimError = "Failed to claim \(orderId)" }
+                    self.fetchMyPurchasedEventsUnified()
+                    self.fetchUnclaimedForUser()
+                    completion?(ok)
+                }
+            }.resume()
+        })
+    }
+
+    // MARK: Delete (platform)
     private func deleteEvent(_ event: EventModel) {
         let ref = Database.database().reference().child("events").child(event.id)
         ref.removeValue { error, _ in
@@ -437,13 +708,217 @@ struct MyEventsView: View {
             }
         }
     }
+}
 
-    private func formattedDate(from timestamp: TimeInterval) -> String {
-        let date = Date(timeIntervalSince1970: timestamp)
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+// MARK: - Wallet card for any purchase (platform or EB)
+
+fileprivate struct WalletPurchaseCard: View {
+    let p: UnifiedPurchase
+    let openPlatform: (PurchaseModel) -> Void
+    let openEventbrite: (UnifiedPurchase) -> Void
+
+    private func formattedDate(_ p: UnifiedPurchase) -> String {
+        if let iso = p.eventISODate, let d = ISO8601DateFormatter().date(from: iso) {
+            let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+            return f.string(from: d)
+        } else {
+            let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+            return f.string(from: Date(timeIntervalSince1970: p.timestamp))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+
+            // Image (EB URL → AsyncImage; platform path → EventImageView; else gray)
+            if p.isEventbrite, !p.eventImagePath.isEmpty, let url = URL(string: p.eventImagePath) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .empty:
+                        ZStack { Color.gray.opacity(0.2); ProgressView() }
+                    case .success(let img):
+                        img.resizable().scaledToFill()
+                    default:
+                        Color.gray.opacity(0.2)
+                    }
+                }
+                .frame(height: 180)
+                .clipped()
+                .cornerRadius(10)
+            } else if !p.isEventbrite, !p.eventImagePath.isEmpty {
+                EventImageView(imagePath: p.eventImagePath)
+                    .frame(height: 180)
+                    .cornerRadius(10)
+            } else {
+                Rectangle().fill(Color.gray.opacity(0.2))
+                    .frame(height: 180)
+                    .cornerRadius(10)
+            }
+
+            Text(p.eventTitle.isEmpty ? "Event" : p.eventTitle)
+                .font(.headline)
+
+            HStack {
+                Text("Date: \(formattedDate(p))")
+                    .font(.subheadline)
+                    .foregroundColor(.gray)
+                Spacer()
+                Text("\(p.quantity)x")
+                    .font(.subheadline)
+                Text(String(format: "$%.2f", p.totalAmount))
+                    .font(.subheadline)
+            }
+
+            HStack(spacing: 8) {
+                if p.isEventbrite {
+                    Button {
+                        openEventbrite(p)
+                    } label: {
+                        Label("View Ticket", systemImage: "qrcode")
+                            .font(.footnote)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .background(Color.blue.opacity(0.9))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                    }
+
+                    if let s = p.externalURL, let url = URL(string: s) {
+                        Button {
+                            UIApplication.shared.open(url)
+                        } label: {
+                            Label("Open in Eventbrite", systemImage: "arrow.up.right.square")
+                                .font(.footnote)
+                                .padding(.horizontal, 10).padding(.vertical, 8)
+                                .background(Color.orange.opacity(0.9))
+                                .foregroundColor(.white)
+                                .cornerRadius(8)
+                        }
+                    }
+                } else {
+                    Button {
+                        let model = PurchaseModel(
+                            id: p.id,
+                            userId: p.userId,
+                            eventId: p.eventId,
+                            eventTitle: p.eventTitle,
+                            eventImagePath: p.eventImagePath,
+                            quantity: p.quantity,
+                            type: p.type,
+                            totalAmount: p.totalAmount,
+                            timestamp: p.timestamp
+                        )
+                        openPlatform(model)
+                    } label: {
+                        Label("View Ticket", systemImage: "ticket")
+                            .font(.footnote)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .background(Color.blue.opacity(0.9))
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+}
+
+// MARK: - Eventbrite proof (QR/barcode + order info)
+
+fileprivate struct EBTicketProofView: View {
+    let purchase: UnifiedPurchase
+    @Environment(\.dismiss) private var dismiss
+    private let context = CIContext()
+    private let filter = CIFilter.qrCodeGenerator()
+
+    private func qrImage(from string: String) -> UIImage? {
+        let data = Data(string.utf8)
+        filter.setValue(data, forKey: "inputMessage")
+        guard let output = filter.outputImage?
+                .transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else { return nil }
+        if let cgimg = context.createCGImage(output, from: output.extent) {
+            return UIImage(cgImage: cgimg)
+        }
+        return nil
+    }
+
+    private var dateText: String {
+        if let iso = purchase.eventISODate, let d = ISO8601DateFormatter().date(from: iso) {
+            let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+            return f.string(from: d)
+        } else {
+            let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short
+            return f.string(from: Date(timeIntervalSince1970: purchase.timestamp))
+        }
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 16) {
+                Text(purchase.eventTitle.isEmpty ? "Event" : purchase.eventTitle)
+                    .font(.title3).multilineTextAlignment(.center)
+
+                if purchase.isEventbrite,
+                   let url = URL(string: purchase.eventImagePath), !purchase.eventImagePath.isEmpty {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .empty:
+                            ZStack { Color.gray.opacity(0.2); ProgressView() }
+                        case .success(let img): img.resizable().scaledToFill()
+                        default: Color.gray.opacity(0.2)
+                        }
+                    }
+                    .frame(height: 160)
+                    .clipped()
+                    .cornerRadius(12)
+                }
+
+                VStack(spacing: 6) {
+                    Text(dateText).font(.subheadline).foregroundColor(.gray)
+                    if let oid = purchase.orderId { Text("Order: \(oid)").font(.footnote).foregroundColor(.gray) }
+                }
+
+                if let code = purchase.barcode, let img = qrImage(from: code) {
+                    Image(uiImage: img)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 220, maxHeight: 220)
+                        .padding(.top, 8)
+
+                    Text(code)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                } else {
+                    Text("No barcode available yet.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if let s = purchase.externalURL, let url = URL(string: s) {
+                    Button {
+                        UIApplication.shared.open(url)
+                    } label: {
+                        Text("Open in Eventbrite")
+                            .foregroundColor(.white)
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.orange)
+                            .cornerRadius(10)
+                    }
+                }
+            }
+            .padding()
+            .navigationTitle("Ticket")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -486,6 +961,7 @@ struct EventImageView: View {
     }
 
     private func fetchImage() {
+        guard !imagePath.isEmpty else { isLoading = false; return }
         print("🔍 Fetching image URL for path: \(imagePath)")
         let storageRef = Storage.storage().reference(withPath: imagePath)
         storageRef.downloadURL { url, error in
@@ -522,6 +998,8 @@ struct EventImageView: View {
         }.resume()
     }
 }
+
+
 
 // MARK: - CreateEventView (friendly validation + alerts + disabled overlay)
 

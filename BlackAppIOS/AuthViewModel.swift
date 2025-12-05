@@ -20,6 +20,12 @@ final class AuthViewModel: ObservableObject {
         self.user = Auth.auth().currentUser
         self.currentUser = Auth.auth().currentUser
 
+        // If app cold-starts while already signed in, bind OneSignal immediately
+        if let uid = Auth.auth().currentUser?.uid {
+            bindOneSignalExternalId(uid: uid)
+            OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+        }
+
         // 🔄 Listen for auth changes
         Auth.auth().addStateDidChangeListener { [weak self] _, user in
             guard let self else { return }
@@ -27,9 +33,17 @@ final class AuthViewModel: ObservableObject {
                 self.user = user
                 self.currentUser = user
 
-                guard let user else { return }
-                // Push tokens → server
+                guard let user else {
+                    // User signed out
+                    self.unbindOneSignalExternalId()
+                    return
+                }
+
+                // Push tokens → server (your existing helper)
                 OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
+                // Map Firebase UID to OneSignal external user id
+                self.bindOneSignalExternalId(uid: user.uid)
 
                 // 1) Ensure minimal defaults (CF)
                 self.seedUserDefaultsIfNeeded()
@@ -45,6 +59,9 @@ final class AuthViewModel: ObservableObject {
     func signOut() {
         do {
             try Auth.auth().signOut()
+            // Unbind OneSignal external id on logout
+            unbindOneSignalExternalId()
+
             DispatchQueue.main.async {
                 self.user = nil
                 self.currentUser = nil
@@ -71,6 +88,10 @@ final class AuthViewModel: ObservableObject {
             self.user = fbUser
             self.currentUser = fbUser
 
+            // Map UID → OneSignal + sync token doc
+            self.bindOneSignalExternalId(uid: fbUser.uid)
+            OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
             Task {
                 // Upsert normalized profile to both DBs
                 await self.upsertProfileForCurrentUser(
@@ -79,9 +100,8 @@ final class AuthViewModel: ObservableObject {
                     profileImageURL: profileImageURL
                 )
 
-                // Defaults + tokens
+                // Defaults
                 self.seedUserDefaultsIfNeeded()
-                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
 
                 DispatchQueue.main.async { completion(nil) }
             }
@@ -94,7 +114,11 @@ final class AuthViewModel: ObservableObject {
                 if let user = result?.user {
                     self.user = user
                     self.currentUser = user
+
+                    // Map UID → OneSignal + sync token doc
+                    self.bindOneSignalExternalId(uid: user.uid)
                     OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
                     self.seedUserDefaultsIfNeeded()
                     Task { await self.ensureCurrentUserProfileMirroredAndNormalized(user) }
                 }
@@ -145,6 +169,10 @@ final class AuthViewModel: ObservableObject {
                     self.currentUser = fbUser
                 }
 
+                // Map UID → OneSignal + sync token doc
+                self.bindOneSignalExternalId(uid: fbUser.uid)
+                OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
+
                 // Build best-effort profile from Google
                 let uid = fbUser.uid
                 let name = fbUser.displayName ?? "User"
@@ -159,12 +187,32 @@ final class AuthViewModel: ObservableObject {
                         profileImageURL: profileImageURL
                     )
 
-                    OneSignalTokenManager.shared.syncOneSignalUserIdToFirebase()
                     self.seedUserDefaultsIfNeeded()
                     DispatchQueue.main.async { completion(nil) }
                 }
             }
         }
+    }
+
+    // MARK: - OneSignal mapping
+
+    /// Binds Firebase UID to OneSignal external user id (required for include_external_user_ids)
+    private func bindOneSignalExternalId(uid: String) {
+        // OneSignal SDK v5+
+        OneSignal.login(uid)
+        // Optional: useful tags for segmentation/diagnostics
+        #if DEBUG
+        OneSignal.User.addTags(["env": "debug"])
+        #else
+        OneSignal.User.addTags(["env": "prod"])
+        #endif
+        print("🔗 OneSignal.login → \(uid)")
+    }
+
+    /// Unbinds on sign out
+    private func unbindOneSignalExternalId() {
+        OneSignal.logout()
+        print("🔗 OneSignal.logout")
     }
 
     // MARK: - Write/Normalize Helpers
@@ -198,8 +246,7 @@ final class AuthViewModel: ObservableObject {
             "username": cleanUsername,
             "profileImageURL": profileImageURL,
             // defaults if absent server-side; CF will also enforce
-            "circleSize": FieldValue.increment(Int64(0)),
-  // Firestore-friendly no-op; ignored by RTDB
+            "circleSize": FieldValue.increment(Int64(0)), // Firestore no-op for merge
             "badgeTier": "white",
             // normalized searchable fields
             "nameLower": nameLower,

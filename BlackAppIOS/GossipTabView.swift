@@ -384,6 +384,26 @@ final class EmailVerificationBannerVM: ObservableObject {
         }
     }
 }
+// ===============================================
+// MARK: - Realtime Database key sanitizer
+// ===============================================
+private func rtdbSafeKey(_ raw: String) -> String {
+    // Replace forbidden characters with underscores
+    var result = ""
+    for ch in raw {
+        switch ch {
+        case ".", "#", "$", "[", "]", "/":
+            result.append("_")
+        default:
+            result.append(ch)
+        }
+    }
+    // Fallback if somehow empty
+    if result.isEmpty {
+        return "unknown_key"
+    }
+    return result
+}
 
 // ===============================================
 // MARK: - Gossip Tab
@@ -420,6 +440,9 @@ struct GossipTabView: View {
     @State private var trendingTags: [String] = []
     @State private var showAllTags = false
     @State private var selectedTagFilter: String? = nil
+    // 🔁 City-specific tags derived from hashtags (e.g. #charlotte, #lagos)
+    @State private var cityTags: [String] = []
+    @State private var selectedCityTag: String? = nil
 
     // UI
     @State private var selectedURL: URL? = nil
@@ -431,6 +454,7 @@ struct GossipTabView: View {
     @State private var userProfiles: [String: (name: String, imageURL: String?)] = [:]
     @State private var isUploading: Bool = false
     @State private var posting: Bool = false
+    @State private var selectedSmartFilter: SmartFilter = .all
 
     // Refresh tracking (capsule overlay)
     @State private var loadingBundle = false
@@ -493,17 +517,24 @@ struct GossipTabView: View {
                         root.present(UIHostingController(rootView: SearchView()), animated: true)
                     }
                 )
-                
-                // Composer
+
+                // Composer (post box at the top)
                 composer
+
+                // 🔮 Smart source / mode filters
+                smartFilterStrip
+                
+                // 🏙 City chips (derived from hashtags like #charlotte, #lagos)
+                if !cityTags.isEmpty { cityFilterStrip }
                 
                 Divider().background(Color.gray.opacity(0.3))
-                
-                // Trending tags
+
+                // Trending tags (hashtags, including cities like #charlotte, #lagos, etc.)
                 if !trendingTags.isEmpty { trendingTagStrip }
-                
+
                 // Feed
                 feedSection
+
             }
             .background(
                 LinearGradient(
@@ -766,6 +797,155 @@ struct GossipTabView: View {
         composerVideoPlayer?.pause()
         composerVideoPlayer = nil
     }
+    
+    // ===============================================
+    // MARK: Smart Filter Modes (futuristic pills)
+    // ===============================================
+    private enum SmartFilter: String, CaseIterable, Identifiable {
+        case all
+        case myPosts
+        case nightlifeOnly
+        case newsOnly
+        case mediaOnly
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .all:           return "All"
+            case .myPosts:       return "My Posts"
+            case .nightlifeOnly: return "Nightlife"
+            case .newsOnly:      return "News"
+            case .mediaOnly:     return "Media"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .all:           return "sparkles"
+            case .myPosts:       return "person.crop.circle"
+            case .nightlifeOnly: return "moon.stars.fill"
+            case .newsOnly:      return "newspaper.fill"
+            case .mediaOnly:     return "photo.on.rectangle.angled"
+            }
+        }
+    }
+
+    // ===============================================
+    // MARK: Smart Filter Strip (source / mode chips)
+    // ===============================================
+    @ViewBuilder
+    private var smartFilterStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(SmartFilter.allCases) { filter in
+                    let isSelected = (filter == selectedSmartFilter)
+
+                    Button {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                            selectedSmartFilter = filter
+                            mergeContent()
+                            resetPaging()
+                        }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: filter.icon)
+                                .font(.caption2)
+                            Text(filter.label)
+                                .font(.footnote).bold()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            Group {
+                                if isSelected {
+                                    LinearGradient(
+                                        colors: [Color.blue, Color.purple],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                } else {
+                                    Color.white.opacity(0.08)
+                                }
+                            }
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 999)
+                                .stroke(isSelected ? Color.white.opacity(0.9) : Color.white.opacity(0.18), lineWidth: 1)
+                        )
+                        .foregroundColor(isSelected ? .white : .white.opacity(0.75))
+                        .clipShape(Capsule())
+                        .shadow(color: isSelected ? Color.blue.opacity(0.35) : Color.clear,
+                                radius: 10, x: 0, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal)
+            .padding(.top, 6)
+        }
+    }
+    
+    // ===============================================
+    // MARK: City Filter Strip (dynamic from tags)
+    // ===============================================
+    @ViewBuilder
+    private var cityFilterStrip: some View {
+        if cityTags.isEmpty {
+            EmptyView()
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    // Label chip
+                    HStack(spacing: 6) {
+                        Image(systemName: "mappin.and.ellipse")
+                            .font(.caption2)
+                        Text("Cities")
+                            .font(.footnote).bold()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.05))
+                    .foregroundColor(.white.opacity(0.8))
+                    .clipShape(Capsule())
+
+                    ForEach(cityTags, id: \.self) { tag in
+                        let isSelected = (selectedCityTag == tag)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if isSelected {
+                                    // clear city + global tag filter
+                                    selectedCityTag = nil
+                                    selectedTagFilter = nil
+                                } else {
+                                    selectedCityTag = tag
+                                    selectedTagFilter = tag   // reuse existing tag filter logic
+                                }
+                                mergeContent()
+                                resetPaging()
+                            }
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Text(tag)
+                                .font(.footnote).bold()
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(
+                                    isSelected ? Color.blue.opacity(0.9) : Color.white.opacity(0.08)
+                                )
+                                .foregroundColor(.white)
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 4)
+            }
+        }
+    }
+
 
     // ===============================================
     // MARK: Trending Tags UI
@@ -807,9 +987,11 @@ struct GossipTabView: View {
                     .foregroundColor(.white.opacity(0.8))
                 Button("Clear") {
                     selectedTagFilter = nil
+                    selectedCityTag = nil
                     mergeContent()
                     resetPaging()
                 }
+
                 .foregroundColor(.blue)
             }
             .padding(.horizontal)
@@ -1248,7 +1430,10 @@ struct GossipTabView: View {
     // ===============================================
     private func mergeContent() {
         let rssCards: [AnyIdentifiablePost] = rssArticles
-            .filter { a in matchesSelectedTag("\(a.title) \(a.description)", selected: selectedTagFilter) }
+            .filter { a in
+                passesSmartFilter(a) &&
+                matchesSelectedTag("\(a.title) \(a.description)", selected: selectedTagFilter)
+            }
             .sorted { $0.pubDate > $1.pubDate }
             .map { (article: GossipArticle) in
                 AnyIdentifiablePost(timestamp: article.pubDate.timeIntervalSince1970, id: article.id) {
@@ -1267,7 +1452,10 @@ struct GossipTabView: View {
             }
 
         let userCards: [AnyIdentifiablePost] = userPosts
-            .filter { post in matchesSelectedTag(post.text, selected: selectedTagFilter) }
+            .filter { post in
+                passesSmartFilter(post) &&
+                matchesSelectedTag(post.text, selected: selectedTagFilter)
+            }
             .sorted { $0.timestamp > $1.timestamp }
             .map { post in
                 let profile = userProfiles[post.userId]
@@ -1535,26 +1723,51 @@ struct GossipTabView: View {
     // ===============================================
     private func updateTrendingTags() {
         var tagCount: [String: Int] = [:]
-        for post in userPosts { for tag in extractHashtags(from: post.text) { tagCount[tag, default: 0] += 1 } }
+
+        // Count hashtags on user posts
+        for post in userPosts {
+            for tag in extractHashtags(from: post.text) {
+                tagCount[tag, default: 0] += 1
+            }
+        }
+
+        // Count hashtags on RSS articles
         for article in rssArticles {
             let combined = "\(article.title) \(article.description)"
-            for tag in extractHashtags(from: combined) { tagCount[tag, default: 0] += 1 }
+            for tag in extractHashtags(from: combined) {
+                tagCount[tag, default: 0] += 1
+            }
         }
-        trendingTags = Array(tagCount.sorted { $0.value > $1.value }.prefix(showAllTags ? 24 : 10).map { "#\($0.key)" })
-    }
 
-    private func extractPlainText(from html: String) -> String {
-        guard let data = html.data(using: .utf8) else {
-            return html.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [
-            .documentType: NSAttributedString.DocumentType.html,
-            .characterEncoding: String.Encoding.utf8.rawValue
+        // Main trending tags (mixed)
+        trendingTags = Array(
+            tagCount
+                .sorted { $0.value > $1.value }
+                .prefix(showAllTags ? 24 : 10)
+                .map { "#\($0.key)" }
+        )
+
+        // 🔁 City tags – subset of hashtags that look like cities we care about
+        let cityUniverse: Set<String> = [
+            "charlotte", "atl", "atlanta", "lagos", "houston", "miami",
+            "nyc", "la", "losangeles", "los_angeles",
+            "dc", "washingtondc", "washington_dc",
+            "dubai", "london", "johannesburg", "capetown", "cape_town",
+            "toronto", "paris", "berlin", "nairobi", "accra", "abidjan"
         ]
-        if let attributed = try? NSAttributedString(data: data, options: options, documentAttributes: nil) {
-            return attributed.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            return html.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let cityKeys = tagCount.keys.filter { cityUniverse.contains($0.lowercased()) }
+
+        cityTags = Array(
+            cityKeys
+                .sorted { (tagCount[$0] ?? 0) > (tagCount[$1] ?? 0) }
+                .prefix(12)
+                .map { "#\($0)" }
+        )
+
+        // If current selected city no longer in the list, clear it
+        if let selected = selectedCityTag, !cityTags.contains(selected) {
+            selectedCityTag = nil
         }
     }
 
@@ -1584,6 +1797,45 @@ struct GossipTabView: View {
         return text.lowercased().contains(selected)
     }
 
+    // ===============================================
+    // MARK: Smart Filter Logic
+    // ===============================================
+    private func passesSmartFilter(_ post: UserPost) -> Bool {
+        switch selectedSmartFilter {
+        case .all:
+            return true
+        case .myPosts:
+            return post.userId == Auth.auth().currentUser?.uid
+        case .nightlifeOnly:
+            // rely on hashtags / text signals
+            let lower = post.text.lowercased()
+            return lower.contains("#nightlife") || lower.contains("nightlife")
+        case .newsOnly:
+            let lower = post.text.lowercased()
+            return lower.contains("#news") || lower.contains("headline")
+        case .mediaOnly:
+            return !post.media.isEmpty || post.mediaURL != nil
+        }
+    }
+
+    private func passesSmartFilter(_ article: GossipArticle) -> Bool {
+        switch selectedSmartFilter {
+        case .all:
+            return true
+        case .myPosts:
+            // Smart filter "My Posts" hides external RSS
+            return false
+        case .nightlifeOnly:
+            return article.kind == .nightlife
+        case .newsOnly:
+            return article.kind == .news
+        case .mediaOnly:
+            // require at least a thumbnail or image
+            return article.thumbURL != nil || article.imageURL != nil
+        }
+    }
+
+    
     // ===============================================
     // MARK: Posting / Media upload (MULTI-MEDIA, concurrent)
     // ===============================================
@@ -1964,16 +2216,136 @@ struct GossipTabView: View {
         @Binding var selectedURL: URL?
         @Binding var showWebView: Bool
 
+        // Video state
+        @State private var player: AVPlayer? = nil
+        @State private var isVideoReady = false
+        @State private var videoFailed = false
+        @State private var statusObserver: NSKeyValueObservation?
+        @State private var isMuted = true
+
+        // Engagement state
+        @State private var likedByMe = false
+        @State private var hotByMe = false
+        @State private var repostedByMe = false
+        @State private var likeCount: Int = 0
+        @State private var commentCount: Int = 0
+        @State private var hotCount: Int = 0
+        @State private var repostCount: Int = 0
+
+        // Comment sheet
+        @State private var showCommentSheet = false
+        @State private var commentText: String = ""
+
+        // 🔐 Safe hex key for this article (valid RTDB key: 0-9a-f only)
+        private var safeArticleKey: String {
+            let s = article.id
+            if s.isEmpty { return "unknown_key" }
+            var hash: UInt64 = 1469598103934665603 // FNV-1a 64-bit
+            for u in s.utf8 {
+                hash ^= UInt64(u)
+                hash &*= 1099511628211
+            }
+            return String(hash, radix: 16) // hex string
+        }
+
+        // Realtime DB root for this article’s engagement
+        private var engagementRef: DatabaseReference {
+            Database.database().reference()
+                .child("engagement")
+                .child("rss")
+                .child(safeArticleKey)
+        }
+
+        // MARK: - Decide if this item has a real video URL (backend-provided)
+        private var bestVideoURL: URL? {
+            let exts = [".mp4", ".mov", ".m4v", ".webm", ".m3u8"]
+
+            func videoURL(from url: URL?) -> URL? {
+                guard let u = url else { return nil }
+                let lower = u.absoluteString.lowercased()
+                return exts.contains(where: { lower.hasSuffix($0) }) ? u : nil
+            }
+
+            // Prefer backend-provided media URLs over article.link
+            if let u = videoURL(from: article.imageURL) { return u }
+            if let u = videoURL(from: article.thumbURL) { return u }
+
+            // Fallback: if the link itself is a direct video file
+            if let linkURL = URL(string: article.link) {
+                let lower = article.link.lowercased()
+                if exts.contains(where: { lower.hasSuffix($0) }) {
+                    return linkURL
+                }
+            }
+
+            return nil
+        }
+
+        private var isVideoItem: Bool {
+            bestVideoURL != nil
+        }
+
         var body: some View {
             VStack(alignment: .leading, spacing: 8) {
-                if let thumb = article.thumbURL?.absoluteString, !thumb.isEmpty, let url = URL(string: thumb) {
-                    DynamicAsyncImageView(url: url, cornerRadius: 12)
-                } else if let img = article.imageURL {
-                    DynamicAsyncImageView(url: img, cornerRadius: 12)
-                } else {
-                    placeholderView
+
+                // MEDIA AREA: inline video if we have a clean video URL, else image
+                ZStack {
+                    if let videoURL = bestVideoURL, !videoFailed {
+                        ZStack {
+                            // Always have an image behind the video for safety
+                            if let imgURL = article.thumbURL ?? article.imageURL {
+                                DynamicAsyncImageView(url: imgURL, cornerRadius: 12)
+                            } else {
+                                placeholderView
+                            }
+
+                            VideoPlayer(player: player)
+                                .onAppear { prepareVideo(url: videoURL) }
+                                .onDisappear {
+                                    player?.pause()
+                                }
+                                .opacity(isVideoReady ? 1.0 : 0.0) // fade in when ready
+
+                            if !isVideoReady {
+                                // Loading overlay while video prepares
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .scaleEffect(1.2)
+                            }
+
+                            // Small mute indicator
+                            if isVideoReady {
+                                HStack {
+                                    Spacer()
+                                    Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                        .foregroundColor(.white)
+                                        .padding(8)
+                                        .background(Color.black.opacity(0.4))
+                                        .clipShape(Circle())
+                                }
+                                .padding(10)
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else if let imgURL = article.thumbURL ?? article.imageURL {
+                        DynamicAsyncImageView(url: imgURL, cornerRadius: 12)
+                    } else {
+                        placeholderView
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if isVideoItem {
+                        // For video items: tap toggles mute/unmute instead of opening IG
+                        toggleMute()
+                    } else if let url = URL(string: article.link) {
+                        // Non-video items: open provider page
+                        selectedURL = url
+                        showWebView = true
+                    }
                 }
 
+                // TEXT
                 Text(article.title)
                     .font(.headline)
                     .foregroundColor(.white)
@@ -1984,30 +2356,264 @@ struct GossipTabView: View {
                     .foregroundColor(.white.opacity(0.8))
                     .lineLimit(3)
 
-                HStack(spacing: 16) {
-                    Button {
-                        if let url = URL(string: article.link) {
-                            selectedURL = url
-                            showWebView = true
-                        }
-                    } label: {
-                        Label("Open", systemImage: "safari")
-                    }
-                    .foregroundColor(.blue)
+                // ENGAGEMENT FOOTER
+                HStack(spacing: 22) {
 
-                    Button {
-                        if let url = URL(string: article.link) { presentShare(url: url) }
-                    } label: {
-                        Label("Share", systemImage: "square.and.arrow.up")
+                    // Like
+                    Button(action: toggleLike) {
+                        HStack(spacing: 6) {
+                            Image(systemName: likedByMe ? "hand.thumbsup.fill" : "hand.thumbsup")
+                            Text("\(likeCount)")
+                        }
+                        .foregroundColor(likedByMe ? .blue : .gray)
                     }
-                    .foregroundColor(.gray)
+
+                    // Comment
+                    Button {
+                        showCommentSheet = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bubble.right")
+                            Text("\(commentCount)")
+                        }
+                        .foregroundColor(.gray)
+                    }
+
+                    // Hot (🔥)
+                    Button(action: toggleHot) {
+                        HStack(spacing: 6) {
+                            Image(systemName: hotByMe ? "flame.fill" : "flame")
+                            Text("\(hotCount)")
+                        }
+                        .foregroundColor(hotByMe ? .orange : .gray)
+                    }
+
+                    // Repost
+                    Button(action: toggleRepost) {
+                        HStack(spacing: 6) {
+                            Image(systemName: repostedByMe ? "arrow.2.squarepath.circle.fill" : "arrow.2.squarepath")
+                            Text("\(repostCount)")
+                        }
+                        .foregroundColor(repostedByMe ? .green : .gray)
+                    }
                 }
                 .font(.callout)
+                .padding(.top, 6)
             }
             .padding(12)
             .background(Color.white.opacity(0.06))
             .cornerRadius(14)
+            .onAppear {
+                loadEngagement()
+                recordImpression()
+            }
+            .onDisappear {
+                statusObserver?.invalidate()
+                statusObserver = nil
+            }
+            .sheet(isPresented: $showCommentSheet) {
+                commentSheet
+            }
         }
+
+        // MARK: - Video helpers
+
+        private func prepareVideo(url: URL) {
+            // Don’t recreate player if it already matches
+            if let current = (player?.currentItem?.asset as? AVURLAsset)?.url, current == url {
+                if isVideoReady { player?.play() }
+                return
+            }
+
+            let item = AVPlayerItem(url: url)
+            let newPlayer = AVPlayer(playerItem: item)
+            newPlayer.isMuted = isMuted
+            player = newPlayer
+            isVideoReady = false
+            videoFailed = false
+
+            statusObserver = item.observe(\.status, options: [.initial, .new]) { item, _ in
+                DispatchQueue.main.async {
+                    switch item.status {
+                    case .readyToPlay:
+                        isVideoReady = true
+                        player?.play()
+                    case .failed:
+                        videoFailed = true
+                        player?.pause()
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+
+        private func toggleMute() {
+            isMuted.toggle()
+            player?.isMuted = isMuted
+            if isVideoReady {
+                player?.play()
+            }
+        }
+
+        // MARK: - Engagement load + toggles
+
+        private func loadEngagement() {
+            let me = Auth.auth().currentUser?.uid
+
+            engagementRef.observeSingleEvent(of: .value) { snap in
+                var likes = 0, comments = 0, hot = 0, reposts = 0
+                var liked = false, hotMine = false, repostMine = false
+
+                if snap.hasChild("likes") {
+                    let lsnap = snap.childSnapshot(forPath: "likes")
+                    likes = Int(lsnap.childrenCount)
+                    if let me = me, lsnap.hasChild(me) { liked = true }
+                }
+
+                if snap.hasChild("comments") {
+                    let csnap = snap.childSnapshot(forPath: "comments")
+                    comments = Int(csnap.childrenCount)
+                }
+
+                if snap.hasChild("hot") {
+                    let hsnap = snap.childSnapshot(forPath: "hot")
+                    hot = Int(hsnap.childrenCount)
+                    if let me = me, hsnap.hasChild(me) { hotMine = true }
+                }
+
+                if snap.hasChild("reposts") {
+                    let rsnap = snap.childSnapshot(forPath: "reposts")
+                    reposts = Int(rsnap.childrenCount)
+                    if let me = me, rsnap.hasChild(me) { repostMine = true }
+                }
+
+                DispatchQueue.main.async {
+                    likeCount = likes
+                    commentCount = comments
+                    hotCount = hot
+                    repostCount = reposts
+                    likedByMe = liked
+                    hotByMe = hotMine
+                    repostedByMe = repostMine
+                }
+            }
+        }
+
+        private func toggleLike() {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            let r = engagementRef.child("likes").child(uid)
+            let already = likedByMe
+
+            likedByMe.toggle()
+            likeCount = max(0, likeCount + (already ? -1 : 1))
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+            r.observeSingleEvent(of: .value) { snap in
+                if snap.exists() { r.removeValue() } else { r.setValue(true) }
+            }
+        }
+
+        private func toggleHot() {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            let r = engagementRef.child("hot").child(uid)
+            let already = hotByMe
+
+            hotByMe.toggle()
+            hotCount = max(0, hotCount + (already ? -1 : 1))
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+
+            r.observeSingleEvent(of: .value) { snap in
+                if snap.exists() { r.removeValue() } else { r.setValue(true) }
+            }
+        }
+
+        private func toggleRepost() {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            let r = engagementRef.child("reposts").child(uid)
+            let already = repostedByMe
+
+            repostedByMe.toggle()
+            repostCount = max(0, repostCount + (already ? -1 : 1))
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+
+            r.observeSingleEvent(of: .value) { snap in
+                if snap.exists() { r.removeValue() } else { r.setValue(true) }
+            }
+        }
+
+        // MARK: - Comments for RSS
+
+        private var commentSheet: some View {
+            VStack {
+                Text("Comment").font(.headline).padding(.top)
+
+                TextField("Your comment…", text: $commentText, axis: .vertical)
+                    .padding()
+                    .background(Color.gray.opacity(0.2))
+                    .cornerRadius(8)
+                    .foregroundColor(.white)
+                    .lineLimit(3...5)
+
+                Button("Post Comment") {
+                    postComment()
+                }
+                .padding()
+                .disabled(commentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Spacer()
+            }
+            .padding()
+            .background(Color.black)
+        }
+
+        private func postComment() {
+            let trimmed = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+
+            if ProfanityFilter.containsBanned(trimmed) {
+                print("RSS comment blocked: contains prohibited words.")
+                return
+            }
+
+            let ref = engagementRef.child("comments").childByAutoId()
+            let payload: [String: Any] = [
+                "userId": uid,
+                "text": trimmed,
+                "timestamp": Date().timeIntervalSince1970
+            ]
+
+            ref.setValue(payload) { error, _ in
+                DispatchQueue.main.async {
+                    if error == nil {
+                        commentText = ""
+                        commentCount += 1
+                        showCommentSheet = false
+                    } else {
+                        print("❌ Failed to post RSS comment: \(error?.localizedDescription ?? "unknown")")
+                    }
+                }
+            }
+        }
+
+        // MARK: - Impressions
+
+        private func recordImpression() {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            let ref = Database.database().reference()
+                .child("impressions")
+                .child("rss")
+                .child(safeArticleKey)
+                .childByAutoId()
+
+            ref.setValue([
+                "userId": uid,
+                "timestamp": Date().timeIntervalSince1970
+            ])
+        }
+
+        // MARK: - Misc helpers
 
         private var placeholderView: some View {
             RoundedRectangle(cornerRadius: 12)
@@ -2023,6 +2629,9 @@ struct GossipTabView: View {
             }
         }
     }
+
+
+
 /*
     // ===============================================
     // MARK: WebView
@@ -2047,6 +2656,8 @@ struct GossipTabView: View {
         }
     }
 */
+    
+    
     // ===============================================
     // MARK: IG-Style Composer Sheet
     // ===============================================
