@@ -20,6 +20,7 @@ import FirebaseMessaging       // FCM/APNs bridge
 import GoogleSignIn
 import OneSignalFramework
 import UserNotifications
+import StripePaymentSheet
 
 // MARK: - Notification Category & Action IDs
 fileprivate enum PushUX {
@@ -137,11 +138,17 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         #endif
 
         // --- Persist timezone for regional nudges (if already authed) ---
-        if let uid = Auth.auth().currentUser?.uid {
+        if let _ = Auth.auth().currentUser?.uid {
+            InviteAutoLinker.linkInviterIfPresentAfterAuth { _, msg in
+                if let msg = msg, !msg.isEmpty { print("🔗 [Invite] \(msg)") }
+            }
+
+            // Persist timezone on appear in case login just happened
             let tz = TimeZone.current.identifier
-            Firestore.firestore().collection("users").document(uid)
+            Firestore.firestore().collection("users").document(Auth.auth().currentUser!.uid)
                 .setData(["timezone": tz], merge: true)
         }
+
 
         return true
     }
@@ -742,7 +749,12 @@ private struct AuthedContainerView: View {
                 print("👀 MainTabView appeared. Activating token sync monitor...")
                 _ = TokenSyncMonitor.shared
                 if let uid = Auth.auth().currentUser?.uid {
-                    ReferralManager.consumePendingReferralIfAny(currentUserId: uid)
+                    InviteAutoLinker.linkInviterIfPresentAfterAuth { linked, msg in
+                        if let msg = msg, !msg.isEmpty {
+                            print("🔗 [Invite] \(msg)")
+                        }
+                    }
+
                     // Persist timezone on appear in case login just happened
                     let tz = TimeZone.current.identifier
                     Firestore.firestore().collection("users").document(uid)
@@ -752,7 +764,7 @@ private struct AuthedContainerView: View {
             // Custom scheme deep links
             .onOpenURL { url in
                 print("🔗 App opened via URL: \(url.absoluteString)")
-                storePendingReferrer(from: url)
+                InviteAutoLinker.captureInviterUidFromURL(url)
                 if url.absoluteString == "blackappios://payment-success" { paymentSuccess = true }
                 if url.scheme == "blackappios", url.host == "event" {
                     let eventId = url.lastPathComponent
@@ -765,7 +777,7 @@ private struct AuthedContainerView: View {
             .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
                 if let url = activity.webpageURL {
                     print("🌐 Universal Link: \(url.absoluteString)")
-                    storePendingReferrer(from: url)
+                    InviteAutoLinker.captureInviterUidFromURL(url)
                 }
             }
             .sheet(isPresented: $paymentSuccess) {
@@ -789,7 +801,12 @@ private struct AuthedContainerView: View {
         .overlay(InAppNotificationDialog())
         .onChange(of: authVM.user?.uid) { newUid in
             if let uid = newUid {
-                ReferralManager.consumePendingReferralIfAny(currentUserId: uid)
+                InviteAutoLinker.linkInviterIfPresentAfterAuth { linked, msg in
+                    if let msg = msg, !msg.isEmpty {
+                        print("🔗 [Invite] \(msg)")
+                    }
+                }
+
                 let tz = TimeZone.current.identifier
                 Firestore.firestore().collection("users").document(uid)
                     .setData(["timezone": tz], merge: true)
@@ -823,6 +840,20 @@ struct BlackAppIOSApp: App {
         // Keep your existing performance bootstrap
         PerfBootstrap.installURLCache(memMB: 128, diskMB: 512)
         // ⛔️ Do NOT call FirebaseApp.configure() here
+
+        // ✅ Stripe publishable key – set once for the whole app
+        // Option A: read from Info.plist (recommended)
+        if let key = Bundle.main.object(forInfoDictionaryKey: "STRIPE_PUBLISHABLE_KEY") as? String,
+           !key.isEmpty {
+            StripeAPI.defaultPublishableKey = key
+        } else {
+            // Option B: hard-code temporarily while testing
+            // StripeAPI.defaultPublishableKey = "pk_live_XXXXXXXXXXXX"
+
+            #if DEBUG
+            print("⚠️ STRIPE_PUBLISHABLE_KEY not found in Info.plist")
+            #endif
+        }
     }
 
     var body: some Scene {
@@ -843,11 +874,4 @@ struct BlackAppIOSApp: App {
         }
     }
 }
-// MARK: - Referral helper (captures ?ref=... from deep/universal links)
-fileprivate func storePendingReferrer(from url: URL) {
-    guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-          let ref = comps.queryItems?.first(where: { $0.name.lowercased() == "ref" })?.value,
-          !ref.isEmpty else { return }
-    UserDefaults.standard.set(ref, forKey: "pendingReferrerUid")
-    print("🔗 Stored pending referrer: \(ref)")
-}
+

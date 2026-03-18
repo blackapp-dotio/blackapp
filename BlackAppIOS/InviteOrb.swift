@@ -3,6 +3,7 @@ import SwiftUI
 import Foundation
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseDatabase
 import UIKit
 
 // MARK: - Notification for captured media
@@ -10,32 +11,51 @@ extension Notification.Name {
     static let inviteOrbCapturedMedia = Notification.Name("inviteOrbCapturedMedia")
 }
 
-// MARK: - Build the invite text (Smart Link; no invite code shown)
+// =====================================================
+// MARK: - Invite Link Builder (NEW model: ref link only)
+// =====================================================
 enum InviteLinkBuilder {
-    /// Final share text: uses your smart link (routes to App Store or TestFlight).
-    static func shareText(inviteCode _: String, circleSize: Int?, nextTarget: Int?) -> String {
-        let current = circleSize ?? 0
-        var s = "🚀 Join the BlackApp movement ✊🏾✨\nNightlife • Creators • Brands — all in one app.\n"
+    static func inviteURL(inviterUid: String) -> String {
+        "https://blackapp.io/invite?ref=\(inviterUid)"
+    }
+
+    static func shareText(inviterUid: String, inviteCount: Int?, nextTarget: Int?) -> String {
+        let current = inviteCount ?? 0
+        var s = "Join me on BlackApp.\nNightlife • Creators • Brands — all in one app.\n"
 
         if let target = nextTarget, target > current {
             let remaining = max(0, target - current)
-            s += "\n⭐️ Expand your circle by \(remaining) invites to reach the next Star Power level (\(target)).\n"
+            s += "\nStar Power: \(current) • Next level in \(remaining) invites.\n"
         } else {
-            s += "\n👑 You’ve reached the top Star Power level.\n"
+            s += "\nStar Power: \(current) • Max level reached.\n"
         }
 
-        s += "\n📲 Get the app: https://blackapp.io/app\n"
+        s += "\nInvite link: \(inviteURL(inviterUid: inviterUid))\n"
         return s
     }
 }
 
-// Derive all Star Power level thresholds using your badge API.
-fileprivate func inviteBadgeLevels() -> [Int] {
-    var levels: [Int] = []
+
+
+// =====================================================
+// MARK: - Star Power thresholds (invite-count based)
+// =====================================================
+fileprivate enum _InviteOrbBadge {
+    // 0 = white (new user), then 5,10,15,... or your exponential list.
+    // IMPORTANT: You told me your Star Power progresses in multiples of 5 (rainbow gradient UI elsewhere).
+    static func nextTarget(after size: Int) -> Int? {
+        let next = ((size / 5) + 1) * 5
+        return next
+    }
+}
+
+// Derive levels for any UI that wants them (kept for compatibility)
+fileprivate func inviteBadgeLevels(limit: Int = 100) -> [Int] {
+    guard limit > 0 else { return [] }
+    var levels: [Int] = [0]
     var cursor = 0
     var guardCount = 0
-    while let next = _InviteOrbBadge.nextTarget(after: cursor), guardCount < 50 {
-        guard next > cursor else { break }
+    while let next = _InviteOrbBadge.nextTarget(after: cursor), guardCount < limit {
         levels.append(next)
         cursor = next
         guardCount += 1
@@ -43,20 +63,9 @@ fileprivate func inviteBadgeLevels() -> [Int] {
     return levels
 }
 
-// MARK: - Fetch the current user's invite code
-fileprivate func fetchInviteCode(for userId: String?, completion: @escaping (String) -> Void) {
-    let targetUid = userId ?? Auth.auth().currentUser?.uid
-    guard let uid = targetUid, !uid.isEmpty else {
-        completion("BA-\(UUID().uuidString.prefix(7).uppercased())")
-        return
-    }
-    Firestore.firestore().collection("users").document(uid).getDocument { doc, _ in
-        let code = (doc?.data()?["inviteCode"] as? String) ?? uid
-        completion(code)
-    }
-}
-
+// =====================================================
 // MARK: - System share sheet
+// =====================================================
 struct SystemShareSheet: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -65,7 +74,9 @@ struct SystemShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
-// MARK: - A tiny loader that fetches code, then renders the share sheet
+// =====================================================
+// MARK: - A tiny loader that prepares share sheet
+// =====================================================
 private struct InviteShareSheet: View {
     let userId: String?
     let circleSize: Int?
@@ -88,15 +99,28 @@ private struct InviteShareSheet: View {
 
     private func prepare() {
         let next = _InviteOrbBadge.nextTarget(after: circleSize ?? 0)
-        fetchInviteCode(for: userId) { code in
-            let text = InviteLinkBuilder.shareText(inviteCode: code, circleSize: circleSize, nextTarget: next)
-            self.items = [text]
-            UIPasteboard.general.string = code
+        let inviterUid = (userId ?? Auth.auth().currentUser?.uid ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !inviterUid.isEmpty else {
+            self.items = ["Invite link is unavailable. Please sign in and try again."]
+            return
         }
+
+        let text = InviteLinkBuilder.shareText(inviterUid: inviterUid, inviteCount: circleSize, nextTarget: next)
+        let urlString = InviteLinkBuilder.inviteURL(inviterUid: inviterUid)
+
+        // Share both so Messages/etc linkify cleanly.
+        self.items = [text, urlString]
+
+        // Optional convenience: copy URL (not code)
+        UIPasteboard.general.string = urlString
     }
 }
 
-// MARK: - Dismissible coaching bubble
+// =====================================================
+// MARK: - Dismissible coaching bubble (kept)
+// =====================================================
 struct CoachingBubble: View {
     let text: String
     let onClose: () -> Void
@@ -130,17 +154,8 @@ struct CoachingBubble: View {
     }
 }
 
-// MARK: - Local badge helper
-fileprivate enum _InviteOrbBadge {
-    // 0 = white (new user), then 5/10/20/40/80/160/320/640...
-    static let thresholds: [Int] = [0, 5, 10, 20, 40, 80, 160, 320, 640]
-    static func nextTarget(after size: Int) -> Int? {
-        thresholds.first(where: { $0 > size })
-    }
-}
-
 // =====================================================
-// MARK: - SiriWaveOrb (animated, less translucent, subtle pop)
+// MARK: - SiriWaveOrb (animated)
 // =====================================================
 struct SiriWaveOrb: View {
     var size: CGFloat = 64
@@ -152,10 +167,8 @@ struct SiriWaveOrb: View {
     var body: some View {
         Button(action: action) {
             ZStack {
-                // Outer breathing aura (stronger)
                 BreathingAura(size: size)
 
-                // Soft base glow behind the shell to improve contrast
                 Circle()
                     .fill(
                         RadialGradient(
@@ -172,7 +185,6 @@ struct SiriWaveOrb: View {
                     .blur(radius: 14)
                     .blendMode(.plusLighter)
 
-                // Glassy shell (less translucent than before)
                 Circle()
                     .fill(.ultraThinMaterial.opacity(0.72))
                     .overlay(
@@ -181,7 +193,6 @@ struct SiriWaveOrb: View {
                             .blur(radius: 0.8)
                             .opacity(0.95)
                     )
-                    // Extra neon rim for “alive” look
                     .overlay(
                         Circle()
                             .stroke(
@@ -199,21 +210,16 @@ struct SiriWaveOrb: View {
                             .opacity(0.9)
                     )
 
-                // Fluid ribbons (animated)
                 FluidRibbons(size: size, reduceMotion: reduceMotion)
-
-                // Conic sheen (has its own spin state internally)
                 ConicSheen(size: size, reduceMotion: reduceMotion)
             }
             .frame(width: size, height: size)
             .compositingGroup()
             .shadow(color: Color.black.opacity(0.32), radius: 14, x: 0, y: 8)
             .contentShape(Circle())
-            .accessibilityLabel("AI orb")
-            // Subtle heartbeat pop so it never feels “static”
+            .accessibilityLabel("Invite orb")
             .scaleEffect(pop ? 1.04 : 1.0)
             .onAppear {
-                // Drive the heartbeat; respect Reduce Motion by slowing it and lowering amplitude
                 let dur = reduceMotion ? 3.0 : 1.8
                 withAnimation(.easeInOut(duration: dur).repeatForever(autoreverses: true)) {
                     pop = true
@@ -224,17 +230,16 @@ struct SiriWaveOrb: View {
     }
 }
 
-// MARK: - Breathing Aura
 fileprivate struct BreathingAura: View {
     var size: CGFloat
     @State private var breathe = false
-    
+
     var body: some View {
         Circle()
             .fill(
                 RadialGradient(
                     colors: [
-                        Color.white.opacity(0.22),   // stronger inner light
+                        Color.white.opacity(0.22),
                         Color.white.opacity(0.10),
                         .clear
                     ],
@@ -253,11 +258,10 @@ fileprivate struct BreathingAura: View {
     }
 }
 
-// MARK: - Fluid Ribbons (animated with TimelineView)
 fileprivate struct FluidRibbons: View {
     let size: CGFloat
     let reduceMotion: Bool
-    
+
     var body: some View {
         TimelineView(.animation) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
@@ -265,18 +269,17 @@ fileprivate struct FluidRibbons: View {
                 let rect = CGRect(origin: .zero, size: sz)
                 ctx.addFilter(.blur(radius: 6))
                 ctx.blendMode = .plusLighter
-                
-                // Draw three ribbons with different phases/speeds
+
                 drawRibbon(into: &ctx, in: rect,
                            t: t, speed: 0.9, amp: 1.0, freq: 1.7,
                            colors: [Color.cyan.opacity(0.75), Color.blue.opacity(0.55)],
                            reduceMotion: reduceMotion)
-                
+
                 drawRibbon(into: &ctx, in: rect,
                            t: t, speed: 0.7, amp: 0.9, freq: 2.3,
                            colors: [Color.purple.opacity(0.70), Color.mint.opacity(0.50)],
                            reduceMotion: reduceMotion)
-                
+
                 drawRibbon(into: &ctx, in: rect,
                            t: t, speed: 1.2, amp: 0.8, freq: 3.2,
                            colors: [Color.pink.opacity(0.75), Color.indigo.opacity(0.55)],
@@ -286,7 +289,7 @@ fileprivate struct FluidRibbons: View {
         }
         .frame(width: size, height: size)
     }
-    
+
     private func drawRibbon(into ctx: inout GraphicsContext,
                             in rect: CGRect,
                             t: TimeInterval,
@@ -297,22 +300,20 @@ fileprivate struct FluidRibbons: View {
                             reduceMotion: Bool) {
         let w = rect.width, h = rect.height
         let midY = h * 0.5
-        
-        // Animation drivers
+
         let time = CGFloat(t) * (reduceMotion ? (0.15 * speed) : speed)
         let phase = time * .pi * 2
-        
-        // Build a curvy path across the circle
+
         var path = Path()
         let steps = 90
-        let band = h * 0.18 * amp   // use amp to scale band height
-        
+        let band = h * 0.18 * amp
+
         for i in 0...steps {
             let x = CGFloat(i) / CGFloat(steps) * w
             let y = midY
             + sin((x / w) * .pi * 2 * freq + phase) * band
             + sin((x / w) * .pi * 2 * (freq * 0.5) - phase * 0.6) * band * 0.35
-            
+
             let thickness = max(1.5, (1 + sin((x / w) * .pi * 2 + phase * 0.8)) * 3.5)
             if i == 0 { path.move(to: CGPoint(x: x, y: y - thickness)) }
             else { path.addLine(to: CGPoint(x: x, y: y - thickness)) }
@@ -322,13 +323,12 @@ fileprivate struct FluidRibbons: View {
             let y = midY
             + sin((x / w) * .pi * 2 * freq + phase) * band
             + sin((x / w) * .pi * 2 * (freq * 0.5) - phase * 0.6) * band * 0.35
-            
+
             let thickness = max(1.5, (1 + sin((x / w) * .pi * 2 + phase * 0.8)) * 3.5)
             path.addLine(to: CGPoint(x: x, y: y + thickness))
         }
         path.closeSubpath()
-        
-        // Gradient fill
+
         let swiftUIGradient: SwiftUI.Gradient = .init(stops: [
             .init(color: colors[0], location: 0.00),
             .init(color: (colors.last ?? colors[0]), location: 1.00)
@@ -344,15 +344,11 @@ fileprivate struct FluidRibbons: View {
             endPoint: endPt
         )
 
-        // Fill the ribbon with the shading
         ctx.fill(path, with: shading)
-
-        // Soft rim highlight
         ctx.stroke(path, with: .color(.white.opacity(0.08)), lineWidth: 0.6)
     }
 }
 
-// MARK: - Conic Sheen (slow rotating)
 fileprivate struct ConicSheen: View {
     let size: CGFloat
     let reduceMotion: Bool
@@ -379,7 +375,6 @@ fileprivate struct ConicSheen: View {
         .clipShape(Circle())
         .allowsHitTesting(false)
         .onAppear {
-            // Always animate; if Reduce Motion is on, rotate slower
             let duration = reduceMotion ? 20.0 : 9.0
             withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
                 spin = 1.0
@@ -392,204 +387,8 @@ fileprivate struct ConicSheen: View {
 }
 
 // =====================================================
-// MARK: - Floating Invite Orb (presents capture + share + AI)
-// =====================================================
-public struct InviteOrb: View {
-    let userId: String?
-    let circleSize: Int?
-
-    @State private var showShare = false
-    @State private var showCoach = true
-    @State private var showCapture = false
-    @State private var showMenu = false
-    @State private var showZoraPanel = false
-
-    // Smart, time-aware copy (label only; NOT used in the coach bubble)
-    private var phase: DayPhase { currentDayPhase() }
-    private var captureCTA: String { smartCaptureTitle(for: phase) }
-
-    // Orbit animation (gentle)
-    @State private var orbitAngle: Double = 0
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    private var orbitActive: Bool { !showShare && !showCapture && !showMenu && !showZoraPanel }
-    private var orbitRadius: CGFloat { reduceMotion ? 4 : 14 }
-    private var orbitPeriod: Double { reduceMotion ? 18 : 12 }
-
-    public init(userId: String?, circleSize: Int?) {
-        self.userId = userId
-        self.circleSize = circleSize
-    }
-
-    // Milestone message ONLY (short + clear)
-    private var nextTargetText: String {
-        let current = circleSize ?? 0
-        if let next = _InviteOrbBadge.nextTarget(after: current) {
-            let remaining = max(0, next - current)
-            return "Expand your circle by \(remaining) invites to rise to the next Star Power level."
-        } else {
-            return "You’ve reached the top Star Power level. 👑"
-        }
-    }
-
-    public var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            if showCoach {
-                StarPowerCoachCard(circleSize: circleSize) { showCoach = false }
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                    .padding(.bottom, 120)
-                    .padding(.trailing, 18)
-            }
-
-            if showMenu {
-                Color.black.opacity(0.001)
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { showMenu = false }
-                    }
-            }
-
-            let radians = orbitAngle * .pi / 180
-            let dx = cos(radians) * orbitRadius
-            let dy = sin(radians) * orbitRadius
-
-            VStack(alignment: .trailing, spacing: 10) {
-                if showMenu {
-                    // Smart Camera
-                    MenuPill(icon: "camera.aperture", title: captureCTA) {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
-                        showCapture = true
-                    }
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-
-                    // Share Invite
-                    MenuPill(icon: "envelope.open.fill", title: "Share Invite") {
-                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
-                        showShare = true
-                    }
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-
-                    // AI Assistant (now routes to ZoraAIView via OrbPanel wrapper)
-                    MenuPill(icon: "sparkles", title: "AI Assistant") {
-                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
-                        showZoraPanel = true
-                    }
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
-
-                // Siri-like animated orb
-                SiriWaveOrb(size: 64) {
-                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                        showMenu.toggle()
-                    }
-                }
-                .offset(x: dx, y: dy)
-            }
-            .padding(.trailing, 18)
-            .padding(.bottom, 86)
-        }
-        // Flows
-        .sheet(isPresented: $showShare) {
-            InviteShareSheet(userId: userId, circleSize: circleSize)
-        }
-        .fullScreenCover(isPresented: $showCapture) {
-            LiveCaptureView().ignoresSafeArea()
-        }
-        .sheet(isPresented: $showZoraPanel) {
-            // Forward-compat wrapper so existing calls compile; shows your Iron-Man style assistant
-            OrbPanel(uid: userId, initialIntent: "life_sync.brief", initialPayload: nil)
-                .ignoresSafeArea(edges: .bottom)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { _ in
-            showCapture = false
-        }
-        .onAppear { startOrbitIfNeeded() }
-        .onChange(of: orbitActive) { _ in
-            if orbitActive { startOrbitIfNeeded() } else { stopOrbit() }
-        }
-    }
-
-    // Replace previous StarPowerCoachCard with this one (same signature)
-    fileprivate struct StarPowerCoachCard: View {
-        let circleSize: Int?
-        let onClose: () -> Void
-
-        var body: some View {
-            // Coach card is intentionally disabled for now to avoid distraction.
-            // Keeping the original layout inside `if false` so we can easily
-            // restore or repurpose it later without breaking call sites.
-            if false {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "sparkles")
-                        .foregroundColor(.white)
-                        .padding(.top, 2)
-
-                    // Message + inline star meter
-                    StarPowerNextTargetMeter(circleSize: circleSize, levels: inviteBadgeLevels())
-
-                    Button(action: onClose) {
-                        Image(systemName: "xmark")
-                            .font(.caption.bold())
-                            .foregroundColor(.white.opacity(0.85))
-                    }
-                }
-                .padding(12)
-                .background(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color.blue.opacity(0.32),
-                                    Color.purple.opacity(0.32)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .background(.ultraThinMaterial.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 18)
-                                .stroke(Color.white.opacity(0.16), lineWidth: 1)
-                        )
-                        .shadow(color: Color.blue.opacity(0.25), radius: 12, x: 0, y: 8)
-                )
-                .padding(.trailing, 10)
-            } else {
-                EmptyView()
-            }
-        }
-    }
-
-    // Orbit control
-    private func startOrbitIfNeeded() {
-        guard orbitActive else { return }
-        orbitAngle = 0
-        withAnimation(.linear(duration: orbitPeriod).repeatForever(autoreverses: false)) {
-            orbitAngle = 360
-        }
-    }
-    private func stopOrbit() {
-        let normalized = orbitAngle.truncatingRemainder(dividingBy: 360)
-        withAnimation(.none) { orbitAngle = normalized }
-    }
-}
-
-// Simple inline “next target” visual (now disabled to avoid distraction)
-fileprivate struct StarPowerNextTargetMeter: View {
-    let circleSize: Int?
-    let levels: [Int]
-
-    var body: some View {
-        // Intentionally empty: we’ve disabled the announcement text
-        EmptyView()
-    }
-}
-
-
 // MARK: - MenuPill (water-drop UI)
+// =====================================================
 fileprivate struct MenuPill: View {
     let icon: String
     let title: String
@@ -665,7 +464,124 @@ fileprivate func smartCaptureTitle(for phase: DayPhase) -> String {
 }
 
 // =====================================================
-// MARK: - Remote Orb (server-driven; types kept for compatibility)
+// MARK: - Floating Invite Orb (presents capture + share + AI)
+// =====================================================
+public struct InviteOrb: View {
+    let userId: String?
+    let circleSize: Int?
+
+    @State private var showShare = false
+    @State private var showCoach = true
+    @State private var showCapture = false
+    @State private var showMenu = false
+    @State private var showZoraPanel = false
+
+    private var phase: DayPhase { currentDayPhase() }
+    private var captureCTA: String { smartCaptureTitle(for: phase) }
+
+    @State private var orbitAngle: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var orbitActive: Bool { !showShare && !showCapture && !showMenu && !showZoraPanel }
+    private var orbitRadius: CGFloat { reduceMotion ? 4 : 14 }
+    private var orbitPeriod: Double { reduceMotion ? 18 : 12 }
+
+    public init(userId: String?, circleSize: Int?) {
+        self.userId = userId
+        self.circleSize = circleSize
+    }
+
+    public var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if showCoach {
+                // intentionally disabled coach card display (kept to preserve logic)
+                EmptyView()
+            }
+
+            if showMenu {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { showMenu = false }
+                    }
+            }
+
+            let radians = orbitAngle * .pi / 180
+            let dx = cos(radians) * orbitRadius
+            let dy = sin(radians) * orbitRadius
+
+            VStack(alignment: .trailing, spacing: 10) {
+                if showMenu {
+                    // Smart Camera
+                    MenuPill(icon: "camera.aperture", title: captureCTA) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
+                        showCapture = true
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+
+                    // Share Invite
+                    MenuPill(icon: "envelope.open.fill", title: "Share Invite") {
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
+                        showShare = true
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+
+                    // AI Assistant
+                    MenuPill(icon: "sparkles", title: "AI Assistant") {
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { showMenu = false }
+                        showZoraPanel = true
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+
+                SiriWaveOrb(size: 64) {
+                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                        showMenu.toggle()
+                    }
+                }
+                .offset(x: dx, y: dy)
+            }
+            .padding(.trailing, 18)
+            .padding(.bottom, 86)
+        }
+        .sheet(isPresented: $showShare) {
+            InviteShareSheet(userId: userId, circleSize: circleSize)
+        }
+        .fullScreenCover(isPresented: $showCapture) {
+            LiveCaptureView().ignoresSafeArea()
+        }
+        .sheet(isPresented: $showZoraPanel) {
+            OrbPanel(uid: userId, initialIntent: "life_sync.brief", initialPayload: nil)
+                .ignoresSafeArea(edges: .bottom)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .inviteOrbCapturedMedia)) { _ in
+            showCapture = false
+        }
+        .onAppear { startOrbitIfNeeded() }
+        .onChange(of: orbitActive) { _ in
+            if orbitActive { startOrbitIfNeeded() } else { stopOrbit() }
+        }
+    }
+
+    private func startOrbitIfNeeded() {
+        guard orbitActive else { return }
+        orbitAngle = 0
+        withAnimation(.linear(duration: orbitPeriod).repeatForever(autoreverses: false)) {
+            orbitAngle = 360
+        }
+    }
+
+    private func stopOrbit() {
+        let normalized = orbitAngle.truncatingRemainder(dividingBy: 360)
+        withAnimation(.none) { orbitAngle = normalized }
+    }
+}
+
+// =====================================================
+// MARK: - Remote Orb types (kept for compatibility)
 // =====================================================
 fileprivate enum OrbAPI {
     static let project = "blackappios"
@@ -674,7 +590,6 @@ fileprivate enum OrbAPI {
     static let handleURL = URL(string: "\(base)/aiOrbHandle")!
 }
 
-// Cards the server can return (kept so older code compiles; ZoraAIView handles UI)
 enum OrbCard: Codable, Identifiable {
     case title(text: String)
     case subtitle(text: String)
@@ -699,12 +614,9 @@ enum OrbCard: Codable, Identifiable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let t = try c.decode(CType.self, forKey: .type)
         switch t {
-        case .title:
-            self = .title(text: try c.decode(String.self, forKey: .text))
-        case .subtitle:
-            self = .subtitle(text: try c.decode(String.self, forKey: .text))
-        case .bullets:
-            self = .bullets(items: try c.decode([String].self, forKey: .items))
+        case .title:    self = .title(text: try c.decode(String.self, forKey: .text))
+        case .subtitle: self = .subtitle(text: try c.decode(String.self, forKey: .text))
+        case .bullets:  self = .bullets(items: try c.decode([String].self, forKey: .items))
         case .cta:
             self = .cta(label: try c.decode(String.self, forKey: .label),
                         action: try c.decode(OrbAction.self, forKey: .action))
@@ -827,7 +739,6 @@ fileprivate func decodeJSON<T: Decodable>(_ data: Data) throws -> T {
     return try dec.decode(T.self, from: data)
 }
 
-// MARK: - RemoteOrbService (robust: JSON Accept header, retries, safe decode)
 struct OrbHandleBody: Codable { let uid: String; let intent: String; let payload: [String:String]? }
 
 final class RemoteOrbService {
@@ -852,7 +763,6 @@ final class RemoteOrbService {
         uid ?? Auth.auth().currentUser?.uid ?? ""
     }
 
-    // Generic runner with small retry on -1017/-1005
     private func run(_ req: URLRequest, retries: Int = 2) async throws -> (Data, HTTPURLResponse) {
         var attempt = 0
         var lastErr: Error?
@@ -864,7 +774,6 @@ final class RemoteOrbService {
             } catch {
                 lastErr = error
                 let nsErr = error as NSError
-                // Retry only on parse and connection-lost
                 if nsErr.domain == NSURLErrorDomain,
                    (nsErr.code == NSURLErrorCannotParseResponse || nsErr.code == NSURLErrorNetworkConnectionLost),
                    attempt < retries {
@@ -879,7 +788,6 @@ final class RemoteOrbService {
         throw lastErr ?? URLError(.cannotParseResponse)
     }
 
-    // GET /aiOrbConfig
     func fetchConfig(uid: String?) async throws -> OrbConfigResponse {
         var req = URLRequest(url: OrbAPI.configURL)
         req.httpMethod = "GET"
@@ -889,18 +797,15 @@ final class RemoteOrbService {
 
         let (data, http) = try await run(req)
         guard http.statusCode == 200 else {
-            // return a benign default so UI proceeds
             return OrbConfigResponse(ok: true, version: "shim", release: nil, userProfile: nil)
         }
         do {
             return try decodeJSON(data)
         } catch {
-            // If server replied with non-JSON by accident, still succeed
             return OrbConfigResponse(ok: true, version: "shim", release: nil, userProfile: nil)
         }
     }
 
-    // POST /aiOrbHandle — keep this name/signature (your app calls it)
     func runIntent(uid: String?, intent: String, payload: [String:String]? = nil) async throws -> OrbHandleResponse {
         var req = URLRequest(url: OrbAPI.handleURL)
         req.httpMethod = "POST"
@@ -921,7 +826,6 @@ final class RemoteOrbService {
             print("✅ aiOrbHandle 200 intent=\(intent)")
             return decoded
         } catch {
-            // If decode fails, still deliver a friendly fallback card so the panel never breaks
             let raw = String(data: data, encoding: .utf8) ?? ""
             print("❌ aiOrbHandle decode failed (intent=\(intent)). Raw:", raw)
             return OrbHandleResponse(
@@ -938,8 +842,7 @@ final class RemoteOrbService {
     }
 }
 
-
-// MARK: - OrbPanel wrapper -> presents your Iron-Man style assistant UI (ZoraAIView)
+// MARK: - OrbPanel wrapper -> your assistant UI
 struct OrbPanel: View {
     let uid: String?
     let initialIntent: String
@@ -952,15 +855,13 @@ struct OrbPanel: View {
     }
 
     var body: some View {
-        // IMPORTANT: ZoraAIView must exist elsewhere in your project.
-        // This keeps your existing calls intact and avoids “argument passed to call that takes no arguments”.
         ZoraAIView()
             .ignoresSafeArea(edges: .bottom)
     }
 }
 
 // =====================================================
-// MARK: - Tiny Color utility for mixing (used earlier)
+// MARK: - Tiny Color utility (kept)
 // =====================================================
 fileprivate extension Color {
     func mix(with other: Color, amount: CGFloat) -> Color {

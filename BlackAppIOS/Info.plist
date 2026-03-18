@@ -2,26 +2,52 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleGetInfoString</key>
-	<string></string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleTypeRole</key>
-			<string>None</string>
-			<key>CFBundleURLName</key>
-			<string></string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>blackappios</string>
-				<string>com.googleusercontent.apps.228561181689-nsgktb9doqtnsmnv2i0bdskaj2v6ke9r</string>
-				<string>app-1-139895432289-ios-4de4c667ed23e08ac0b620</string>
-			</array>
-		</dict>
-	</array>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-	</array>
+
+    <!-- Stripe Publishable Key (iOS reads this automatically in app init) -->
+    <key>STRIPE_PUBLISHABLE_KEY</key>
+    <string>pk_live_51SbNLGCgdvG0NvUuLJYTi7vkaPMdomooq5jPM0DYHXk2E0mIPPaN0kK8eG58D0A8YYoEleU1ff7o5wtQzokxiLpu00YCwaGKzt</string>
+
+    <!-- Existing Keys -->
+    <key>CFBundleGetInfoString</key>
+    <string></string>
+
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>None</string>
+            <key>CFBundleURLName</key>
+            <string></string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>blackappios</string>
+                <string>com.googleusercontent.apps.228561181689-nsgktb9doqtnsmnv2i0bdskaj2v6ke9r</string>
+                <string>app-1-139895432289-ios-4de4c667ed23e08ac0b620</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- Required for Stripe PaymentSheet (redirect URLs, Apple Pay, etc.) -->
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+        <string>stripe</string>
+        <string>stripesdk</string>
+        <string>stripe-payment</string>
+        <string>https</string>
+    </array>
+
+    <!-- Background modes -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>remote-notification</string>
+    </array>
+
+    <!-- Zora Voice Input Permissions (REQUIRED) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>BlackApp uses the microphone to let you speak to Zora and transcribe your voice into text messages.</string>
+
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>BlackApp uses speech recognition to convert your voice into text so you can chat with Zora hands-free.</string>
+
 </dict>
 </plist>

@@ -3,6 +3,12 @@
 //  BlackAppIOS
 //
 //  Self-contained Jarvis-style Zora panel with safe networking + TTS + voice input
+//  Apple-review friendly: explicit AI disclosure, permission-safe mic/speech handling,
+//  and server-driven capability/config so Zora can improve without requiring iOS rebuilds.
+//
+//  NOTE (Info.plist REQUIRED):
+//   - NSMicrophoneUsageDescription
+//   - NSSpeechRecognitionUsageDescription
 //
 
 import SwiftUI
@@ -10,12 +16,28 @@ import AVFoundation
 import Speech
 import FirebaseAuth
 
+#if canImport(UIKit)
+import UIKit
+#endif
+
+// MARK: - Keyboard helpers
+fileprivate extension View {
+    /// Dismisses the iOS keyboard from anywhere.
+    func dismissKeyboard() {
+        #if canImport(UIKit)
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
+        #endif
+    }
+}
+
 // MARK: - Server models (namespaced to avoid collisions)
 private struct ZOR_Resp: Decodable {
     let ok: Bool
     let tookMs: Int?
     let cards: [ZOR_Card]?
     let error: String?
+    let config: ZOR_RemoteConfig?
 }
 
 private struct ZOR_Card: Decodable, Identifiable {
@@ -25,10 +47,12 @@ private struct ZOR_Card: Decodable, Identifiable {
     let label: String?
     let action: ZOR_Action?
     let card: ZOR_EventCard?
+    let meta: [String: String]?
 
     var id: String {
         if let t = text, !t.isEmpty { return "\(type):\(t)" }
         if let l = label, !l.isEmpty { return "\(type):\(l)" }
+        if let m = meta?["id"], !m.isEmpty { return "\(type):\(m)" }
         return UUID().uuidString
     }
 }
@@ -49,6 +73,15 @@ private struct ZOR_Action: Decodable {
     let payload: [String: String]?
 }
 
+private struct ZOR_RemoteConfig: Decodable {
+    let suggestions: [String]?
+    let aiDisclosure: String?
+    let allowTTS: Bool?
+    let allowVoice: Bool?
+    let maxInputChars: Int?
+    let schemaVersion: Int?
+}
+
 // MARK: - Local chat models (namespaced)
 private enum ZRole { case user, zora, system }
 
@@ -56,6 +89,45 @@ private struct ZMessage: Identifiable {
     let id = UUID()
     let role: ZRole
     let text: AttributedString
+    let timestamp: Date = Date()
+}
+
+// MARK: - TTS controller (delegate-based speaking state; no timers)
+final class ZoraTTSController: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
+    @Published var speaking: Bool = false
+    private let synthesizer = AVSpeechSynthesizer()
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    func stop() {
+        synthesizer.stopSpeaking(at: .immediate)
+        speaking = false
+    }
+
+    func speak(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let ut = AVSpeechUtterance(string: trimmed)
+        ut.voice = AVSpeechSynthesisVoice(language: "en-US")
+        ut.rate = AVSpeechUtteranceDefaultSpeechRate * 0.98
+        ut.pitchMultiplier = 1.02
+        synthesizer.speak(ut)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { self.speaking = true }
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { self.speaking = false }
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { self.speaking = false }
+    }
 }
 
 // MARK: - Speech controller (fixes "self is immutable" by moving mutation out of the View)
@@ -63,7 +135,7 @@ final class SpeechIOController: NSObject, ObservableObject {
     @Published var isRecording: Bool = false
     @Published var micPermGranted: Bool = false
     @Published var authStatus: SFSpeechRecognizerAuthorizationStatus?
-    
+
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     private let audioEngine = AVAudioEngine()
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -86,13 +158,15 @@ final class SpeechIOController: NSObject, ObservableObject {
         await MainActor.run { self.authStatus = status }
     }
 
+    func canRecord() -> Bool {
+        guard micPermGranted else { return false }
+        if let status = authStatus, (status == .denied || status == .restricted) { return false }
+        return true
+    }
+
     /// Start speech recognition. `onUpdate(text, isFinal)` is called on the main thread.
     func start(onUpdate: @escaping (_ text: String, _ isFinal: Bool) -> Void) {
-        guard micPermGranted else {
-            onUpdate("", true)
-            return
-        }
-        if let status = authStatus, status == .denied || status == .restricted {
+        guard canRecord() else {
             onUpdate("", true)
             return
         }
@@ -162,25 +236,127 @@ final class SpeechIOController: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Main View
-struct ZoraAIView: View {
-    @State private var input = ""
-    @State private var messages: [ZMessage] = []
-    @State private var thinking = false
-    @State private var speaking = false
-    @State private var suggestions: [String] = [
+// MARK: - Server-backed service (server-driven config so capabilities can evolve without iOS rebuild)
+final class ZoraService: ObservableObject {
+
+    private let functionURL = URL(string: "https://us-central1-blackappios.cloudfunctions.net/aiOrbHandle")!
+
+    // Server-driven settings (safe defaults)
+    @Published var suggestions: [String] = [
         "Plan my day",
         "Help me focus for an hour",
         "Suggest events nearby tonight",
         "Optimize my morning routine"
     ]
+    @Published var aiDisclosure: String =
+        "Zora is an AI assistant. Responses may be inaccurate. Do not rely on it for medical, legal, or financial advice."
+    @Published var allowTTS: Bool = true
+    @Published var allowVoice: Bool = true
+    @Published var maxInputChars: Int = 900
+    @Published var schemaVersion: Int = 1
+
+    private var inFlightTask: Task<Void, Never>?
+
+    private lazy var session: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 20
+        cfg.timeoutIntervalForResource = 25
+        cfg.waitsForConnectivity = true
+        return URLSession(configuration: cfg)
+    }()
+
+    func cancelInFlight() {
+        inFlightTask?.cancel()
+        inFlightTask = nil
+    }
+
+    func bootstrapIfNeeded(uid: String) async {
+        do {
+            let resp = try await call(intent: "zora.bootstrap", uid: uid, payload: [:])
+            if let cfg = resp.config {
+                await MainActor.run { self.applyRemoteConfig(cfg) }
+            }
+        } catch {
+            // Keep defaults if bootstrap fails
+        }
+    }
+
+    /// Ask Zora. Returns decoded response or throws.
+    fileprivate func ask(text: String, uid: String) async throws -> ZOR_Resp {
+        return try await call(intent: "zora.ask", uid: uid, payload: ["text": text])
+    }
+
+    private func call(intent: String, uid: String, payload: [String: String]) async throws -> ZOR_Resp {
+        var req = URLRequest(url: functionURL)
+        req.httpMethod = "POST"
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("BlackAppIOS/ZoraAI", forHTTPHeaderField: "User-Agent")
+
+        let body: [String: Any] = [
+            "uid": uid,
+            "intent": intent,
+            "schemaVersion": schemaVersion,
+            "payload": payload
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
+
+        let (data, response) = try await session.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
+
+        do {
+            return try JSONDecoder().decode(ZOR_Resp.self, from: data)
+        } catch {
+            let raw = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !raw.isEmpty {
+                return ZOR_Resp(
+                    ok: true,
+                    tookMs: nil,
+                    cards: [ZOR_Card(type: "title", text: raw, items: nil, label: nil, action: nil, card: nil, meta: nil)],
+                    error: nil,
+                    config: nil
+                )
+            }
+            throw error
+        }
+    }
+
+    private func applyRemoteConfig(_ cfg: ZOR_RemoteConfig) {
+        if let s = cfg.suggestions, !s.isEmpty { self.suggestions = s }
+        if let d = cfg.aiDisclosure, !d.isEmpty { self.aiDisclosure = d }
+        if let t = cfg.allowTTS { self.allowTTS = t }
+        if let v = cfg.allowVoice { self.allowVoice = v }
+        if let m = cfg.maxInputChars, m >= 200 { self.maxInputChars = min(m, 4000) }
+        if let sv = cfg.schemaVersion, sv >= 1 { self.schemaVersion = sv }
+    }
+}
+
+// MARK: - Main View
+struct ZoraAIView: View {
+    @State private var input = ""
+    @State private var messages: [ZMessage] = []
+    @State private var thinking = false
     @State private var glowPulse = false
 
-    // TTS
-    private let synthesizer = AVSpeechSynthesizer()
+    // Keyboard visibility tracking
+    @State private var keyboardVisible: Bool = false
 
-    // Speech controller
+    // Controllers
     @StateObject private var speech = SpeechIOController()
+    @StateObject private var tts = ZoraTTSController()
+    @StateObject private var service = ZoraService()
+
+    // Apple-friendly: explicit AI disclosure UI
+    @State private var showAbout = false
+    @State private var showMicHelp = false
+
+    // Rate-limit / safety
+    @State private var lastSentAt: Date = .distantPast
+    private let minSendInterval: TimeInterval = 0.75
+
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         ZStack {
@@ -198,6 +374,7 @@ struct ZoraAIView: View {
 
             VStack(spacing: 0) {
                 header
+                disclosureBar
                 chatPanel
             }
 
@@ -207,11 +384,34 @@ struct ZoraAIView: View {
             }
         }
         .onAppear {
-            if messages.isEmpty { addSystem("Hi, I’m Zora. Ask me anything or tap a suggestion ✨") }
-            Task { await speech.requestPermissions() }
+            if messages.isEmpty {
+                addSystem("Hi, I’m Zora. Ask me anything or tap a suggestion.")
+            }
+            Task {
+                await speech.requestPermissions()
+                let uid = Auth.auth().currentUser?.uid ?? ""
+                await service.bootstrapIfNeeded(uid: uid)
+            }
         }
         .onDisappear {
             speech.stop()
+            tts.stop()
+            service.cancelInFlight()
+        }
+        // Keyboard show/hide tracking
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            keyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardVisible = false
+        }
+        .sheet(isPresented: $showAbout) {
+            ZoraAboutView(text: service.aiDisclosure)
+        }
+        .alert("Voice permissions needed", isPresented: $showMicHelp) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Enable Microphone and Speech Recognition permissions in Settings to use voice input.")
         }
     }
 
@@ -221,7 +421,8 @@ struct ZoraAIView: View {
             ZoraOrb(size: 36)
                 .overlay(
                     Circle()
-                        .strokeBorder(glowPulse ? Color.cyan.opacity(0.45) : Color.white.opacity(0.12), lineWidth: glowPulse ? 2.0 : 1.0)
+                        .strokeBorder(glowPulse ? Color.cyan.opacity(0.45) : Color.white.opacity(0.12),
+                                      lineWidth: glowPulse ? 2.0 : 1.0)
                         .blur(radius: glowPulse ? 2 : 0.8)
                         .animation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true), value: glowPulse)
                 )
@@ -232,15 +433,62 @@ struct ZoraAIView: View {
                     .font(.title2.weight(.heavy))
                     .foregroundStyle(.white)
                     .shadow(color: .cyan.opacity(0.6), radius: 6)
-                Text(speaking ? "Speaking…" : (thinking ? "Thinking…" : (speech.isRecording ? "Listening…" : "Online • Ready")))
+
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(thinking ? .cyan : .secondary)
             }
+
             Spacer()
+
+            Button {
+                dismissKeyboard()
+                showAbout = true
+            } label: {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(8)
+                    .background(Circle().fill(Color.white.opacity(0.08)))
+                    .overlay(Circle().stroke(Color.white.opacity(0.12), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("About Zora")
         }
         .padding(.horizontal, 18)
         .padding(.top, 18)
         .padding(.bottom, 10)
+    }
+
+    private var statusText: String {
+        if tts.speaking { return "Speaking…" }
+        if thinking { return "Thinking…" }
+        if speech.isRecording { return "Listening…" }
+        return "Online • Ready"
+    }
+
+    // MARK: Disclosure bar
+    private var disclosureBar: some View {
+        Button {
+            dismissKeyboard()
+            showAbout = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                Text("AI Assistant • Tap for details")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .opacity(0.85)
+            }
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(Color.white.opacity(0.06))
+            .overlay(Rectangle().frame(height: 1).foregroundStyle(Color.white.opacity(0.10)), alignment: .bottom)
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: Chat Panel
@@ -270,6 +518,8 @@ struct ZoraAIView: View {
                         }
                         .padding(16)
                     }
+                    // Drag/scroll dismisses keyboard (native behavior)
+                    .scrollDismissesKeyboard(.interactively)
                     .onChange(of: messages.count) { _ in
                         withAnimation(.easeInOut(duration: 0.25)) {
                             proxy.scrollTo(messages.last?.id, anchor: .bottom)
@@ -277,13 +527,16 @@ struct ZoraAIView: View {
                     }
                 }
 
-                // Suggestions
-                if !suggestions.isEmpty {
+                if !service.suggestions.isEmpty {
                     suggestionRow
                 }
 
-                // Input Row
                 inputRow
+            }
+            // Tap anywhere in panel dismisses keyboard
+            .contentShape(Rectangle())
+            .onTapGesture {
+                dismissKeyboard()
             }
         }
         .padding(.horizontal, 18)
@@ -293,8 +546,11 @@ struct ZoraAIView: View {
     private var suggestionRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(suggestions, id: \.self) { s in
-                    Button { send(text: s) } label: {
+                ForEach(service.suggestions, id: \.self) { s in
+                    Button {
+                        dismissKeyboard()
+                        send(text: s)
+                    } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "sparkles")
                             Text(s)
@@ -308,9 +564,7 @@ struct ZoraAIView: View {
                                                startPoint: .topLeading, endPoint: .bottomTrailing)
                             )
                         )
-                        .overlay(
-                            Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        )
+                        .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                 }
@@ -328,42 +582,75 @@ struct ZoraAIView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
-                .background(
-                    RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-
-            // Mic button
-            Button {
-                if speech.isRecording {
-                    speech.stop()
-                } else {
-                    speech.start { text, isFinal in
-                        self.input = text
-                        if isFinal && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            self.send(text: text)
-                        }
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.08)))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                .onChange(of: input) { newValue in
+                    if newValue.count > service.maxInputChars {
+                        input = String(newValue.prefix(service.maxInputChars))
                     }
                 }
-            } label: {
-                Image(systemName: speech.isRecording ? "waveform.circle.fill" : "mic.circle.fill")
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(speech.isRecording ? Color.red : Color.cyan, Color.white.opacity(0.95))
-                    .font(.system(size: 28, weight: .semibold))
-                    .padding(.vertical, 4)
-                    .overlay(
-                        Circle()
-                            .stroke(speech.isRecording ? Color.red.opacity(0.6) : Color.cyan.opacity(0.4), lineWidth: speech.isRecording ? 3 : 1.5)
-                            .blur(radius: speech.isRecording ? 1.2 : 0.8)
-                    )
-            }
-            .buttonStyle(.plain)
-            .help(speech.isRecording ? "Stop listening" : "Start voice input")
-            .disabled(!(speech.micPermGranted && (speech.authStatus == .authorized || speech.authStatus == .notDetermined || speech.authStatus == nil)))
 
-            Button { send(text: input) } label: {
+            // Keyboard dismiss button (shows only when keyboard is visible)
+            if keyboardVisible {
+                Button {
+                    dismissKeyboard()
+                } label: {
+                    Image(systemName: "keyboard.chevron.compact.down")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                        .padding(10)
+                        .background(Circle().fill(Color.white.opacity(0.08)))
+                        .overlay(Circle().stroke(Color.white.opacity(0.12), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss keyboard")
+                .disabled(thinking)
+            }
+
+            // Mic button
+            if service.allowVoice {
+                Button {
+                    if !speech.canRecord() {
+                        showMicHelp = true
+                        return
+                    }
+                    dismissKeyboard()
+                    if speech.isRecording {
+                        speech.stop()
+                    } else {
+                        tts.stop()
+                        speech.start { text, isFinal in
+                            self.input = text
+                            if isFinal {
+                                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if !trimmed.isEmpty {
+                                    self.send(text: trimmed)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: speech.isRecording ? "waveform.circle.fill" : "mic.circle.fill")
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(speech.isRecording ? Color.red : Color.cyan, Color.white.opacity(0.95))
+                        .font(.system(size: 28, weight: .semibold))
+                        .padding(.vertical, 4)
+                        .overlay(
+                            Circle()
+                                .stroke(speech.isRecording ? Color.red.opacity(0.6) : Color.cyan.opacity(0.4),
+                                        lineWidth: speech.isRecording ? 3 : 1.5)
+                                .blur(radius: speech.isRecording ? 1.2 : 0.8)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(speech.isRecording ? "Stop listening" : "Start voice input")
+                .disabled(thinking)
+            }
+
+            Button {
+                dismissKeyboard()
+                send(text: input)
+            } label: {
                 Image(systemName: "paperplane.fill")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundStyle(.white)
@@ -377,7 +664,7 @@ struct ZoraAIView: View {
                     .shadow(color: .cyan.opacity(0.4), radius: 10, x: 0, y: 4)
             }
             .buttonStyle(.plain)
-            .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(thinking || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(12)
     }
@@ -386,7 +673,10 @@ struct ZoraAIView: View {
 
     private func messageBubble(_ msg: ZMessage) -> some View {
         HStack(alignment: .bottom, spacing: 8) {
-            if msg.role == .zora || msg.role == .system { ZoraOrb(size: 18).opacity(0.9) }
+            if msg.role == .zora || msg.role == .system {
+                ZoraOrb(size: 18).opacity(0.9)
+            }
+
             Text(msg.text)
                 .foregroundStyle(.white)
                 .padding(.horizontal, 12)
@@ -395,10 +685,9 @@ struct ZoraAIView: View {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(msg.role == .user ? Color.white.opacity(0.10) : Color.blue.opacity(0.18))
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.10), lineWidth: 1)
-                )
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.10), lineWidth: 1))
                 .id(msg.id)
+
             if msg.role == .user { Spacer(minLength: 0) }
         }
     }
@@ -425,7 +714,9 @@ struct ZoraAIView: View {
 
     private func addZora(_ text: String) {
         messages.append(ZMessage(role: .zora, text: AttributedString(text)))
-        speak(text)
+        if service.allowTTS && !speech.isRecording {
+            tts.speak(text)
+        }
     }
 
     // MARK: - Send / Networking
@@ -433,68 +724,69 @@ struct ZoraAIView: View {
     private func send(text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        // throttle
+        let now = Date()
+        guard now.timeIntervalSince(lastSentAt) >= minSendInterval else { return }
+        lastSentAt = now
+
+        // Stop voice capture if sending
+        if speech.isRecording { speech.stop() }
+
+        // Cap input
+        let capped = trimmed.count > service.maxInputChars ? String(trimmed.prefix(service.maxInputChars)) : trimmed
+
         input = ""
-        addUser(trimmed)
+        addUser(capped)
         thinking = true
-        Task { await talkToZora(trimmed) }
+
+        service.cancelInFlight()
+
+        Task { await talkToZora(capped) }
     }
 
-    /// Calls your Cloud Function with intent "zora.ask".
-    /// Retries on cannotParseResponse / connection lost; never throws to UI.
     private func talkToZora(_ text: String) async {
         let uid = Auth.auth().currentUser?.uid ?? ""
-        guard let url = URL(string: "https://us-central1-blackappios.cloudfunctions.net/aiOrbHandle") else {
-            await MainActor.run { addZora("I couldn’t reach the server."); thinking = false }
-            return
-        }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.timeoutInterval = 20
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let body: [String: Any] = [
-            "uid": uid,
-            "intent": "zora.ask",
-            "payload": ["text": text]
-        ]
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
+        let safeUid = uid
 
         let maxRetries = 2
         var lastError: NSError?
+
         for attempt in 0...maxRetries {
+            if Task.isCancelled { break }
+
             do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                    throw URLError(.badServerResponse)
-                }
-                let decoded: ZOR_Resp
-                do {
-                    decoded = try JSONDecoder().decode(ZOR_Resp.self, from: data)
-                } catch {
-                    let raw = String(data: data, encoding: .utf8) ?? ""
+                let decoded = try await service.ask(text: text, uid: safeUid)
+
+                if let cfg = decoded.config {
                     await MainActor.run {
-                        addZora(raw.isEmpty ? "I’m here, but I couldn’t parse that." : raw)
-                        thinking = false
+                        if let s = cfg.suggestions, !s.isEmpty { service.suggestions = s }
+                        if let d = cfg.aiDisclosure, !d.isEmpty { service.aiDisclosure = d }
+                        if let t = cfg.allowTTS { service.allowTTS = t }
+                        if let v = cfg.allowVoice { service.allowVoice = v }
+                        if let m = cfg.maxInputChars, m >= 200 { service.maxInputChars = min(m, 4000) }
+                        if let sv = cfg.schemaVersion, sv >= 1 { service.schemaVersion = sv }
                     }
-                    return
                 }
 
-                let reply = pickReply(from: decoded)
+                let picked = pickReply(from: decoded)
+
                 await MainActor.run {
-                    addZora(reply)
+                    addZora(picked.text)
+                    if let action = picked.firstAction {
+                        handleAction(action)
+                    }
                     thinking = false
                 }
                 return
             } catch {
                 let ns = error as NSError
                 lastError = ns
+
                 if ns.domain == NSURLErrorDomain &&
-                    (ns.code == NSURLErrorCannotParseResponse || ns.code == NSURLErrorNetworkConnectionLost) &&
+                    (ns.code == NSURLErrorCannotParseResponse || ns.code == NSURLErrorNetworkConnectionLost || ns.code == NSURLErrorTimedOut) &&
                     attempt < maxRetries {
-                    let backoff = UInt64(Double.random(in: 0.15...0.45) * 1_000_000_000)
+                    let backoff = UInt64(Double.random(in: 0.2...0.6) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: backoff)
                     continue
                 } else {
@@ -504,51 +796,131 @@ struct ZoraAIView: View {
         }
 
         await MainActor.run {
-            addZora("Network hiccup (\(lastError?.code ?? -1)). Tap a suggestion to try again.")
+            addZora("I hit a network issue (\(lastError?.code ?? -1)). Please try again.")
             thinking = false
         }
     }
 
-    /// Collapse server cards into a friendly reply string
-    private func pickReply(from resp: ZOR_Resp) -> String {
+    // MARK: - Reply extraction
+
+    fileprivate struct PickedReply {
+        let text: String
+        let firstAction: ZOR_Action?
+    }
+
+    fileprivate func pickReply(from resp: ZOR_Resp) -> PickedReply {
         guard resp.ok, let cards = resp.cards, !cards.isEmpty else {
-            return resp.error ?? "I’m here."
+            return PickedReply(text: resp.error ?? "I’m here.", firstAction: nil)
         }
+
         var parts: [String] = []
+        var firstAction: ZOR_Action?
+
         for c in cards {
+            if firstAction == nil, let a = c.action { firstAction = a }
+
             switch c.type {
-            case "title", "subtitle":
+            case "title", "subtitle", "text":
                 if let t = c.text, !t.isEmpty { parts.append(t) }
-            case "bullets":
+
+            case "bullets", "list":
                 if let its = c.items, !its.isEmpty {
                     parts.append(its.map { "• \($0)" }.joined(separator: "\n"))
                 }
+
             case "card":
                 if let ec = c.card {
                     var s = "• \(ec.title)"
-                    if let sub = ec.subtitle { s += " — \(sub)" }
+                    if let sub = ec.subtitle, !sub.isEmpty { s += " — \(sub)" }
                     parts.append(s)
                 }
+
             case "cta":
-                if let lbl = c.label { parts.append("[\(lbl)]") }
+                if let lbl = c.label, !lbl.isEmpty { parts.append(lbl) }
+
             default:
-                continue
+                if let t = c.text, !t.isEmpty { parts.append(t) }
+                else if let m = c.meta?["text"], !m.isEmpty { parts.append(m) }
             }
         }
-        return parts.joined(separator: "\n")
+
+        let combined = parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return PickedReply(text: combined.isEmpty ? "Done." : combined, firstAction: firstAction)
     }
 
-    // MARK: - TTS
-    private func speak(_ text: String) {
-        // If we’re recording, don’t echo to prevent audio feedback.
-        guard !speech.isRecording else { return }
-        let ut = AVSpeechUtterance(string: text)
-        ut.voice = AVSpeechSynthesisVoice(language: "en-US")
-        ut.rate = AVSpeechUtteranceDefaultSpeechRate * 0.98
-        ut.pitchMultiplier = 1.02
-        speaking = true
-        synthesizer.speak(ut)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { speaking = false }
+    // MARK: - Safe action handling
+
+    private func handleAction(_ action: ZOR_Action) {
+        switch action.type {
+        case "open_url":
+            guard let raw = action.url, let url = URL(string: raw) else { return }
+            guard isAllowedURL(url) else { return }
+            openURL(url)
+
+        case "open_event":
+            if let id = action.id, let url = URL(string: "blackappios://event/\(id)") {
+                openURL(url)
+            }
+
+        default:
+            return
+        }
+    }
+
+    private func isAllowedURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else { return false }
+        guard let host = url.host?.lowercased() else { return false }
+
+        let allowedHosts: Set<String> = [
+            "blackapp.io",
+            "www.blackapp.io",
+            "blackappios.web.app",
+            "blackappios.firebaseapp.com"
+        ]
+        return allowedHosts.contains(host)
+    }
+}
+
+// MARK: - About sheet
+private struct ZoraAboutView: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("About Zora")
+                        .font(.title2.weight(.heavy))
+
+                    Text(text)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+
+                    Divider().opacity(0.6)
+
+                    Text("Privacy")
+                        .font(.headline)
+                    Text("Zora sends your typed or transcribed text to the BlackApp server to generate a response. Audio is not uploaded by this view. Avoid sharing sensitive information.")
+                        .foregroundStyle(.secondary)
+
+                    Divider().opacity(0.6)
+
+                    Text("Safety")
+                        .font(.headline)
+                    Text("Zora may be inaccurate. Do not rely on responses for medical, legal, or financial decisions.")
+                        .foregroundStyle(.secondary)
+                }
+                .padding(18)
+            }
+            .navigationTitle("Zora AI")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
 
@@ -598,21 +970,17 @@ private struct TypingDots: View {
     @State private var phase: CGFloat = 0
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(0..<3) { i in
+            ForEach(0..<3) { _ in
                 Circle()
                     .fill(Color.white.opacity(0.9))
                     .frame(width: 6, height: 6)
-                    .scaleEffect(scale(for: i))
-                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: phase)
+                    .scaleEffect(phase == 0 ? 0.85 : 1.0)
             }
         }
-        .onAppear { phase = 1 }
-    }
-    private func scale(for i: Int) -> CGFloat {
-        switch i {
-        case 0: return 0.85
-        case 1: return 1.0
-        default: return 0.85
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                phase = 1
+            }
         }
     }
 }

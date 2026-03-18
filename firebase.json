@@ -3,25 +3,34 @@
     "source": "functions",
     "runtime": "nodejs20"
   },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
   "hosting": {
     "public": "public",
+    "cleanUrls": true,
     "ignore": [
       "firebase.json",
       "**/.*",
       "**/node_modules/**"
     ],
-    "cleanUrls": true,
     "headers": [
       {
         "source": "**/*.@(js|css|png|jpg|jpeg|svg|webp|gif|ico|woff|woff2|ttf)",
         "headers": [
-          { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
         ]
       },
       {
-        "source": "/index.html",
+        "source": "**/*.html",
         "headers": [
-          { "key": "Cache-Control", "value": "no-cache" }
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
+          }
         ]
       },
       {
@@ -33,29 +42,72 @@
           { "key": "X-Frame-Options", "value": "SAMEORIGIN" },
           {
             "key": "Content-Security-Policy",
-            "value": "default-src 'self'; frame-src 'self' https://www.eventbrite.com https://*.eventbrite.com; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com https://img.evbuc.com; media-src 'self' blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com; connect-src 'self' https://us-central1-blackappios.cloudfunctions.net https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://firebasestorage.googleapis.com https://*.firebasestorage.app https://www.eventbriteapi.com https://www.eventbrite.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://www.googletagmanager.com https://www.eventbrite.com; style-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'self';"
+            "value": "default-src 'self'; frame-src 'self' https://www.eventbrite.com https://*.eventbrite.com https://js.stripe.com https://hooks.stripe.com; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com https://img.evbuc.com; media-src 'self' blob: https://firebasestorage.googleapis.com https://*.firebasestorage.app https://storage.googleapis.com; connect-src 'self' https://us-central1-blackappios.cloudfunctions.net https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://firebasestorage.googleapis.com https://*.firebasestorage.app https://www.eventbriteapi.com https://www.eventbrite.com https://api.stripe.com https://m.stripe.network https://q.stripe.com https://r.stripe.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.gstatic.com https://www.googletagmanager.com https://www.eventbrite.com https://js.stripe.com; style-src 'self' 'unsafe-inline'; base-uri 'self'; frame-ancestors 'self';"
           }
         ]
       }
     ],
     "rewrites": [
-      { "source": "/api/feedTicketmaster", "function": { "functionId": "feedTicketmaster", "region": "us-central1" } },
-      { "source": "/api/feedEventbrite",   "function": { "functionId": "feedEventbrite",   "region": "us-central1" } },
-      { "source": "/api/ping",             "function": { "functionId": "ping",             "region": "us-central1" } },
+      {
+        "source": "/api/feedTicketmaster",
+        "function": { "functionId": "feedTicketmaster", "region": "us-central1" }
+      },
+      {
+        "source": "/api/feedEventbrite",
+        "function": { "functionId": "feedEventbrite", "region": "us-central1" }
+      },
+      {
+        "source": "/api/ping",
+        "function": { "functionId": "ping", "region": "us-central1" }
+      },
+      {
+        "source": "/generateClientToken",
+        "function": { "functionId": "generateClientToken", "region": "us-central1" }
+      },
+      {
+        "source": "/createTransaction",
+        "function": { "functionId": "createTransaction", "region": "us-central1" }
+      },
+      {
+        "source": "/getCheckoutURL",
+        "function": { "functionId": "getCheckoutURL", "region": "us-central1" }
+      },
+      {
+        "source": "/api/rssBundle",
+        "function": { "functionId": "rssBundle", "region": "us-central1" }
+      },
+      {
+        "source": "/api/imgThumb",
+        "function": { "functionId": "imgThumb", "region": "us-central1" }
+      },
+      {
+        "source": "/api/eventbrite/webhook",
+        "function": { "functionId": "ebWebhook", "region": "us-central1" }
+      },
+      {
+        "source": "/api/eb/order-complete",
+        "function": { "functionId": "ebOrderComplete", "region": "us-central1" }
+      },
+      {
+        "source": "/api/eb/claim",
+        "function": { "functionId": "ebClaimTicket", "region": "us-central1" }
+      },
+      {
+        "source": "/api/eb/list-unclaimed",
+        "function": { "functionId": "ebListUnclaimed", "region": "us-central1" }
+      },
 
-      { "source": "/generateClientToken",  "function": { "functionId": "generateClientToken", "region": "us-central1" } },
-      { "source": "/createTransaction",    "function": { "functionId": "createTransaction",   "region": "us-central1" } },
-      { "source": "/getCheckoutURL",       "function": { "functionId": "getCheckoutURL",      "region": "us-central1" } },
+      { "source": "/search", "destination": "/search.html" },
+      { "source": "/profile", "destination": "/profile.html" },
+      { "source": "/passport", "destination": "/passport.html" },
+      { "source": "/chat", "destination": "/chat.html" },
+      { "source": "/admin-dashboard", "destination": "/admin-dashboard.html" },
 
-      { "source": "/api/rssBundle",        "function": { "functionId": "rssBundle",        "region": "us-central1" } },
-      { "source": "/api/imgThumb",         "function": { "functionId": "imgThumb",         "region": "us-central1" } },
-
-      { "source": "/api/eventbrite/webhook", "function": { "functionId": "ebWebhook",         "region": "us-central1" } },
-      { "source": "/api/eb/order-complete",  "function": { "functionId": "ebOrderComplete",   "region": "us-central1" } },
-
-      { "source": "/api/eb/claim",         "function": { "functionId": "ebClaimTicket",  "region": "us-central1" } },
-      { "source": "/api/eb/list-unclaimed","function": { "functionId": "ebListUnclaimed",
-"region": "us-central1" } },
+      { "source": "/search.html", "destination": "/search.html" },
+      { "source": "/profile.html", "destination": "/profile.html" },
+      { "source": "/passport.html", "destination": "/passport.html" },
+      { "source": "/chat.html", "destination": "/chat.html" },
+      { "source": "/admin-dashboard.html", "destination": "/admin-dashboard.html" },
 
       { "source": "**", "destination": "/index.html" }
     ]

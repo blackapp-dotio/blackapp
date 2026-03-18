@@ -1,3 +1,8 @@
+//
+//  EventFeedView.swift (stable)
+//  BlackAppIOS
+//
+
 import SwiftUI
 import UIKit
 import Firebase
@@ -116,9 +121,12 @@ struct EventFeedView: View {
                                     .padding(.vertical)
                             } else {
                                 ForEach(filteredPlatformEvents(), id: \.id) { event in
-                                    EventCardView(event: event)
-                                        .listRowSeparator(.hidden)
-                                        .listRowBackground(Color.clear)
+                                    NavigationLink(destination: EventDetailView(event: event)) {
+                                        EventCardView(event: event)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
                                 }
                             }
                         }
@@ -287,40 +295,228 @@ extension EventFeedView {
     }
 }
 
+import SwiftUI
+import UIKit
+import FirebaseAuth
+import FirebaseDatabase
+import FirebaseStorage
+
 // =====================================================
-// MARK: - Event Card View (Platform events - unchanged)
+// MARK: - Flyer image loader (Firebase Storage -> UIImage)
+// =====================================================
+fileprivate final class FlyerImageCache {
+    static let shared = NSCache<NSString, UIImage>()
+}
+
+fileprivate struct FlyerStorageImageFitView: View {
+    let imagePath: String
+    var onAspectResolved: ((CGFloat) -> Void)? = nil // aspect = width/height
+
+    @State private var uiImage: UIImage? = nil
+    @State private var isLoading: Bool = false
+    @State private var didResolveAspect: Bool = false
+
+    var body: some View {
+        ZStack {
+            if let img = uiImage {
+                Image(uiImage: img)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .aspectRatio(img.size, contentMode: .fit) // ✅ no crop
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black.opacity(0.02))
+                    .onAppear {
+                        guard !didResolveAspect else { return }
+                        didResolveAspect = true
+                        if img.size.width > 0, img.size.height > 0 {
+                            onAspectResolved?(img.size.width / img.size.height)
+                        }
+                    }
+            } else if isLoading {
+                ZStack {
+                    Color.black.opacity(0.06)
+                    ProgressView()
+                }
+            } else {
+                Color.gray.opacity(0.18)
+            }
+        }
+        .onAppear { load() }
+        .onChange(of: imagePath) { _ in
+            uiImage = nil
+            didResolveAspect = false
+            load()
+        }
+    }
+
+    private func load() {
+        let trimmed = imagePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard !isLoading else { return }
+
+        if let cached = FlyerImageCache.shared.object(forKey: trimmed as NSString) {
+            self.uiImage = cached
+            return
+        }
+
+        isLoading = true
+        let storageRef = Storage.storage().reference().child(trimmed)
+
+        storageRef.downloadURL { url, _ in
+            guard let url = url else {
+                DispatchQueue.main.async { self.isLoading = false }
+                return
+            }
+
+            URLSession.shared.dataTask(with: url) { data, _, _ in
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    guard let data = data, let img = UIImage(data: data) else { return }
+                    FlyerImageCache.shared.setObject(img, forKey: trimmed as NSString)
+                    self.uiImage = img
+                }
+            }.resume()
+        }
+    }
+}
+
+// =====================================================
+// MARK: - Auto-height swipe carousel (real paging + full flyer visible)
+// =====================================================
+fileprivate struct EventImageCarouselView: View {
+    let imagePaths: [String]
+
+    // Tuning knobs
+    private let minHeight: CGFloat = 320
+    private let maxHeight: CGFloat = 820
+    private let fallbackAspectWH: CGFloat = 4.0 / 5.0 // width/height fallback
+
+    @State private var pageIndex: Int = 0
+    @State private var aspectByPath: [String: CGFloat] = [:] // path -> width/height
+
+    private var normalizedPaths: [String] {
+        imagePaths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = max(geo.size.width, 1)
+
+            let currentPath: String = {
+                if pageIndex >= 0, pageIndex < normalizedPaths.count { return normalizedPaths[pageIndex] }
+                return normalizedPaths.first ?? ""
+            }()
+
+            let aspectWH = max(aspectByPath[currentPath] ?? fallbackAspectWH, 0.1)
+            let computedHeight = clamp(width / aspectWH, minHeight, maxHeight)
+
+            ZStack(alignment: .topTrailing) {
+                TabView(selection: $pageIndex) {
+                    ForEach(Array(normalizedPaths.enumerated()), id: \.offset) { idx, path in
+                        FlyerStorageImageFitView(
+                            imagePath: path,
+                            onAspectResolved: { wh in
+                                if wh > 0.1 { aspectByPath[path] = wh }
+                            }
+                        )
+                        .tag(idx)
+                        .frame(width: width, height: computedHeight)
+                        .background(Color.black.opacity(0.08))
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: normalizedPaths.count > 1 ? .automatic : .never))
+                .indexViewStyle(.page(backgroundDisplayMode: .always))
+                .frame(width: width, height: computedHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                if normalizedPaths.count > 1 {
+                    Text("\(pageIndex + 1)/\(normalizedPaths.count)")
+                        .font(.caption2)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.55), in: Capsule())
+                        .padding(10)
+                }
+            }
+            .frame(width: width, height: computedHeight)
+        }
+        // Ensure GeometryReader doesn't collapse before first image resolves
+        .frame(height: 420)
+    }
+
+    private func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+        min(max(v, lo), hi)
+    }
+}
+
+// =====================================================
+// MARK: - Event Card View (UPDATED)
 // =====================================================
 struct EventCardView: View {
     let event: EventModel
 
-    @State private var showCheckout: Bool = false
     @State private var isSaved: Bool = false
     @State private var showShareOptions: Bool = false
 
-    // Compact formatters
     private static let dateFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .none; return f
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
     }()
+
     private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateStyle = .none; f.timeStyle = .short; return f
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
     }()
+
     private var dateText: String { Self.dateFormatter.string(from: event.date) }
     private var timeText: String { Self.timeFormatter.string(from: event.date) }
-    var ticketsRemaining: Int { max(event.ticketQuantity - (event.ticketsSold), 0) }
-    var tablesRemaining: Int { max(event.tableQuantity - (event.tablesSold), 0) }
+
+    private var ticketsRemaining: Int { max(event.ticketQuantity - event.ticketsSold, 0) }
+    private var tablesRemaining: Int { max(event.tableQuantity - event.tablesSold, 0) }
+
+    // ✅ Uses gallery when present, else legacy cover
+    private var resolvedImagePaths: [String] {
+        let legacy = event.imagePath.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // If EventModel does NOT yet have imagePaths, temporarily return [legacy].
+        // If it DOES, this will compile and work:
+        let gallery = event.imagePaths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if !gallery.isEmpty { return gallery }
+        return legacy.isEmpty ? [] : [legacy]
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Flyer with date/time overlay
-            ZStack(alignment: .bottomLeading) {
-                EventImageView(imagePath: event.imagePath)
-                    .frame(height: 200)
-                    .clipped()
+        VStack(alignment: .leading, spacing: 10) {
 
-                LinearGradient(colors: [Color.clear, Color.black.opacity(0.72)],
-                               startPoint: .top, endPoint: .bottom)
-                    .frame(height: 72)
-                    .frame(maxWidth: .infinity, alignment: .bottom)
+            ZStack(alignment: .bottomLeading) {
+                if resolvedImagePaths.isEmpty {
+                    Color.gray.opacity(0.2)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 420)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                } else {
+                    EventImageCarouselView(imagePaths: resolvedImagePaths)
+                }
+
+                LinearGradient(
+                    colors: [Color.clear, Color.black.opacity(0.72)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 84)
+                .frame(maxWidth: .infinity, alignment: .bottom)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 HStack(spacing: 12) {
                     Label(dateText, systemImage: "calendar")
@@ -328,13 +524,12 @@ struct EventCardView: View {
                 }
                 .font(.caption)
                 .foregroundColor(.white)
-                .padding(8)
+                .padding(10)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 12))
 
             Text(event.title)
                 .font(.headline)
-                .padding(.top, 4)
+                .foregroundColor(.white)
 
             HStack(spacing: 12) {
                 Label(dateText, systemImage: "calendar")
@@ -348,12 +543,13 @@ struct EventCardView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(2)
 
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 Image(systemName: "mappin.and.ellipse").foregroundColor(.gray)
-                Text(event.location).font(.subheadline).foregroundColor(.gray)
+                Text(event.location)
+                    .font(.subheadline)
+                    .foregroundColor(.gray)
             }
 
-            // Prices
             HStack(spacing: 16) {
                 if event.ticketPrice > 0 {
                     Label("$\(String(format: "%.2f", event.ticketPrice)) Tickets", systemImage: "ticket")
@@ -366,7 +562,6 @@ struct EventCardView: View {
             }
             .foregroundColor(.white)
 
-            // Remaining counts
             HStack(spacing: 16) {
                 if event.ticketQuantity > 0 {
                     Label("\(ticketsRemaining) tickets left", systemImage: "exclamationmark.triangle")
@@ -380,12 +575,11 @@ struct EventCardView: View {
                 }
             }
 
-            // Save & Share
             HStack {
-                Button(action: {
+                Button {
                     isSaved.toggle()
-                    saveEventToFirebase(event: event, isSaved: isSaved)
-                }) {
+                    saveEventToFirebase(isSaved: isSaved)
+                } label: {
                     Image(systemName: isSaved ? "bookmark.fill" : "bookmark")
                         .foregroundColor(isSaved ? .yellow : .white)
                 }
@@ -393,46 +587,32 @@ struct EventCardView: View {
 
                 Spacer()
 
-                Button(action: { showShareOptions = true }) {
-                    Image(systemName: "square.and.arrow.up").foregroundColor(.white)
+                Button { showShareOptions = true } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .foregroundColor(.white)
                 }
                 .buttonStyle(.borderless)
             }
             .font(.caption)
-            .padding(.top, 4)
-
-            // Checkout
-            Button(action: { showCheckout = true }) {
-                Text("Buy Tickets / Tables")
-                    .foregroundColor(.white)
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(Color.blue)
-                    .cornerRadius(10)
-            }
-            .buttonStyle(.borderless)
-            .padding(.top, 8)
+            .padding(.top, 2)
         }
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(12)
         .contentShape(Rectangle())
         .onAppear(perform: checkIfSaved)
-        .sheet(isPresented: $showCheckout) {
-            CheckoutConfirmationView(event: event) { ticketQty, tableQty in
-                openCheckout(ticketQty: ticketQty, tableQty: tableQty)
-            }
-        }
-        .confirmationDialog("Share Event",
-                            isPresented: $showShareOptions,
-                            titleVisibility: .visible) {
-            Button("Share to Gossip (recommended)") { shareToGossip() }
+        .confirmationDialog(
+            "Share Event",
+            isPresented: $showShareOptions,
+            titleVisibility: .visible
+        ) {
+            Button("Share Event to Gossip") { shareToGossip() }
             Button("Share via…") { shareToSystem() }
             Button("Cancel", role: .cancel) { }
         }
     }
 
-    // MARK: Save / load
+    // MARK: - Save / load
     private func checkIfSaved() {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
@@ -441,7 +621,7 @@ struct EventCardView: View {
         }
     }
 
-    private func saveEventToFirebase(event: EventModel, isSaved: Bool) {
+    private func saveEventToFirebase(isSaved: Bool) {
         guard let userId = Auth.auth().currentUser?.uid else { return }
         let ref = Database.database().reference().child("savedEvents").child(userId).child(event.id)
         if isSaved {
@@ -451,49 +631,11 @@ struct EventCardView: View {
         }
     }
 
-    // MARK: Checkout deep link (existing)
-    private func openCheckout(ticketQty: Int, tableQty: Int) {
-        guard let userId = Auth.auth().currentUser?.uid else {
-            print("❌ No user logged in"); return
-        }
-        let payoutMethod = event.payoutMethod.isEmpty ? "N/A" : event.payoutMethod
-        let payoutDetails = event.payoutDetails.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "N/A"
-        let ticketTotal = Double(ticketQty) * event.ticketPrice
-        let tableTotal = Double(tableQty) * event.tablePrice
-        let grossTotal = ticketTotal + tableTotal
-        let totalWithFee = grossTotal * 1.02
-
-        var components = URLComponents()
-        components.scheme = "https"
-        components.host = "blackappios.web.app"
-        components.path = "/checkout"
-        components.queryItems = [
-            URLQueryItem(name: "eventId", value: event.id),
-            URLQueryItem(name: "eventName", value: event.title.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""),
-            URLQueryItem(name: "eventTime", value: "\(Int(event.date.timeIntervalSince1970))"),
-            URLQueryItem(name: "userId", value: userId),
-            URLQueryItem(name: "ticketQty", value: "\(ticketQty)"),
-            URLQueryItem(name: "ticketPrice", value: "\(event.ticketPrice)"),
-            URLQueryItem(name: "tableQty", value: "\(tableQty)"),
-            URLQueryItem(name: "tablePrice", value: "\(event.tablePrice)"),
-            URLQueryItem(name: "baseTotal", value: String(format: "%.2f", grossTotal)),
-            URLQueryItem(name: "totalWithFee", value: String(format: "%.2f", totalWithFee)),
-            URLQueryItem(name: "payoutMethod", value: payoutMethod),
-            URLQueryItem(name: "payoutDetails", value: payoutDetails),
-            URLQueryItem(name: "eventImagePath", value: event.imagePath)
-        ]
-        if let url = components.url {
-            print("🔗 Checkout URL:", url.absoluteString)
-            UIApplication.shared.open(url)
-        } else {
-            print("❌ Failed to create checkout URL")
-        }
-    }
-
-    // MARK: Share helpers (unchanged)
+    // MARK: - Share helpers (these MUST stay inside EventCardView)
     private func shareToGossip() {
         guard let url = buildEventDeepLink() else {
-            shareToSystem(); return
+            shareToSystem()
+            return
         }
         let caption = makeEventCaption()
         if let top = topMostController() {
@@ -513,11 +655,9 @@ struct EventCardView: View {
     }
 
     private func makeEventCaption() -> String {
-        let dateText = Self.dateFormatter.string(from: event.date)
-        let timeText = Self.timeFormatter.string(from: event.date)
-        var parts: [String] = []
-        parts.append(event.title)
-        parts.append("\(dateText) • \(timeText)")
+        let d = Self.dateFormatter.string(from: event.date)
+        let t = Self.timeFormatter.string(from: event.date)
+        var parts: [String] = [event.title, "\(d) • \(t)"]
         if !event.location.isEmpty { parts.append(event.location) }
         if event.ticketPrice > 0 { parts.append(String(format: "Tickets $%.0f", event.ticketPrice)) }
         if event.tablePrice > 0 { parts.append(String(format: "Tables $%.0f", event.tablePrice)) }
@@ -591,14 +731,14 @@ fileprivate struct EventbriteCardView: View {
 
             // --- Actions ---
             VStack(spacing: 8) {
-                // Buy inside BlackApp (embedded checkout page)
+                // Get inside BlackApp (embedded checkout page)
                 Button {
                     let uid = Auth.auth().currentUser?.uid ?? "anon"
                     if let url = URL(string: "https://blackappios.web.app/eb.html?eventId=\(item.id)&userId=\(uid)") {
                         UIApplication.shared.open(url)
                     }
                 } label: {
-                    Text("Buy in BlackApp")
+                    Text("Get tickets in BlackApp")
                         .foregroundColor(.white)
                         .padding()
                         .frame(maxWidth: .infinity)
@@ -639,7 +779,6 @@ fileprivate struct ZstackLoader: View {
         }
     }
 }
-
 
 // =====================================================
 // MARK: - Generic share presenters (existing helpers)

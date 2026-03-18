@@ -3,4 +3,38 @@
    uuid = "20C90DED-2725-41A7-8EB6-063B19D6056C"
    type = "1"
    version = "2.0">
+   <Breakpoints>
+      <BreakpointProxy
+         BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
+         <BreakpointContent
+            uuid = "A59F6438-5C9A-47ED-AD84-7AA4D4D3FE58"
+            shouldBeEnabled = "Yes"
+            ignoreCount = "0"
+            continueAfterRunningActions = "No"
+            filePath = "BlackAppIOS/EventModule.swift"
+            startingColumnNumber = "9223372036854775807"
+            endingColumnNumber = "9223372036854775807"
+            startingLineNumber = "2629"
+            endingLineNumber = "2629"
+            landmarkName = "callCreateTransaction(paymentMethodId:userId:eventId:eventName:eventImagePath:ticketQty:ticketPrice:tableQty:tablePrice:eventTime:)"
+            landmarkType = "7">
+         </BreakpointContent>
+      </BreakpointProxy>
+      <BreakpointProxy
+         BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
+         <BreakpointContent
+            uuid = "39EF57E8-BDB8-430D-A95B-F4C8A6AFBCE2"
+            shouldBeEnabled = "Yes"
+            ignoreCount = "0"
+            continueAfterRunningActions = "No"
+            filePath = "BlackAppIOS/EventModule.swift"
+            startingColumnNumber = "9223372036854775807"
+            endingColumnNumber = "9223372036854775807"
+            startingLineNumber = "2629"
+            endingLineNumber = "2629"
+            landmarkName = "callCreateTransaction(paymentMethodId:userId:eventId:eventName:eventImagePath:ticketQty:ticketPrice:tableQty:tablePrice:eventTime:)"
+            landmarkType = "7">
+         </BreakpointContent>
+      </BreakpointProxy>
+   </Breakpoints>
 </Bucket>

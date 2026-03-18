@@ -1,14 +1,16 @@
+
 // functions/index.js
 /* eslint-disable no-console */
 const admin = require("firebase-admin");
-const braintree = require("braintree");
 const corsMw = require("cors")({ origin: true });
-const functions = require("firebase-functions/v1"); // v1 API (region helper below)
+const functions = require("firebase-functions/v1");
 const crypto = require("crypto");
 const RSSParser = require("rss-parser");
 const sharp = require("sharp");
 const { fetch: undiciFetch } = require("undici");
 const parser = new RSSParser();
+const Stripe = require("stripe");
+
 
 
 // --- Config helper (non-conflicting) ---
@@ -32,6 +34,27 @@ const getCfg = (() => {
     }
   };
 })();
+
+// ====== Stripe init (replaces Braintree) ======
+const STRIPE_SECRET_KEY = getCfg("stripe.secret_key", "");
+const STRIPE_PUBLISHABLE_KEY = getCfg("stripe.publishable_key", "");
+
+let stripe = null;
+if (!STRIPE_SECRET_KEY) {
+  console.warn("⚠️ [Stripe] No stripe.secret_key configured. Payment endpoints will fail until set.");
+} else {
+  stripe = new Stripe(STRIPE_SECRET_KEY, {
+    apiVersion: "2024-06-20",
+  });
+}
+
+function requireStripe() {
+  if (!stripe) {
+    throw new Error("Stripe is not initialized: set functions.config().stripe.secret_key");
+  }
+  return stripe;
+}
+
 
 
 
@@ -77,12 +100,90 @@ if (!admin.apps.length) {
   });
 }
 
+// ===============================
+// Njangi backend modules (NEW)
+// ===============================
+const njangiPremium = require("./njangi/premium");
+
+exports.enforceNjangiPlatformFee = njangiPremium.enforceNjangiPlatformFee;
+exports.onNjangiContributionWritten = njangiPremium.onNjangiContributionWritten;
+exports.autoApproveNjangiPayouts = njangiPremium.autoApproveNjangiPayouts;
+
+
+// ===============================
+// Njangi disputes module (NEW)
+// ===============================
+const njangiDisputes = require("./njangi/disputes");
+
+exports.njangiOpenDispute = njangiDisputes.njangiOpenDispute;
+exports.njangiResolveDispute = njangiDisputes.njangiResolveDispute;
+
 
 const fn = functions.region("us-central1");
 const rtdb = admin.database();
 const firestore = admin.firestore();
 const db = admin.database();
 
+// --- Njangi Withdrawals (Phase 4.5) ---
+const { registerNjangiWithdrawals } = require("./njangi/withdrawals");
+
+const { njangiProcessClubWithdrawal } = registerNjangiWithdrawals({
+  fn,
+  firestore,
+  requireStripe,
+  PLATFORM_FEE_RATE,
+});
+
+exports.njangiProcessClubWithdrawal = njangiProcessClubWithdrawal;
+
+const {
+  onCommunityMessageCreated,
+  markCommunityThreadRead,
+} = require("./communityNotifications");
+
+// ===== Njangi overrides (locked-down server enforcement) =====
+const makeNjangiOverrides = require("./njangi/overrides");
+Object.assign(exports, makeNjangiOverrides({ fn, admin, firestore, rtdb }));
+
+
+// --- Njangi Automation (Phase 2.3A) ---
+const { njangiAutoApprovePayouts } = require("./njangi/automation")({
+  functions,
+  admin,
+});
+
+exports.njangiAutoApprovePayouts = njangiAutoApprovePayouts;
+
+
+
+// ---- Njangi Money (Phase 4.3) ----
+const buildNjangiMoneyExports = require("./njangi/money");
+
+const njangiMoney = buildNjangiMoneyExports({
+  fn,
+  firestore,
+  requireStripe,
+  PLATFORM_FEE_RATE,
+});
+
+exports.njangiCreateContributionCheckout = njangiMoney.njangiCreateContributionCheckout;
+exports.njangiStripeWebhook = njangiMoney.njangiStripeWebhook;
+
+// ---- Njangi Connect + Withdraw (Phase 4.4) ----
+const buildNjangiConnectExports = require("./njangi/connect");
+
+const njangiConnect = buildNjangiConnectExports({
+  fn,
+  firestore,
+  requireStripe,
+  PLATFORM_FEE_RATE,
+});
+
+exports.njangiCreateConnectLink = njangiConnect.njangiCreateConnectLink;
+exports.njangiCreateConnectLoginLink = njangiConnect.njangiCreateConnectLoginLink;
+exports.njangiCreateWithdrawalRequest = njangiConnect.njangiCreateWithdrawalRequest;
+exports.onCommunityMessageCreated = onCommunityMessageCreated;
+exports.markCommunityThreadRead = markCommunityThreadRead;
 // Optional: lazy bucket accessor for use inside function bodies.
 // (Avoid calling admin.storage().bucket() at module load in case config is missing during analyzer)
 
@@ -411,102 +512,6 @@ function mapIgToItem(m, partnerId) {
   };
 }
 
-
-// Image resize proxy with 25% centered logo fallback and backend-driven revalidation
-exports.imgThumb = fn.https.onRequest(async (req, res) => {
-  try {
-    const url = String(q(req, "url") || "");
-    const fmt = String(q(req, "fmt") || "webp").toLowerCase();
-    const w   = Math.max(120, Math.min(Number(q(req, "w")) || 900, 2000));
-
-    const fallbackUrl = String(q(req, "fallback") || getLogoFallback() || FALLBACK_LOGO || "");
-    const scale = Math.max(0.05, Math.min(Number(q(req, "fallbackScale")) || 0.25, 0.9));
-
-    const arStr = String(q(req, "ar") || "16:9");
-    const [aw, ah] = arStr.includes(":") ? arStr.split(":").map(Number) : [16, 9];
-    const h = Math.max(80, Math.round(w * (ah / aw)));
-    const bg = String(q(req, "bg") || "transparent");
-
-    const setCT = () => res.set("Content-Type", (fmt === "jpg" || fmt === "jpeg") ? "image/jpeg" : "image/webp");
-    // Real images: normal cache + SWR so even if a later request fails, clients can serve cached then revalidate
-    const cacheReal = () => res.set("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=60, stale-if-error=600");
-    // Fallbacks: force re-request soon so real image can replace it without app changes
-    const cacheFallback = () => res.set("Cache-Control", "no-store, must-revalidate");
-
-    // Hard timeout for upstream to keep UI snappy
-    const HARD_MS = 1200;
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), HARD_MS);
-
-    let upstreamBuf = null;
-    try {
-      if (/^https?:\/\//i.test(url)) {
-        const upstream = await undiciFetch(url, { redirect: "follow", signal: ac.signal });
-        if (upstream && upstream.ok) upstreamBuf = Buffer.from(await upstream.arrayBuffer());
-      }
-    } catch (_) {} finally { clearTimeout(t); }
-
-async function renderShrunkFallback() {
-  // Always paint a SOLID BLACK canvas for fallbacks (ignore ?bg=)
-  const canvas = sharp({
-    create: {
-      width: w,
-      height: h,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 1 }, // <— force black, opaque
-    },
-  });
-
-  // Try to fetch the fallback logo (still optional)
-  let fbBuf = null;
-  if (fallbackUrl) {
-    try {
-      const fbResp = await undiciFetch(fallbackUrl, { redirect: "follow" });
-      if (fbResp && fbResp.ok) fbBuf = Buffer.from(await fbResp.arrayBuffer());
-    } catch {}
-  }
-
-  let out;
-  if (fbBuf) {
-    const innerW = Math.max(40, Math.round(w * scale)); // ~25% by default
-    const logoBuf = await sharp(fbBuf).resize({ width: innerW, withoutEnlargement: true }).toBuffer();
-    out = await canvas
-      .composite([{ input: logoBuf, gravity: "center" }])
-      .toFormat((fmt === "jpg" || fmt === "jpeg") ? "jpeg" : "webp", { quality: 78 })
-      .toBuffer();
-  } else {
-    // No logo available—still return a solid-black tile
-    out = await canvas
-      .toFormat((fmt === "jpg" || fmt === "jpeg") ? "jpeg" : "webp", { quality: 78 })
-      .toBuffer();
-  }
-
-  // Fallbacks should NOT cache, so clients will retry for real images
-  res.set("Cache-Control", "no-store, must-revalidate");
-  res.set("X-Thumb-Status", "fallback");
-  res.set("Retry-After", "5");
-  res.set("Content-Type", (fmt === "jpg" || fmt === "jpeg") ? "image/jpeg" : "image/webp");
-  return res.status(200).send(out);
-}
-
-
-    return await renderShrunkFallback();
-
-  } catch (e) {
-    console.error("imgThumb error", e);
-    try {
-      const w = 900, h = Math.round(900 * 9 / 16);
-      const out = await sharp({ create: { width: w, height: h, channels: 4, background: { r:0,g:0,b:0,alpha:0 } } })
-        .webp({ quality: 78 }).toBuffer();
-      res.set("Content-Type", "image/webp");
-      res.set("Cache-Control", "no-store, must-revalidate");
-      res.set("X-Thumb-Status", "fallback");
-      return res.status(200).send(out);
-    } catch {
-      return res.status(500).send("thumb error");
-    }
-  }
-});
 
 
 // DEBUG: list gossip items for a partner (admin-guarded)
@@ -1041,102 +1046,594 @@ const withCors = (handler) => async (req, res) => {
 };
 
 
-// ====== single Braintree gateway instance ======
-const gateway = new braintree.BraintreeGateway({
-  environment: braintree.Environment.Sandbox, // switch to Production when ready
-  merchantId: "bv3gft4qcdkrznn2",
-  publicKey:  "869df6w9p4pks5ch",
-  privateKey: "2703c4d9fc5a3e1e9ec7fde9641a2951",
-});
-
 
 // ====================================================================
-// A) EVENTS CHECKOUT (unchanged, de-duplicated)
+// A) EVENTS CHECKOUT + BLACKAPPMONEY (Stripe Connect) — UPDATED
+// - Adds: createStripeConnectLink (onboarding/login URL for iOS)
+// - Updates: createTransaction -> destination charge routing (seller paid, platform keeps 5%)
+// - Adds: stripeWebhook (verified raw-body webhook)
+// - Keeps: generateClientToken, getPlatformRevenue, getCheckoutURL, ping
 // ====================================================================
+//
+// ASSUMPTIONS (based on your project):
+// - You already have: admin (firebase-admin) initialized, fn (functions wrapper), withCors helper, requireStripe() helper
+// - You already have: STRIPE_PUBLISHABLE_KEY populated from functions config: stripe.publishable_key
+// - Events live in RTDB: events/{eventId} with seller uid under `userId` OR `ownerId`
+// - Seller stripe account id stored in RTDB: users/{sellerUid}/stripeAccountId = "acct_..."
+//
+// REQUIRED CONFIG (Firebase Functions config):
+// - stripe.secret_key
+// - stripe.publishable_key
+// - stripe.webhook_secret          // whsec_... from Stripe Webhooks
+// Optional (recommended):
+// - stripe.connect_return_url      // e.g. blackappios://stripe-return
+// - stripe.connect_refresh_url     // e.g. blackappios://stripe-refresh
+//
+// IMPORTANT:
+// - Do NOT wrap stripeWebhook with withCors (it must use req.rawBody exactly as Stripe sent it).
 
+// ====================================================================
+// 1) EVENTS CHECKOUT: publishable key (kept endpoint name for compatibility)
+// ====================================================================
 exports.generateClientToken = fn.https.onRequest(
   withCors(async (_req, res) => {
     try {
-      const { clientToken } = await gateway.clientToken.generate({});
-      res.status(200).send({ clientToken });
+      if (!STRIPE_PUBLISHABLE_KEY) {
+        console.warn("⚠️ [Stripe] Missing publishable key. Set stripe.publishable_key in functions:config.");
+      }
+      res.status(200).send({
+        publishableKey: STRIPE_PUBLISHABLE_KEY || null,
+      });
     } catch (error) {
-      console.error("❌ Token generation failed:", error);
-      res.status(500).send({ error: "Token generation failed" });
+      console.error("❌ generateClientToken (Stripe) failed:", error);
+      res.status(500).send({ error: "Stripe generateClientToken failed" });
     }
   })
 );
 
+// ====================================================================
+// 2) BLACKAPPMONEY: create Stripe Connect onboarding/login link (FOR iOS)
+// Endpoint used by StripeConnectLinkService.swift:
+//   https://us-central1-<project>.cloudfunctions.net/createStripeConnectLink
+// ====================================================================
+
+
+// ====================================================================
+// 3) EVENTS: createTransaction (Stripe Connect destination charges)
+// Buyer pays: base + 5%
+// Seller receives: base
+// Platform keeps: 5% (application_fee_amount)
+// ====================================================================
 exports.createTransaction = fn.https.onRequest(
   withCors(async (req, res) => {
-    const {
-      paymentMethodNonce,
-      userId,
-      eventId,
-      eventName,
-      eventImagePath = "",
-      ticketQty = 0,
-      ticketPrice = 0,
-      tableQty = 0,
-      tablePrice = 0,
-      eventTime,
-    } = req.body || {};
+    // ---- Simple request correlation id ----
+    const rid =
+      (req.headers["x-request-id"] && String(req.headers["x-request-id"])) ||
+      `ct_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-    const ticketQtyNum   = parseInt(ticketQty) || 0;
-    const tableQtyNum    = parseInt(tableQty)  || 0;
-    const ticketPriceNum = parseFloat(ticketPrice) || 0;
-    const tablePriceNum  = parseFloat(tablePrice)  || 0;
-
-    const baseAmount  = +(ticketQtyNum * ticketPriceNum + tableQtyNum * tablePriceNum).toFixed(2);
-    const feeAmount   = +(baseAmount * PLATFORM_FEE_RATE).toFixed(2);
-    const totalCharge = +(baseAmount + feeAmount).toFixed(2);
-
-    if (!paymentMethodNonce || !userId || !eventId || !eventName) {
-      return res.status(400).send({ error: "❌ Missing required fields" });
+    // ---- Stripe error logger (prints *real* reason) ----
+    function logStripeError(tag, err) {
+      try {
+        console.error(tag, {
+          rid,
+          message: err?.message,
+          type: err?.type,
+          code: err?.code,
+          decline_code: err?.decline_code,
+          param: err?.param,
+          statusCode: err?.statusCode,
+          requestId: err?.requestId,
+          rawType: err?.rawType,
+          raw: {
+            message: err?.raw?.message,
+            type: err?.raw?.type,
+            code: err?.raw?.code,
+            decline_code: err?.raw?.decline_code,
+            param: err?.raw?.param,
+            payment_intent: err?.raw?.payment_intent,
+            payment_method: err?.raw?.payment_method,
+          },
+          headers: err?.headers,
+        });
+      } catch (e) {
+        console.error(tag, "failed to log stripe error:", e);
+      }
     }
 
-    let type = "ticket";
-    if (ticketQtyNum > 0 && tableQtyNum > 0) type = "mixed";
-    else if (tableQtyNum > 0 && ticketQtyNum === 0) type = "table";
-    const totalQty = ticketQtyNum + tableQtyNum;
-
     try {
-      const result = await gateway.transaction.sale({
-        amount: totalCharge.toFixed(2),
-        paymentMethodNonce,
-        options: { submitForSettlement: true },
-      });
-      if (!result.success) throw new Error(result.message || "Transaction unsuccessful");
+      if (req.method === "OPTIONS") {
+        console.log("[createTransaction] OPTIONS preflight", { rid });
+        return res.status(204).send("");
+      }
+      if (req.method !== "POST") {
+        console.warn("[createTransaction] wrong method", { rid, method: req.method });
+        return res.status(405).send({ error: "Method not allowed" });
+      }
 
+      // IMPORTANT:
+      // Prefer a SINGLE global constant in your index.js.
+      // If you already have PLATFORM_FEE_RATE globally, REMOVE this local line.
+      const PLATFORM_FEE_RATE = 0.05;
+
+      const stripe = requireStripe();
+      const db = admin.database();
+
+      const {
+        paymentMethodId, // FROM iOS (Stripe PaymentMethod)
+        userId,          // buyer uid
+        eventId,
+        eventName,
+        eventImagePath = "",
+
+        // qty/price inputs
+        ticketQty = 0,
+        ticketPrice = 0,
+        tableQty = 0,
+        tablePrice = 0,
+
+        eventTime,
+        currency = "usd",
+      } = req.body || {};
+
+      // ---- Basic request logging (sanitize) ----
+      console.log("[createTransaction] start", {
+        rid,
+        userId: userId ? String(userId).slice(0, 8) + "…" : null,
+        eventId,
+        eventName: eventName ? String(eventName).slice(0, 60) : null,
+        paymentMethodIdPrefix: paymentMethodId ? String(paymentMethodId).slice(0, 8) + "…" : null,
+        currency,
+        ticketQty,
+        tableQty,
+      });
+
+      if (!paymentMethodId || !userId || !eventId || !eventName) {
+        console.warn("[createTransaction] missing required fields", { rid });
+        return res.status(400).send({
+          error: "❌ Missing required fields (paymentMethodId, userId, eventId, eventName)",
+          rid,
+        });
+      }
+
+      // ---- Normalize inputs ----
+      const ticketQtyNum = parseInt(ticketQty, 10) || 0;
+      const tableQtyNum = parseInt(tableQty, 10) || 0;
+      const ticketPriceNum = parseFloat(ticketPrice) || 0;
+      const tablePriceNum = parseFloat(tablePrice) || 0;
+
+      // Guard: if qty selected but price is 0 in paid flow, you’ll get weird totals
+      if (ticketQtyNum > 0 && ticketPriceNum < 0) {
+        return res.status(400).send({ error: "❌ Invalid ticketPrice", rid });
+      }
+      if (tableQtyNum > 0 && tablePriceNum < 0) {
+        return res.status(400).send({ error: "❌ Invalid tablePrice", rid });
+      }
+
+      const baseAmount = +(ticketQtyNum * ticketPriceNum + tableQtyNum * tablePriceNum).toFixed(2);
+      const feeAmount = +(baseAmount * PLATFORM_FEE_RATE).toFixed(2);
+      const totalCharge = +(baseAmount + feeAmount).toFixed(2);
+
+      if (!isFinite(totalCharge) || totalCharge <= 0) {
+        console.warn("[createTransaction] invalid total", { rid, baseAmount, feeAmount, totalCharge });
+        return res.status(400).send({ error: "❌ Invalid total amount", rid });
+      }
+
+      const currencyLower = String(currency || "usd").toLowerCase().trim();
+      if (!/^[a-z]{3}$/.test(currencyLower)) {
+        console.warn("[createTransaction] invalid currency", { rid, currency });
+        return res.status(400).send({ error: "❌ Invalid currency", rid });
+      }
+
+      const amountInCents = Math.round(totalCharge * 100);
+      const feeInCents = Math.round(feeAmount * 100);
+
+      // Guard: Stripe requires application_fee_amount < amount
+      if (!(feeInCents >= 0 && feeInCents < amountInCents)) {
+        console.warn("[createTransaction] invalid fee/amount cents", {
+          rid, amountInCents, feeInCents, baseAmount, feeAmount, totalCharge
+        });
+        return res.status(400).send({
+          error: "❌ Invalid fee calculation (fee must be < total).",
+          rid,
+          amountInCents,
+          feeInCents,
+        });
+      }
+
+      let type = "ticket";
+      if (ticketQtyNum > 0 && tableQtyNum > 0) type = "mixed";
+      else if (tableQtyNum > 0 && ticketQtyNum === 0) type = "table";
+      const totalQty = ticketQtyNum + tableQtyNum;
+
+      console.log("[createTransaction] computed totals", {
+        rid,
+        ticketQtyNum,
+        tableQtyNum,
+        ticketPriceNum,
+        tablePriceNum,
+        baseAmount,
+        feeAmount,
+        totalCharge,
+        amountInCents,
+        feeInCents,
+        type,
+        totalQty,
+      });
+
+      // ---- Fetch event to discover seller uid ----
+      const esnap = await db.ref("events").child(eventId).get();
+      if (!esnap.exists()) {
+        console.warn("[createTransaction] event not found", { rid, eventId });
+        return res.status(404).send({ error: "❌ Event not found", rid });
+      }
+
+      const ev = esnap.val() || {};
+      const sellerId = String(ev.userId || ev.ownerId || "").trim();
+      if (!sellerId) {
+        console.warn("[createTransaction] missing sellerId in event", { rid, eventId, keys: Object.keys(ev || {}) });
+        return res.status(400).send({ error: "❌ Event missing seller userId/ownerId", rid });
+      }
+
+      // ---- Fetch seller Stripe account id ----
+      const ssnap = await db.ref("users").child(sellerId).child("stripeAccountId").get();
+      const sellerStripeAccountId = ssnap.exists() ? String(ssnap.val() || "").trim() : "";
+
+      console.log("[createTransaction] seller lookup", {
+        rid,
+        sellerId: sellerId.slice(0, 8) + "…",
+        sellerStripeAccountIdPrefix: sellerStripeAccountId ? sellerStripeAccountId.slice(0, 8) + "…" : null,
+      });
+
+      if (!sellerStripeAccountId || !sellerStripeAccountId.startsWith("acct_")) {
+        console.warn("[createTransaction] seller missing stripeAccountId", { rid, sellerId, sellerStripeAccountId });
+        return res.status(409).send({
+          error: "❌ Seller has not connected Stripe (missing stripeAccountId).",
+          rid,
+          sellerId,
+        });
+      }
+
+      // Optional: try to fetch account state for diagnostics (won’t block)
+      // This helps identify “charges not enabled” failures quickly.
+      try {
+        const acct = await stripe.accounts.retrieve(sellerStripeAccountId);
+        console.log("[createTransaction] seller acct state", {
+          rid,
+          acctId: acct.id,
+          charges_enabled: !!acct.charges_enabled,
+          payouts_enabled: !!acct.payouts_enabled,
+          details_submitted: !!acct.details_submitted,
+          requirements_due: Array.isArray(acct.requirements?.currently_due)
+            ? acct.requirements.currently_due.slice(0, 10)
+            : null,
+        });
+      } catch (acctErr) {
+        // Non-fatal
+        console.warn("[createTransaction] could not retrieve seller acct (diag only)", {
+          rid,
+          message: acctErr?.message,
+          code: acctErr?.code,
+        });
+      }
+
+      // ---- Create purchase record FIRST (pending) so webhook can finalize reliably ----
       const timestamp = Math.floor(Date.now() / 1000);
-      const purchaseRef = admin.database().ref(`purchases/${userId}`).push();
+      const purchaseRef = db.ref(`purchases/${userId}`).push();
+      const purchaseId = purchaseRef.key;
+
+      if (!purchaseId) {
+        console.error("[createTransaction] could not allocate purchase id", { rid });
+        return res.status(500).send({ error: "❌ Could not allocate purchase id", rid });
+      }
+
       await purchaseRef.set({
-        id: purchaseRef.key,
-        userId,
+        id: purchaseId,
+        rid,
+
+        userId, // buyer
+        sellerId,
+
         eventId,
         eventTitle: eventName,
         eventImagePath,
+
         quantity: totalQty,
         type,
+
         ticketQty: ticketQtyNum,
         ticketPrice: ticketPriceNum,
         tableQty: tableQtyNum,
         tablePrice: tablePriceNum,
+
         baseAmount,
         platformFee: feeAmount,
         totalAmount: totalCharge,
+        platformFeeRate: PLATFORM_FEE_RATE,
+
         timestamp,
-        eventTime: eventTime ? parseInt(eventTime) : null,
+        eventTime: eventTime ? parseInt(eventTime, 10) : null,
+
         paymentMethod: "card",
+
+        // Stripe fields (pending until confirmed)
+        stripePaymentIntentId: null,
+        stripeStatus: "pending",
+        stripeChargeId: null,
+        payoutStripeAccountId: sellerStripeAccountId,
+
+        updatedAt: timestamp,
       });
 
-      res.status(200).send({ success: true, transactionId: result.transaction.id });
+      // ---- Create destination charge PaymentIntent ----
+      let pi;
+      try {
+        const returnUrl =
+          `https://blackappios.web.app/stripeReturn.html?purchaseId=${encodeURIComponent(purchaseId)}&userId=${encodeURIComponent(userId)}`;
+
+        // Strongly recommended: idempotency so client retries don’t double-charge.
+        // This key ties the Stripe request to a unique purchase record.
+        const idempotencyKey = `pi_${purchaseId}`;
+
+        console.log("[createTransaction] creating PI", {
+          rid,
+          purchaseId,
+          idempotencyKey,
+          destination: sellerStripeAccountId,
+          amountInCents,
+          feeInCents,
+          currencyLower,
+        });
+
+        pi = await stripe.paymentIntents.create(
+          {
+            amount: amountInCents,
+            currency: currencyLower,
+            payment_method: paymentMethodId,
+            confirm: true,
+
+            // If you’re explicitly handling next_action on iOS, this is fine.
+            // automatic_payment_methods can be kept enabled.
+            automatic_payment_methods: { enabled: true },
+            return_url: returnUrl,
+
+            application_fee_amount: feeInCents,
+            transfer_data: { destination: sellerStripeAccountId },
+
+            metadata: {
+              purchaseId,
+              rid,
+              buyerId: userId,
+              sellerId,
+              eventId,
+              eventName,
+              eventImagePath,
+
+              ticketQty: String(ticketQtyNum),
+              tableQty: String(tableQtyNum),
+              ticketPrice: String(ticketPriceNum),
+              tablePrice: String(tablePriceNum),
+
+              baseAmount: String(baseAmount),
+              platformFee: String(feeAmount),
+              totalAmount: String(totalCharge),
+              platformFeeRate: String(PLATFORM_FEE_RATE),
+              payoutStripeAccountId: sellerStripeAccountId,
+            },
+          },
+          { idempotencyKey }
+        );
+
+        console.log("[createTransaction] PI created", {
+          rid,
+          purchaseId,
+          piId: pi.id,
+          status: pi.status,
+          nextActionType: pi.next_action?.type || null,
+        });
+      } catch (stripeErr) {
+        logStripeError("❌ Stripe PI create/confirm error", stripeErr);
+
+        const now = Math.floor(Date.now() / 1000);
+        await purchaseRef.update({
+          stripeStatus: "failed",
+          stripeError: stripeErr?.raw?.message || stripeErr?.message || "Stripe PI creation failed",
+          stripeErrorCode: stripeErr?.raw?.code || stripeErr?.code || null,
+          stripeErrorParam: stripeErr?.raw?.param || stripeErr?.param || null,
+          stripeRequestId: stripeErr?.requestId || null,
+          updatedAt: now,
+        });
+
+        // Return structured error to iOS so you can display the real reason.
+        return res.status(400).send({
+          error: stripeErr?.raw?.message || stripeErr?.message || "Payment failed",
+          rid,
+          stripe: {
+            message: stripeErr?.raw?.message || stripeErr?.message || null,
+            type: stripeErr?.type || stripeErr?.rawType || null,
+            code: stripeErr?.raw?.code || stripeErr?.code || null,
+            decline_code: stripeErr?.raw?.decline_code || stripeErr?.decline_code || null,
+            param: stripeErr?.raw?.param || stripeErr?.param || null,
+            requestId: stripeErr?.requestId || null,
+          },
+        });
+      }
+
+      // Persist PI for webhook reconciliation + UI
+      await purchaseRef.update({
+        stripePaymentIntentId: pi.id,
+        stripeStatus: pi.status,
+        stripeClientSecret: pi.client_secret || null,
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+
+      return res.status(200).send({
+        ok: true,
+        rid,
+        purchaseId,
+        paymentIntent: {
+          id: pi.id,
+          status: pi.status,
+          clientSecret: pi.client_secret,
+          nextAction: pi.next_action || null,
+        },
+      });
     } catch (error) {
-      console.error("❌ Transaction failed:", error);
-      res.status(500).send({ error: error.message || "Unknown server error" });
+      // This catches non-Stripe exceptions (coding issues, RTDB issues, etc.)
+      console.error("❌ createTransaction failed (outer):", {
+        rid,
+        message: error?.message,
+        stack: error?.stack,
+      });
+      return res.status(500).send({
+        error: error?.message || "createTransaction failed",
+        rid,
+      });
     }
   })
 );
 
+
+// ====================================================================
+// 4) STRIPE WEBHOOK (RAW BODY VERIFIED) — REQUIRED FOR PRODUCTION SAFETY
+// IMPORTANT: Do NOT wrap with withCors. Must use req.rawBody.
+// Configure Stripe webhook endpoint to this URL and paste whsec_... into functions config.
+// ====================================================================
+exports.stripeWebhook = fn.https.onRequest(async (req, res) => {
+  try {
+    if (req.method !== "POST") return res.status(405).send("Method not allowed");
+
+    const stripe = requireStripe();
+    const functions = require("firebase-functions/v1");
+
+    const whsec = functions.config().stripe?.webhook_secret;
+    if (!whsec) {
+      console.error("❌ Missing stripe.webhook_secret in functions config");
+      return res.status(500).send("Webhook secret not configured");
+    }
+
+    const sig = req.headers["stripe-signature"];
+    if (!sig) {
+      console.error("❌ Missing stripe-signature header");
+      return res.status(400).send("Missing stripe-signature header");
+    }
+
+    let evt;
+    try {
+      evt = stripe.webhooks.constructEvent(req.rawBody, sig, whsec);
+    } catch (err) {
+      console.error("❌ Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    const db = admin.database();
+    console.log("🔔 Stripe webhook event:", evt.type);
+
+    switch (evt.type) {
+      case "payment_intent.succeeded": {
+        const pi = evt.data.object;
+
+        const buyerId = pi.metadata?.buyerId || pi.metadata?.userId || null;
+        const eventId = pi.metadata?.eventId || null;
+
+        if (buyerId && eventId) {
+          await db.ref("purchasesByIntent").child(pi.id).set({
+            buyerId,
+            eventId,
+            status: pi.status,
+            amount: (pi.amount || 0) / 100,
+            currency: pi.currency || "usd",
+            updatedAt: Math.floor(Date.now() / 1000),
+            metadata: pi.metadata || {},
+          });
+          console.log("✅ payment_intent.succeeded reconciled:", pi.id);
+        } else {
+          console.log("ℹ️ payment_intent.succeeded without buyerId/eventId metadata:", pi.id);
+        }
+        break;
+      }
+
+      case "payment_intent.payment_failed": {
+        const pi = evt.data.object;
+        await db.ref("failedIntents").child(pi.id).set({
+          status: pi.status,
+          last_payment_error: pi.last_payment_error?.message || "",
+          updatedAt: Math.floor(Date.now() / 1000),
+          metadata: pi.metadata || {},
+        });
+        console.log("⚠️ payment_intent.payment_failed logged:", pi.id);
+        break;
+      }
+
+      case "account.updated": {
+        const acct = evt.data.object;
+
+        // Store a normalized snapshot of the Stripe account state
+        await db.ref("stripeAccounts").child(acct.id).update({
+          charges_enabled: !!acct.charges_enabled,
+          payouts_enabled: !!acct.payouts_enabled,
+          details_submitted: !!acct.details_submitted,
+          updatedAt: Math.floor(Date.now() / 1000),
+        });
+
+        // If we stored firebaseUID in account.metadata, also update the user's node
+        const firebaseUID =
+          (acct.metadata && (acct.metadata.firebaseUID || acct.metadata.firebaseUid)) || null;
+
+        if (firebaseUID) {
+          const onboardingComplete = !!(acct.details_submitted && acct.charges_enabled);
+
+          await db.ref("users").child(firebaseUID).update({
+            stripeAccountId: acct.id,
+            stripeAccountUpdatedAt: Math.floor(Date.now() / 1000),
+            stripeOnboardingComplete: onboardingComplete,
+            stripeChargesEnabled: !!acct.charges_enabled,
+            stripePayoutsEnabled: !!acct.payouts_enabled,
+          });
+
+          console.log("✅ account.updated mirrored to user:", {
+            acctId: acct.id,
+            firebaseUID,
+            onboardingComplete,
+          });
+        } else {
+          console.log("ℹ️ account.updated without firebaseUID metadata. acct.id:", acct.id);
+        }
+
+        break;
+      }
+
+      case "payout.paid":
+      case "payout.failed": {
+        const payout = evt.data.object;
+        await db.ref("stripePayouts").child(payout.id).set({
+          status: payout.status,
+          amount: (payout.amount || 0) / 100,
+          currency: payout.currency || "usd",
+          arrival_date: payout.arrival_date || null,
+          updatedAt: Math.floor(Date.now() / 1000),
+        });
+        console.log("💸 payout event stored:", { id: payout.id, status: payout.status });
+        break;
+      }
+
+      default: {
+        // Unhandled event types are just acknowledged
+        console.log("ℹ️ Unhandled Stripe event type:", evt.type);
+        break;
+      }
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("❌ stripeWebhook handler error:", err);
+    return res.status(500).send("Webhook handler error");
+  }
+});
+
+
+// ====================================================================
+// 5) AGDashboard revenue summary (UPDATED to count ticket + table separately)
+// ====================================================================
 exports.getPlatformRevenue = fn.https.onRequest(
   withCors(async (_req, res) => {
     try {
@@ -1145,22 +1642,30 @@ exports.getPlatformRevenue = fn.https.onRequest(
       let totalRevenue = 0;
       let platformEarnings = 0;
       const totalEvents = new Set();
+
       let ticketsSold = 0;
+      let tablesSold = 0;
 
       snapshot.forEach((userSnap) => {
         userSnap.forEach((purchaseSnap) => {
-          const data = purchaseSnap.val();
+          const data = purchaseSnap.val() || {};
           const total = parseFloat(data.totalAmount) || 0;
           const fee = parseFloat(data.platformFee) || 0;
-          const qty = parseInt(data.ticketQty) || 0;
+
+          const tQty = parseInt(data.ticketQty) || 0;
+          const tbQty = parseInt(data.tableQty) || 0;
+
           const eventId = data.eventId;
           const userId = data.userId;
 
           if (!userId || !eventId || isNaN(total) || total <= 0) return;
+
           totalEvents.add(eventId);
           platformEarnings += fee;
           totalRevenue += total;
-          ticketsSold += qty;
+
+          ticketsSold += tQty;
+          tablesSold += tbQty;
         });
       });
 
@@ -1169,6 +1674,7 @@ exports.getPlatformRevenue = fn.https.onRequest(
         totalRevenue: totalRevenue.toFixed(2),
         totalEvents: totalEvents.size,
         ticketsSold,
+        tablesSold,
       });
     } catch (err) {
       console.error("❌ Revenue summary failed:", err);
@@ -1177,75 +1683,228 @@ exports.getPlatformRevenue = fn.https.onRequest(
   })
 );
 
+// ====================================================================
+// 6) Hosted checkout redirect helper (kept)
+// ====================================================================
 exports.getCheckoutURL = fn.https.onRequest(
   withCors((req, res) => {
     const { amount, description } = req.query || {};
-    if (!amount || !description) return res.status(400).send({ error: "Missing amount or description" });
-    const redirectURL = `https://blackappios.web.app/?amount=${amount}&desc=${encodeURIComponent(description)}`;
-    res.status(200).send({ checkoutURL: redirectURL });
+    if (!amount || !description) {
+      return res.status(400).send({ error: "Missing amount or description" });
+    }
+
+    // Prefer config so you can switch hosts without code changes:
+    // firebase functions:config:set app.checkout_base_url="https://black-app-web.web.app/"
+    const functions = require("firebase-functions/v1");
+    const base = (functions.config().app && functions.config().app.checkout_base_url) || "https://black-app-web.web.app/";
+
+    const redirectURL = `${String(base).replace(/\/+$/, "/")}?amount=${amount}&desc=${encodeURIComponent(description)}`;
+    return res.status(200).send({ checkoutURL: redirectURL });
   })
 );
 
+
+// ====================================================================
+// 7) Ping (kept)
+// ====================================================================
 exports.ping = fn.https.onRequest(
   withCors(async (_req, res) => {
     res.status(200).json({ ok: true, ts: Date.now() });
   })
 );
 
-
 // ====================================================================
-// B) BRAND UNIVERSAL CHECKOUT (USD-only for now)
+// B) BRAND UNIVERSAL CHECKOUT (USD-only for now) — UNCHANGED
 // ====================================================================
 
-// Plain-text client token for hosted page (kept separate name from JSON one above)
+// Plain-text publishable key for hosted pages (kept name `client_token` for compatibility)
 exports.client_token = fn.https.onRequest(
   withCors(async (_req, res) => {
     try {
-      const { clientToken } = await gateway.clientToken.generate({});
-      res.status(200).send(clientToken); // plain text
+      if (!STRIPE_PUBLISHABLE_KEY) {
+        console.warn("⚠️ [Stripe] Missing publishable key for client_token endpoint.");
+        return res.status(500).send("Stripe publishable key not configured");
+      }
+      res.status(200).send(STRIPE_PUBLISHABLE_KEY);
     } catch (error) {
-      console.error("❌ Token generation failed:", error);
+      console.error("❌ client_token (Stripe) failed:", error);
       res.status(500).send("Token generation failed");
     }
   })
 );
 
-// USD-only charge (no merchantAccountId → default USD account)
+// Generic Stripe charge endpoint (name kept as charge_braintree for now to avoid breaking callers)
 exports.charge_braintree = fn.https.onRequest(
   withCors(async (req, res) => {
     try {
-      const { nonce, amount, currency = "USD" } = req.body || {};
+      const stripe = requireStripe();
+
+      const { paymentMethodId, amount, currency = "USD" } = req.body || {};
       const amt = Number(amount);
-      const cur = String(currency).toUpperCase();
+      const cur = String(currency).toLowerCase();
 
-      if (!nonce || !amt || isNaN(amt) || amt <= 0) {
-        return res.status(400).json({ ok: false, error: "Missing or invalid nonce/amount" });
+      if (!paymentMethodId || !amt || isNaN(amt) || amt <= 0) {
+        return res.status(400).json({ ok: false, error: "Missing or invalid paymentMethodId/amount" });
       }
-      if (cur !== "USD") {
-        return res.status(400).json({ ok: false, errorCode: "UNSUPPORTED_CURRENCY", error: "Only USD is supported" });
+      if (cur !== "usd") {
+        return res.status(400).json({
+          ok: false,
+          errorCode: "UNSUPPORTED_CURRENCY",
+          error: "Only USD is supported right now",
+        });
       }
 
-      const result = await gateway.transaction.sale({
-        amount: amt.toFixed(2),
-        paymentMethodNonce: nonce,
-        options: { submitForSettlement: true },
+      const pi = await stripe.paymentIntents.create({
+        amount: Math.round(amt * 100),
+        currency: cur,
+        payment_method: paymentMethodId,
+        confirm: true,
+        automatic_payment_methods: { enabled: true },
+        metadata: {
+          context: "charge_braintree_legacy",
+        },
       });
 
-      if (!result.success) {
-        return res.status(400).json({ ok: false, error: result.message || "Transaction unsuccessful" });
-      }
+      // Update purchase with PI results (keep as you already do)
+const now = Math.floor(Date.now() / 1000);
+await purchaseRef.update({
+  stripePaymentIntentId: pi.id,
+  stripeStatus: pi.status || "unknown",
+  stripeChargeId: pi.latest_charge || null,
+  updatedAt: now,
+});
+
+// ✅ Handle SCA / 3DS flows
+// Common statuses you will see:
+// - succeeded
+// - requires_action (needs 3DS challenge on client)
+// - requires_payment_method (card failed / invalid)
+// - processing (rare but possible)
+if (pi.status === "requires_action") {
+  console.log("🔐 PaymentIntent requires action (3DS/SCA):", pi.id);
+
+  // Keep purchase pending until client completes 3DS and calls finalizeTransaction
+  await purchaseRef.update({
+    stripeStatus: "requires_action",
+    updatedAt: Math.floor(Date.now() / 1000),
+  });
+
+  return res.status(200).send({
+    success: false,
+    requiresAction: true,
+    purchaseId,
+    paymentIntentId: pi.id,
+    paymentIntentClientSecret: pi.client_secret, // ✅ critical for iOS to complete auth
+    status: pi.status,
+    baseAmount,
+    platformFee: feeAmount,
+    totalAmount: totalCharge,
+  });
+}
+
+// ✅ Success path
+if (pi.status === "succeeded" || pi.status === "requires_capture") {
+  return res.status(200).send({
+    success: true,
+    purchaseId,
+    paymentIntentId: pi.id,
+    status: pi.status,
+    baseAmount,
+    platformFee: feeAmount,
+    totalAmount: totalCharge,
+    sellerId,
+    sellerStripeAccountId,
+    amountInCents,
+    feeInCents,
+  });
+}
+
+// Other non-success statuses: return a clean error (client can show message)
+console.error("❌ PaymentIntent not completed:", pi.status);
+await purchaseRef.update({
+  stripeStatus: pi.status || "failed",
+  stripeError: `Stripe status: ${pi.status}`,
+  updatedAt: Math.floor(Date.now() / 1000),
+});
+
+return res.status(400).send({
+  error: `Stripe payment status: ${pi.status}`,
+  paymentIntentId: pi.id,
+  purchaseId,
+});
+
 
       res.status(200).json({
         ok: true,
-        txnId: result.transaction.id,
-        paymentType: result.transaction.paymentInstrumentType, // 'credit_card' | 'paypal_account'
+        paymentIntentId: pi.id,
+        paymentStatus: pi.status,
       });
     } catch (err) {
-      console.error("❌ charge_braintree error:", err);
+      console.error("❌ charge_braintree (Stripe) error:", err);
       res.status(500).json({ ok: false, error: err.message || "Unknown server error" });
     }
   })
 );
+
+
+// ====================================================================
+// 5) finalizeTransaction — after iOS completes 3DS/SCA
+// iOS calls this with purchaseId + buyer userId + paymentIntentId
+// ====================================================================
+exports.finalizeTransaction = fn.https.onRequest(
+  withCors(async (req, res) => {
+    try {
+      if (req.method === "OPTIONS") return res.status(204).send("");
+      if (req.method !== "POST") return res.status(405).send({ error: "Method not allowed" });
+
+      const stripe = requireStripe();
+      const db = admin.database();
+
+      const { userId, purchaseId, paymentIntentId } = req.body || {};
+      if (!userId || !purchaseId || !paymentIntentId) {
+        return res.status(400).send({ error: "Missing required fields (userId, purchaseId, paymentIntentId)" });
+      }
+
+      // Retrieve latest PI state from Stripe
+      // Expand charges so latest_charge is consistently available
+      const pi = await stripe.paymentIntents.retrieve(paymentIntentId, {
+        expand: ["latest_charge"],
+      });
+
+      const now = Math.floor(Date.now() / 1000);
+      const purchaseRef = db.ref(`purchases/${userId}/${purchaseId}`);
+
+      await purchaseRef.update({
+        stripePaymentIntentId: pi.id,
+        stripeStatus: pi.status || "unknown",
+        stripeChargeId: (pi.latest_charge && pi.latest_charge.id) ? pi.latest_charge.id : (pi.latest_charge || null),
+        updatedAt: now,
+      });
+
+      if (pi.status === "succeeded" || pi.status === "requires_capture") {
+        return res.status(200).send({
+          success: true,
+          status: pi.status,
+          paymentIntentId: pi.id,
+          purchaseId,
+        });
+      }
+
+      return res.status(200).send({
+        success: false,
+        status: pi.status,
+        paymentIntentId: pi.id,
+        purchaseId,
+        error: pi.last_payment_error?.message || `Payment not completed: ${pi.status}`,
+      });
+    } catch (error) {
+      console.error("❌ finalizeTransaction failed:", error);
+      return res.status(500).send({ error: error.message || "Unknown server error" });
+    }
+  })
+);
+
+
 
 
 // GET /gossipRss?partner=a1lounge&limit=30   or  /gossipRss?all=1&limit=50
@@ -2357,58 +3016,6 @@ async function loadNightlifeHashtagItems({ maxAgeDays = 7 } = {}) {
 
 
 
-// ===============================
-// Helper: AI Crew → bundle items
-// ===============================
-async function fetchAICrewPostsForBundle({ limit = 60, thumbWidth = 900 } = {}) {
-  try {
-    const snap = await rtdb
-      .ref("gossip/posts")
-      .orderByChild("timestamp")
-      .limitToLast(limit) // newest
-      .get();
-
-    if (!snap.exists()) return [];
-
-    const out = [];
-    snap.forEach((ch) => {
-      const it = ch.val() || {};
-      if ((it.source || "") !== "ai-scraper") return; // only AI crew
-      const id      = it.id || ch.key;
-      const title   = it.text || "Untitled";
-      const link    = it.eventUrl || it.link || "";
-      const image   = it.imageUrl || it.thumb || "";
-      const pubDate = Number(it.timestamp || Date.now());
-      const kind    = "nightlife";
-      const source  = "ai-scraper";
-
-      out.push({
-        id,
-        title: String(title).slice(0, 200),
-        link,
-        summary: "", // we don’t have long descriptions from scrapes
-        pubDate,
-        image: image || null,
-        thumb: cfUrl("imgThumb", {
-          url: image || "",
-          w: thumbWidth,
-          fallback: getLogoFallback(),
-          fallbackScale: 0.25,
-        }),
-        aspect: null,
-        kind,
-        source,
-      });
-    });
-
-    // newest first
-    return out.sort((a, b) => (b.pubDate || 0) - (a.pubDate || 0));
-  } catch (e) {
-    console.warn("[fetchAICrewPostsForBundle] error:", e?.message || e);
-    return [];
-  }
-}
-
 
       async function fetchUserPosts(limit = 120) {
         try {
@@ -2469,57 +3076,6 @@ async function fetchAICrewPostsForBundle({ limit = 60, thumbWidth = 900 } = {}) 
       }
 
 
-
-
-
-// ===============================
-// Helper: XNews → bundle items
-// ===============================
-async function fetchXNewsForBundle({ limit = 40, thumbWidth = 900 } = {}) {
-  try {
-    const snap = await rtdb
-      .ref("gossip/xnews/items")
-      .orderByChild("pubDate")
-      .limitToLast(limit)
-      .get();
-
-    if (!snap.exists()) return [];
-
-    const items = [];
-    snap.forEach((child) => {
-      const it = child.val() || {};
-      const id      = it.id || child.key;
-      const title   = it.title || it.text || "Untitled";
-      const link    = it.link || it.url || "";
-      const image   = it.image || it.thumb || "";
-      const pubDate = Number(it.pubDate || Date.now());
-      const source  = it.source || "xnews";
-
-      items.push({
-        id,
-        title: String(title).slice(0, 200),
-        link,
-        summary: it.summary || it.description || "",
-        pubDate,
-        image: image || null,
-        thumb: cfUrl("imgThumb", {
-          url: image || "",
-          w: thumbWidth,
-          fallback: getLogoFallback(),
-          fallbackScale: 0.25,
-        }),
-        aspect: null,
-        kind: "news",
-        source,
-      });
-    });
-
-    return items.sort((a, b) => (b.pubDate || 0) - (a.pubDate || 0));
-  } catch (e) {
-    console.warn("[fetchXNewsForBundle] error:", e?.message || e);
-    return [];
-  }
-}
 // ===============================================
 // Helper: Build a Cloud Function thumb URL
 // (does not rely on any global helpers)
@@ -2647,7 +3203,7 @@ const isThumbUrl = (u) =>
   /cloudfunctions\.net\/imgThumb|blackapp\.io\/api\/imgThumb/i.test(String(u || ""));
 
 // Build a thumb only if it's not already a thumb URL
-const thumbFor = (img, givenThumb, w) => {
+const mkthumb = (img, givenThumb, w) => {
   const candidate = givenThumb || img || "";
   if (isThumbUrl(candidate)) return candidate;
   return cfUrl("imgThumb", {
@@ -2748,13 +3304,14 @@ function stripThumb(u) {
 }
 
 
-      const thumbFor = (img) =>
-        cfUrl("imgThumb", {
-          url: img || "",
-          w: thumbWidth,
-          fallback: logoFallback,
-          fallbackScale: 0.25,
-        });
+      const mkThumb = (img) =>
+  cfUrl("imgThumb", {
+    url: img || "",
+    w: thumbWidth,
+    fallback: logoFallback,
+    fallbackScale: 0.25,
+  });
+
 
       // Strip invalid surrogate range chars so iOS / jq don't choke
       const BAD_SURROGATE_RE = /[\uD800-\uDFFF]/g;
@@ -3094,7 +3651,7 @@ if (typeof v.mediaURL === "string" && /^https?:\/\//i.test(v.mediaURL)) {
             ),
             pubDate: pub,
             image: rawCandidate,
-            thumb: thumbFor(rawCandidate),
+            thumb: mkthumb(rawCandidate),
             kind: "nightlife",
             source: String(it.source || "instagram-partner"),
             platform: "instagram",
@@ -3106,17 +3663,17 @@ if (typeof v.mediaURL === "string" && /^https?:\/\//i.test(v.mediaURL)) {
 
       const aiNorm = (aiCrew || []).map((it) => ({
         ...it,
-        thumb: thumbFor(it.image || it.thumb || ""),
+        thumb: mkthumb(it.image || it.thumb || ""),
       }));
 
       const rssNormRaw = (rssItems || []).map((it) => ({
         ...it,
-        thumb: thumbFor(it.image || it.thumb || ""),
+        thumb: mkthumb(it.image || it.thumb || ""),
       }));
 
       const xNorm = (xnews || []).map((it) => ({
         ...it,
-        thumb: thumbFor(it.image || it.thumb || ""),
+        thumb: mkthumb(it.image || it.thumb || ""),
       }));
 
       // For *user* posts we trust the original image URL that already works
@@ -5363,220 +5920,174 @@ exports.baPostsProbe = fn.https.onRequest(async (req, res) => {
 });
 
 
-
-// Image resize proxy with smarter contain/cover behavior:
-// - NEW: mode=fluid (default) → no-crop, no padding, height computed from source aspect
-// - mode=canvas → fixed WxH canvas; use fit=contain|cover|inside|fillmax; bg color applied
-// - fit=fillmax: if aspect delta ≤ 10%, use cover (minimal crop), else contain (no crop)
-// - ar=auto honors source aspect (when mode=fluid or when computing H)
-// - fmt=webp|jpg; default webp
+// Image resize proxy with centered-logo fallback + caching + safe fetch
 exports.imgThumb = fn.https.onRequest(async (req, res) => {
-  try {
-    const srcUrl = String(q(req, "url") || "");
-    const fmt = String(q(req, "fmt") || "webp").toLowerCase();             // webp | jpg | jpeg
-    const w   = Math.max(120, Math.min(Number(q(req, "w")) || 900, 2000)); // target width
+  // --- CORS (safe for iOS/web) ---
+  res.set("Access-Control-Allow-Origin", "*");
+  if (req.method === "OPTIONS") {
+    res.set("Access-Control-Allow-Methods", "GET,OPTIONS");
+    res.set("Access-Control-Allow-Headers", "Content-Type");
+    return res.status(204).end();
+  }
 
-    // Default to "fluid" so images don't end up as tiny postcards in a fixed canvas.
-    // In fluid mode: we compute height from the source aspect (no padding, no crop).
-    const mode = (q(req, "mode") || "fluid").toLowerCase();                // fluid | canvas
+  // --- helpers ---
+  const _q = (name) => {
+    const v = req.query && req.query[name];
+    return typeof v === "string" && v.trim() ? v.trim() : undefined;
+  };
 
-    // When mode=canvas, you can still pass a strict height (h) or aspect (ar).
-    // If ar=auto, we’ll compute H from source aspect as best as possible.
-    const arStr = String(q(req, "ar") || "16:9").toLowerCase();            // e.g., "auto", "1:1", "4:5", "16:9"
-    const fitReq = (q(req, "fit") || (mode === "canvas" ? "contain" : "contain")).toLowerCase();
-    const bgParam = q(req, "bg");
-    const bgColor =
-      (bgParam && bgParam.toLowerCase() === "transparent")
-        ? { r: 0, g: 0, b: 0, alpha: 0 }
-        : (bgParam || "#ffffff"); // default white for nicer letterbox in light UIs
+  const fmt = String(_q("fmt") || "webp").toLowerCase();
+  const w = Math.max(120, Math.min(Number(_q("w")) || 900, 2000));
 
-    // Fallback logo control (still centered, 25% width by default)
-    const fallbackUrl = String(q(req, "fallback") || getLogoFallback() || FALLBACK_LOGO || "");
-    const fallbackScale = Math.max(0.05, Math.min(Number(q(req, "fallbackScale")) || 0.25, 0.9));
+  const arStr = String(_q("ar") || "16:9");
+  const [aw, ah] = arStr.includes(":") ? arStr.split(":").map(Number) : [16, 9];
+  const h = Math.max(80, Math.round(w * ((ah || 9) / (aw || 16))));
 
-    // Hard upstream timeout to keep UI snappy
-    const HARD_MS = 1400;
+  const fit = String(_q("fit") || "cover").toLowerCase(); // cover | contain | fill
+  const bg = String(_q("bg") || "transparent");           // "#111111" or "transparent"
+  const cb = String(_q("cb") || "");                      // cache buster (optional)
+
+  const url = String(_q("url") || "");
+  const fallbackUrl = String(_q("fallback") || (typeof getLogoFallback === "function" ? getLogoFallback() : "") || FALLBACK_LOGO || "");
+  const scale = Math.max(0.05, Math.min(Number(_q("fallbackScale")) || 0.25, 0.9));
+
+  const contentType =
+    (fmt === "jpg" || fmt === "jpeg") ? "image/jpeg" :
+    (fmt === "png") ? "image/png" :
+    "image/webp";
+
+  function setCachingHeaders(etag) {
+    // CDN-friendly caching:
+    // - immutable because the URL can carry cb= or the upstream image URL changes
+    // - keep s-maxage longer for CDN
+    res.set("Content-Type", contentType);
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=604800, immutable");
+    if (etag) res.set("ETag", etag);
+  }
+
+  function makeEtag(parts) {
+    // cheap stable hash; good enough for conditional requests
+    const crypto = require("crypto");
+    return crypto.createHash("sha1").update(parts.join("|")).digest("hex");
+  }
+
+  async function fetchBuf(u, timeoutMs = 9000) {
+    const { fetch: undiciFetch } = require("undici");
+    const f = (typeof globalThis.fetch === "function") ? globalThis.fetch : undiciFetch;
+
     const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), HARD_MS);
+    const t = setTimeout(() => ac.abort(), timeoutMs);
 
-    const setCT = () => res.set("Content-Type", (fmt === "jpg" || fmt === "jpeg") ? "image/jpeg" : "image/webp");
-    const cacheReal = () => res.set("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=60, stale-if-error=600");
-    const cacheFallback = () => res.set("Cache-Control", "no-store, must-revalidate");
-
-    // --- Load upstream (if any) ---
-    let upstreamBuf = null;
     try {
-      if (/^https?:\/\//i.test(srcUrl)) {
-        const upstream = await undiciFetch(srcUrl, { redirect: "follow", signal: ac.signal });
-        if (upstream && upstream.ok) upstreamBuf = Buffer.from(await upstream.arrayBuffer());
-      }
-    } catch (_) {
-      // ignore; we’ll render fallback below
+      const r = await f(u, {
+        method: "GET",
+        redirect: "follow",
+        signal: ac.signal,
+        headers: {
+          "User-Agent": "BlackAppThumbProxy/1.0",
+          "Accept": "image/*,*/*;q=0.8",
+        }
+      });
+
+      if (!r.ok) throw new Error(`upstream ${r.status}`);
+
+      // node-fetch v2 has buffer(); undici has arrayBuffer()
+      if (typeof r.buffer === "function") return await r.buffer();
+      const ab = await r.arrayBuffer();
+      return Buffer.from(ab);
     } finally {
       clearTimeout(t);
     }
-
-    // Utility to parse "W:H"
-    function parseAR(s) {
-      if (!s || s === "auto") return null;
-      const m = s.split(":").map(Number);
-      if (m.length === 2 && m[0] > 0 && m[1] > 0) return { aw: m[0], ah: m[1] };
-      return null;
-    }
-    const arPair = parseAR(arStr);
-
-    // Compute a target height when we need a canvas
-    function targetHFromAR() {
-      if (arPair) return Math.max(80, Math.round(w * (arPair.ah / arPair.aw)));
-      // default to 16:9 if we must create a canvas without source metadata
-      return Math.max(80, Math.round(w * 9 / 16));
-    }
-
-async function renderShrunkFallback(hHint) {
-  // Compute a fixed canvas height using requested AR (or default 16:9)
-  const H = Math.max(80, hHint || targetHFromAR());
-
-  // Try to fetch the fallback logo (if configured)
-  let fbBuf = null;
-  if (fallbackUrl) {
-    try {
-      const fbResp = await undiciFetch(fallbackUrl, { redirect: "follow" });
-      if (fbResp && fbResp.ok) fbBuf = Buffer.from(await fbResp.arrayBuffer());
-    } catch {}
   }
 
-  // Always produce a fixed canvas (mode=canvas behavior for fallback),
-  // so the logo size is relative to the canvas, not to the source.
-  const canvas = sharp({
-    create: {
-      width: w,
-      height: H,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 1 },
+  async function renderFallbackCanvas() {
+    if (!fallbackUrl) throw new Error("no fallback available");
+    const sharp = require("sharp");
+    const logoBuf = await fetchBuf(fallbackUrl, 9000);
 
-    },
-  });
+    // base background canvas
+    const base =
+      bg === "transparent"
+        ? sharp({
+            create: { width: w, height: h, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+          })
+        : sharp({
+            create: { width: w, height: h, channels: 3, background: bg }
+          });
 
-  let out;
-  if (fbBuf) {
-    // Scale the logo to 25% (or fallbackScale) of the SHORTER canvas side,
-    // so it is visually consistent in both landscape and portrait tiles.
-    const innerEdge = Math.max(40, Math.round(Math.min(w, H) * fallbackScale));
-    const logoBuf = await sharp(fbBuf)
-      .resize({ width: innerEdge, height: innerEdge, fit: "inside", withoutEnlargement: true })
+    const targetW = Math.max(16, Math.round(w * scale));
+    const targetH = Math.max(16, Math.round(h * scale));
+
+    const logo = await sharp(logoBuf)
+      .resize(targetW, targetH, { fit: "inside", withoutEnlargement: true })
       .toBuffer();
 
-    out = await canvas
-      .composite([{ input: logoBuf, gravity: "center" }])
-      .toFormat((fmt === "jpg" || fmt === "jpeg") ? "jpeg" : "webp", { quality: 80 })
-      .toBuffer();
-  } else {
-    // No logo available; return a clean blank tile
-    out = await canvas
-      .toFormat((fmt === "jpg" || fmt === "jpeg") ? "jpeg" : "webp", { quality: 80 })
+    return await base
+      .composite([{ input: logo, gravity: "center" }])
+      .toFormat(fmt === "jpg" || fmt === "jpeg" ? "jpeg" : (fmt === "png" ? "png" : "webp"), {
+        quality: 80
+      })
       .toBuffer();
   }
 
-  cacheFallback(); setCT();
-  res.set("X-Thumb-Status", "fallback-canvas-25p");
-  res.set("Retry-After", "5");
-  return res.status(200).send(out);
-}
+  async function renderImage(buf) {
+    const sharp = require("sharp");
 
+    let bgColor = undefined;
+    if (bg !== "transparent") bgColor = bg;
 
-    // If no upstream, render fallback
-    if (!upstreamBuf) return await renderShrunkFallback(null);
+    const resizeFit =
+      fit === "contain" ? "contain" :
+      fit === "fill" ? "fill" :
+      "cover";
 
-    // --- We have upstream: read metadata to decide layout smartly ---
-    let meta;
-    try { meta = await sharp(upstreamBuf).metadata(); } catch { meta = {}; }
-    const sw = Math.max(1, Number(meta.width || 0));
-    const sh = Math.max(1, Number(meta.height || 0));
-    const sAspect = sw / sh;
+    return await sharp(buf, { failOnError: false })
+      .rotate() // respect EXIF orientation
+      .resize(w, h, {
+        fit: resizeFit,
+        background: bgColor
+      })
+      .toFormat(fmt === "jpg" || fmt === "jpeg" ? "jpeg" : (fmt === "png" ? "png" : "webp"), {
+        quality: 80
+      })
+      .toBuffer();
+  }
 
-    // Compute canvas H if we need one
-    let H = arPair ? Math.max(80, Math.round(w * (arPair.ah / arPair.aw))) : null;
-
-    // "fillmax" decision: cover only when aspect close enough (<=10% delta)
-    function pickFit(fitRequested) {
-      if (fitRequested !== "fillmax") return fitRequested;
-      const targetAspect = arPair ? (arPair.aw / arPair.ah) : sAspect;
-      const delta = Math.abs(sAspect - targetAspect) / targetAspect; // relative diff
-      return (delta <= 0.10) ? "cover" : "contain";
+  try {
+    // conditional GET support via ETag
+    const etag = makeEtag([url || "fallback", fallbackUrl || "", fmt, String(w), String(h), fit, bg, cb, String(scale)]);
+    const inm = req.headers["if-none-match"];
+    if (inm && String(inm).includes(etag)) {
+      setCachingHeaders(etag);
+      return res.status(304).end();
     }
 
-    const finalFit = pickFit(fitReq);
+    let out;
 
-    // ==========
-    // MODE: FLUID (default) → no crop, no padding, variable height
-    // ==========
-    if (mode === "fluid") {
-      // Height driven by source aspect (or best effort)
-      const autoH = Math.max(80, Math.round(w / (sAspect || (16 / 9))));
-      let pipe = sharp(upstreamBuf).rotate(); // auto-orient
-      // Resize by width only (no forced height == no padding, no crop)
-      pipe = pipe.resize({ width: w, withoutEnlargement: false });
-      if (fmt === "jpg" || fmt === "jpeg") {
-        pipe = pipe.jpeg({ quality: 82, mozjpeg: true });
-      } else {
-        pipe = pipe.webp({ quality: 80 });
-      }
-      const out = await pipe.toBuffer();
-      cacheReal(); setCT();
-      res.set("X-Thumb-Status", "real-fluid");
-      // Helpful hint for clients that rely on layout sizing
-      res.set("X-Image-Height", String(autoH));
+    if (!url) {
+      out = await renderFallbackCanvas();
+      setCachingHeaders(etag);
       return res.status(200).send(out);
     }
 
-    // ==========
-    // MODE: CANVAS (fixed WxH) → may letterbox/pillarbox or crop
-    // ==========
-    const canvasH = H || targetHFromAR();
-    let pipe = sharp(upstreamBuf).rotate(); // auto-orient
-
-    // Map our fits to sharp options
-    const sharpFit =
-      finalFit === "contain" ? "contain" :
-      finalFit === "cover"   ? "cover"   :
-      finalFit === "inside"  ? "inside"  :
-      "contain";
-
-    pipe = pipe.resize({
-      width: w,
-      height: canvasH,
-      fit: sharpFit,
-      position: "center",
-      background: { r: 0, g: 0, b: 0, alpha: 1 },
-      withoutEnlargement: false,
-    });
-
-    if (fmt === "jpg" || fmt === "jpeg") {
-      pipe = pipe.jpeg({ quality: 82, mozjpeg: true });
-    } else {
-      pipe = pipe.webp({ quality: 80 });
+    try {
+      const srcBuf = await fetchBuf(url, 9000);
+      out = await renderImage(srcBuf);
+      setCachingHeaders(etag);
+      return res.status(200).send(out);
+    } catch (e) {
+      // upstream failed → fallback canvas with centered logo
+      out = await renderFallbackCanvas();
+      setCachingHeaders(etag);
+      return res.status(200).send(out);
     }
-
-    const out = await pipe.toBuffer();
-    cacheReal(); setCT();
-    res.set("X-Thumb-Status", `real-canvas-${finalFit}`);
-    return res.status(200).send(out);
-
   } catch (e) {
-    console.error("imgThumb error", e);
-    try {
-      const w = 900, h = Math.round(900 * 9 / 16);
-      const out = await sharp({ create: { width: w, height: h, channels: 4, background: "#ffffff" } })
-        .webp({ quality: 78 }).toBuffer();
-      res.set("Content-Type", "image/webp");
-      res.set("Cache-Control", "no-store, must-revalidate");
-      res.set("X-Thumb-Status", "fallback-hard");
-      return res.status(200).send(out);
-    } catch {
-      return res.status(500).send("thumb error");
-    }
+    console.error("imgThumb error:", e);
+    res.set("Content-Type", "application/json");
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 // TUNED: write thumbs as JPEG + contain + solid bg by default
 exports.baBackfillPosts = fn.https.onRequest(async (req, res) => {
@@ -6609,8 +7120,8 @@ function _safeCfUrl(url, w) {
   return url || _safeGetLogoFallback();
 }
 
-// ---------- AI Crew → bundle item adapter (with safe helpers) ----------
-async function fetchAICrewPostsForBundle({ limit = 50, city /* e.g. 'Charlotte' or '#Charlotte' */, thumbWidth = 900 }) {
+/* // ---------- AI Crew → bundle item adapter (with safe helpers) ----------
+async function fetchAICrewPostsForBundle({ limit = 50, city e.g. 'Charlotte' or '#Charlotte' , thumbWidth = 900 }) {
   const snap = await rtdb.ref("/gossip/posts").orderByChild("timestamp").limitToLast(500).get();
   if (!snap.exists()) return [];
 
@@ -6650,8 +7161,7 @@ async function fetchAICrewPostsForBundle({ limit = 50, city /* e.g. 'Charlotte' 
         region: p.region || null
       };
     });
-}
-
+} */
 
 
 // === Admin upsert for /gossip/partners (key-guarded) ===
@@ -7322,7 +7832,9 @@ exports.aiOrbHandle = functions
         cards: [Cards.title("Something went wrong"), Cards.subtitle("I’ll keep this graceful so you can continue."), Cards.cta("Start setup", Action.intent("life_sync.onboard.start", {}))]
       });
     }
-  });
+    });
+
+
 
 
 
@@ -7997,3 +8509,370 @@ exports.adminEnrichWallet = functions.region("us-central1").https.onRequest(asyn
     return res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 });
+
+
+// ===============================
+// BLACKAPPMONEY — STRIPE CONNECT LINK ENDPOINT
+// ===============================
+exports.createStripeConnectLink = fn.https.onRequest(async (req, res) => {
+  // CORS (include Authorization)
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
+
+  try {
+    // 1) Verify Firebase ID token
+    const authHeader = req.get("Authorization") || "";
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    const idToken = match ? match[1] : null;
+
+    if (!idToken) {
+      console.error("[BlackAppMoney] Missing Authorization Bearer token");
+      return res.status(401).json({ ok: false, error: "Missing Authorization Bearer token" });
+    }
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+
+    const { mode, platform } = req.body || {};
+    const normalizedMode = String(mode || "").trim(); // "connectExisting" | "getNewAccount"
+
+    console.log("[BlackAppMoney] createStripeConnectLink request:", {
+      uid,
+      mode: normalizedMode,
+      platform,
+    });
+
+    if (!["connectExisting", "getNewAccount"].includes(normalizedMode)) {
+      console.error("[BlackAppMoney] Invalid mode:", normalizedMode);
+      return res.status(400).json({ ok: false, error: "Invalid mode" });
+    }
+
+    const stripe = requireStripe();
+
+    // 2) Read existing Stripe account id from RTDB users/{uid}/stripeAccountId
+    const userRef = admin.database().ref("users").child(uid);
+    const userSnap = await userRef.get();
+    const user = userSnap.exists() ? userSnap.val() : {};
+    let stripeAccountId = (user && user.stripeAccountId) ? String(user.stripeAccountId) : "";
+
+    // 3) If no account, create one (Express)
+    if (!stripeAccountId) {
+      console.log("[BlackAppMoney] No stripeAccountId. Creating Connect account for uid:", uid);
+
+      const email = decoded.email || undefined;
+
+      const acct = await stripe.accounts.create({
+        type: "express",
+        country: "US", // adjust if you want cross-country behavior
+        email,
+        metadata: {
+          firebaseUID: uid,
+          platform: platform || "ios",
+        },
+      });
+
+      stripeAccountId = acct.id;
+
+      await userRef.update({
+        stripeAccountId,
+        stripeAccountUpdatedAt: Math.floor(Date.now() / 1000),
+      });
+
+      console.log("[BlackAppMoney] Created Connect account:", stripeAccountId);
+    }
+
+    // 4) Build redirect URLs from config or env
+    const cfg = (() => {
+      try {
+        return require("firebase-functions/v1").config();
+      } catch {
+        return {};
+      }
+    })();
+
+    const returnUrl =
+      (cfg.stripe && cfg.stripe.return_url) ||
+      process.env.STRIPE_CONNECT_RETURN_URL ||
+      "https://black-app-web.web.app/stripe-return.html";
+
+    const refreshUrl =
+      (cfg.stripe && cfg.stripe.refresh_url) ||
+      process.env.STRIPE_CONNECT_REFRESH_URL ||
+      "https://black-app-web.web.app/stripe-refresh.html";
+
+    console.log("[BlackAppMoney] Using Connect redirect URLs:", {
+      returnUrl,
+      refreshUrl,
+    });
+
+    // 4.1) Validate URLs before calling Stripe so we don't get cryptic "Not a valid URL"
+    try {
+      // throws if invalid
+      new URL(returnUrl);
+      new URL(refreshUrl);
+    } catch (urlErr) {
+      console.error("[BlackAppMoney] Invalid return/refresh URL configuration:", {
+        returnUrl,
+        refreshUrl,
+        error: urlErr.message,
+      });
+      return res.status(500).json({
+        ok: false,
+        error:
+          "Not a valid URL for return/refresh. Check stripe.return_url / stripe.refresh_url in functions config.",
+      });
+    }
+
+    // 5) Decide onboarding vs login link
+    let urlToOpen = "";
+
+    const acct = await stripe.accounts.retrieve(stripeAccountId);
+    const needsOnboarding = !(acct.details_submitted && acct.charges_enabled);
+
+    console.log("[BlackAppMoney] Retrieved account for link:", {
+      stripeAccountId,
+      charges_enabled: acct.charges_enabled,
+      details_submitted: acct.details_submitted,
+      needsOnboarding,
+    });
+
+    if (normalizedMode === "getNewAccount" || needsOnboarding) {
+      const accountLink = await stripe.accountLinks.create({
+        account: stripeAccountId,
+        type: "account_onboarding",
+        refresh_url: refreshUrl,
+        return_url: returnUrl,
+      });
+      urlToOpen = accountLink.url;
+      console.log("[BlackAppMoney] Returning onboarding link:", urlToOpen);
+    } else {
+      const loginLink = await stripe.accounts.createLoginLink(stripeAccountId);
+      urlToOpen = loginLink.url;
+      console.log("[BlackAppMoney] Returning login link:", urlToOpen);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      url: urlToOpen,
+      stripeAccountId,
+    });
+  } catch (err) {
+    console.error("❌ [BlackAppMoney] createStripeConnectLink error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Internal error",
+    });
+  }
+});
+
+
+
+// =====================================================
+// PASSPORT: Claim invite referral (dual-write)
+// URL format: https://blackapp.io/invite?ref=<inviterUid>
+// iOS flow: app stores ref -> after login calls this endpoint
+// =====================================================
+exports.claimInviteReferral = fn.https.onRequest((req, res) => {
+  corsMw(req, res, async () => {
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
+
+    try {
+      // ---- Auth: require Firebase ID token ----
+      const authHeader = req.get("Authorization") || "";
+      const m = authHeader.match(/^Bearer (.+)$/i);
+      if (!m) return res.status(401).json({ error: "Missing Authorization: Bearer <token>" });
+
+      const decoded = await admin.auth().verifyIdToken(m[1], true);
+      const inviteeUid = decoded.uid;
+
+      const inviterUidRaw = (req.body && req.body.inviterUid) ? String(req.body.inviterUid) : "";
+      const inviterUid = inviterUidRaw.trim();
+
+      if (!inviterUid) return res.status(400).json({ error: "Missing inviterUid" });
+      if (inviterUid === inviteeUid) return res.status(400).json({ error: "Self-referral not allowed" });
+
+      // ---- Firestore: idempotent ledger keyed by inviteeUid ----
+      const referralDocRef = firestore.collection("referrals").doc(inviteeUid);
+      const inviteeUserRef  = firestore.collection("users").doc(inviteeUid);
+      const inviterUserRef  = firestore.collection("users").doc(inviterUid);
+
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+
+      // Transaction ensures: only first claim counts
+      const txResult = await firestore.runTransaction(async (tx) => {
+        const existing = await tx.get(referralDocRef);
+        if (existing.exists) {
+          return { ok: true, alreadyClaimed: true, inviterUid: existing.data()?.inviterUid || null };
+        }
+
+        // If invitee already has referredBy, do not re-attribute (keeps it simple + safe)
+        const inviteeSnap = await tx.get(inviteeUserRef);
+        const inviteeData = inviteeSnap.exists ? inviteeSnap.data() : null;
+        const alreadyReferredBy = inviteeData && inviteeData.referredBy ? String(inviteeData.referredBy) : "";
+
+        if (alreadyReferredBy) {
+          // Lock in a ledger entry so we never re-process this invitee again
+          tx.set(referralDocRef, {
+            inviterUid: alreadyReferredBy,
+            inviteeUid,
+            createdAt: nowTs,
+            source: "invite_link",
+            note: "Invitee already had referredBy; did not increment.",
+          });
+          return { ok: true, alreadyClaimed: true, inviterUid: alreadyReferredBy };
+        }
+
+        // Create ledger
+        tx.set(referralDocRef, {
+          inviterUid,
+          inviteeUid,
+          createdAt: nowTs,
+          source: "invite_link",
+        });
+
+        // Mark invitee
+        tx.set(inviteeUserRef, { referredBy: inviterUid }, { merge: true });
+
+        // Increment inviter
+        tx.set(inviterUserRef, { inviteCount: admin.firestore.FieldValue.increment(1) }, { merge: true });
+
+        return { ok: true, alreadyClaimed: false, inviterUid };
+      });
+
+      // ---- RTDB: best-effort dual-write (do not fail whole request if this errors) ----
+      // Firestore remains canonical; RTDB is for fast UI reads if you want it.
+      try {
+        const rtdbReferralRef = rtdb.ref(`referrals/${inviteeUid}`);
+        const rtdbInviteeRef  = rtdb.ref(`users/${inviteeUid}/referredBy`);
+        const rtdbInviterCnt  = rtdb.ref(`users/${inviterUid}/inviteCount`);
+
+        // If already claimed, we still ensure RTDB has referredBy + ledger (no increment)
+        const rtdbNow = Date.now();
+
+        // Write ledger + referredBy
+        await rtdb.ref().update({
+          [`referrals/${inviteeUid}`]: {
+            inviterUid: txResult.inviterUid || inviterUid,
+            inviteeUid,
+            createdAt: rtdbNow,
+            source: "invite_link",
+          },
+          [`users/${inviteeUid}/referredBy`]: txResult.inviterUid || inviterUid,
+        });
+
+        // Only increment RTDB count if Firestore transaction actually incremented
+        if (!txResult.alreadyClaimed) {
+          await rtdbInviterCnt.transaction((cur) => (Number(cur) || 0) + 1);
+        }
+      } catch (e) {
+        console.warn("⚠️ [Invite] RTDB dual-write failed (Firestore succeeded):", e?.message || e);
+      }
+
+      return res.status(200).json({
+        ok: true,
+        inviteeUid,
+        inviterUid: txResult.inviterUid || inviterUid,
+        alreadyClaimed: !!txResult.alreadyClaimed,
+      });
+    } catch (err) {
+      console.error("❌ [Invite] claimInviteReferral error:", err);
+      return res.status(500).json({ error: err?.message || "Unknown error" });
+    }
+  });
+});
+
+
+
+exports.onReferrerLinked = fn.firestore
+  .document("users/{uid}")
+  .onWrite(async (change, context) => {
+    const uid = context.params.uid;
+
+    const after = change.after.exists ? change.after.data() : null;
+    const before = change.before.exists ? change.before.data() : null;
+    if (!after) return;
+
+    const newRef = after.referrer || null;
+    const oldRef = before ? (before.referrer || null) : null;
+
+    // Only act the first time referrer is set
+    if (!newRef || oldRef) return;
+
+    const inviterUid = String(newRef);
+    if (!inviterUid || inviterUid === uid) return;
+
+    const inviterRef = firestore.collection("users").document(inviterUid);
+    const invitedRef = firestore.collection("users").document(uid);
+
+    // Hard idempotency record (prevents double counting forever)
+    // If this doc already exists, we've already credited this inviter for this user.
+    const creditRef = inviterRef.collection("referrals").document(uid);
+
+    let shouldApply = false;
+
+    await firestore.runTransaction(async (tx) => {
+      // If already credited, exit
+      const creditSnap = await tx.get(creditRef);
+      if (creditSnap.exists) return;
+
+      // Optional safety: do not credit if inviter user doc doesn't exist
+      const inviterSnap = await tx.get(inviterRef);
+      if (!inviterSnap.exists) return;
+
+      // Write credit record first (this is the lock)
+      tx.set(creditRef, {
+        referredUid: uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Increment inviter count (authoritative)
+      tx.set(inviterRef, {
+        inviteCount: admin.firestore.FieldValue.increment(1),
+      }, { merge: true });
+
+      // Mark invited user as applied (nice-to-have, but not relied upon for idempotency)
+      tx.set(invitedRef, {
+        referrerApplied: true,
+        referrerAppliedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      shouldApply = true;
+    });
+
+    if (!shouldApply) {
+      console.log(`ℹ️ Referrer link ignored (already credited or inviter missing) uid=${uid} inviter=${inviterUid}`);
+      return;
+    }
+
+    // --- Dual-write mirrors to RTDB ---
+    // 1) Relationship mirror
+    await rtdb.ref().update({
+      [`users/${uid}/referrer`]: inviterUid,
+      [`users/${uid}/referrerApplied`]: true,
+      [`users/${uid}/referrerAppliedAt`]: admin.database.ServerValue.TIMESTAMP,
+    });
+
+    // 2) Mirror inviter count via RTDB transaction increment (no Firestore read needed)
+    await rtdb.ref(`users/${inviterUid}/inviteCount`).transaction((cur) => {
+      if (cur === null || cur === undefined) return 1;
+      const n = Number(cur);
+      return Number.isFinite(n) ? (n + 1) : 1;
+    });
+
+    console.log(`✅ Referrer linked uid=${uid} inviter=${inviterUid}`);
+  });
+
+
+
+

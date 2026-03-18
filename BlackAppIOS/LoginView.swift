@@ -96,7 +96,7 @@ struct LoginView: View {
         }
         .onAppear {
             showLogo = true
-            InviteAutoLinker.primeInviteCodeCapture()
+            //InviteAutoLinker.primeInviteCodeCapture()
         }
         .overlay(alignment: .top) {
             if let toast = infoToast {
@@ -1012,85 +1012,122 @@ private struct CompleteProfileSheet: View {
 
 // MARK: - Invite auto-capture & post-auth linker (unchanged)
 
-fileprivate enum InviteAutoLinker {
-    private static let kCodeKey = "pending_invite_code"
-    private static let kSavedAtKey = "pending_invite_saved_at"
-    private static let ttlHours: Double = 48
-    private static let regex = try! NSRegularExpression(pattern: #"BA-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{7}"#, options: [])
+/*fileprivate enum InviteAutoLinker {
 
-    static func primeInviteCodeCapture() {
-        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-        let full = text as NSString
-        if let m = regex.firstMatch(in: text, options: [], range: NSRange(location: 0, length: full.length)) {
-            let code = full.substring(with: m.range)
-            let ud = UserDefaults.standard
-            if ud.string(forKey: kCodeKey) != code {
-                ud.set(code, forKey: kCodeKey)
-                ud.set(Date().timeIntervalSince1970, forKey: kSavedAtKey)
-                ud.synchronize()
-                print("🔗 [Invite] cached code \(code)")
-            }
-        }
+    // Store inviter UID captured from invite link
+    private static let kInviterKey = "pending_inviter_uid"
+    private static let kSavedAtKey = "pending_inviter_saved_at"
+    private static let ttlHours: Double = 72
+
+    // Call this when app opens from: https://blackapp.io/invite?ref=<uid>
+    static func captureInviterUidFromURL(_ url: URL) {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+        let ref = comps.queryItems?.first(where: { $0.name.lowercased() == "ref" })?.value ?? ""
+        let inviterUid = ref.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inviterUid.isEmpty else { return }
+
+        let ud = UserDefaults.standard
+        ud.set(inviterUid, forKey: kInviterKey)
+        ud.set(Date().timeIntervalSince1970, forKey: kSavedAtKey)
+        ud.synchronize()
+        print("🔗 [Invite] cached inviterUid \(inviterUid)")
     }
 
+    // After auth, attribute invite via Cloud Function (idempotent on backend)
     static func linkInviterIfPresentAfterAuth(completion: ((Bool, String?) -> Void)? = nil) {
-        guard let me = Auth.auth().currentUser?.uid else {
-            completion?(false, nil); return
+        guard let me = Auth.auth().currentUser?.uid else { completion?(false, nil); return }
+        guard let inviterUid = freshCachedInviterUid(), !inviterUid.isEmpty else {
+            completion?(false, nil)
+            return
         }
-        guard let code = freshCachedCode() else {
-            completion?(false, nil); return
+        if inviterUid == me {
+            clearCache()
+            completion?(false, "Invite ignored (self-referral)")
+            return
         }
 
-        let fs = Firestore.firestore()
-        let meRef = fs.collection("users").document(me)
-
-        meRef.getDocument { meDoc, _ in
-            if let meDoc, let data = meDoc.data(), data["referrer"] != nil {
-                clearCache()
-                completion?(false, "Invite already linked")
+        // Get Firebase ID token (required by your Cloud Function)
+        Auth.auth().currentUser?.getIDTokenForcingRefresh(true) { token, err in
+            if let err = err {
+                print("❌ [Invite] failed to get ID token: \(err.localizedDescription)")
+                completion?(false, "Invite link found but couldn’t authenticate.")
+                return
+            }
+            guard let token = token, !token.isEmpty else {
+                completion?(false, "Invite link found but token missing.")
                 return
             }
 
-            fs.collection("inviteCodes").document(code).getDocument { snap, _ in
-                guard let inviter = snap?.data()?["uid"] as? String, !inviter.isEmpty, inviter != me else {
-                    clearCache()
-                    completion?(false, "Invalid invite code")
+            guard let url = URL(string: "https://us-central1-blackappios.cloudfunctions.net/claimInviteReferral") else {
+                completion?(false, "Invalid invite endpoint.")
+                return
+            }
+
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+            let body: [String: Any] = ["inviterUid": inviterUid]
+
+            do {
+                req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
+            } catch {
+                completion?(false, "Couldn’t encode invite request.")
+                return
+            }
+
+            URLSession.shared.dataTask(with: req) { data, response, error in
+                if let error = error {
+                    print("❌ [Invite] claimInviteReferral network error:", error.localizedDescription)
+                    completion?(false, "Invite link found but network failed.")
                     return
                 }
 
-                meRef.setData(["referrer": inviter], merge: true) { err in
-                    if let err = err {
-                        print("❌ [Invite] failed to set referrer: \(err.localizedDescription)")
-                        completion?(false, "Couldn’t link invite")
-                    } else {
-                        clearCache()
-                        print("✅ [Invite] linked referrer \(inviter)")
-                        completion?(true, "Invite linked 🎉")
-                    }
+                guard let http = response as? HTTPURLResponse else {
+                    completion?(false, "Invite link found but response invalid.")
+                    return
                 }
-            }
+
+                guard let data = data else {
+                    completion?(false, "Invite link found but no response data.")
+                    return
+                }
+
+                let json = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any]
+
+                if http.statusCode == 200, (json?["ok"] as? Bool) == true {
+                    let already = (json?["alreadyClaimed"] as? Bool) == true
+                    clearCache()
+                    completion?(true, already ? "Invite already linked ✅" : "Invite linked 🎉")
+                } else {
+                    let msg = (json?["error"] as? String) ?? "Invite claim failed."
+                    print("❌ [Invite] claimInviteReferral failed:", http.statusCode, msg)
+                    completion?(false, msg)
+                }
+            }.resume()
         }
     }
 
-    private static func freshCachedCode() -> String? {
+    private static func freshCachedInviterUid() -> String? {
         let ud = UserDefaults.standard
-        guard let code = ud.string(forKey: kCodeKey), !code.isEmpty else { return nil }
+        guard let inviter = ud.string(forKey: kInviterKey), !inviter.isEmpty else { return nil }
         let savedAt = ud.double(forKey: kSavedAtKey)
-        guard savedAt > 0 else { return code }
+        guard savedAt > 0 else { return inviter }
         let ageHrs = (Date().timeIntervalSince1970 - savedAt) / 3600.0
-        if ageHrs <= ttlHours { return code }
+        if ageHrs <= ttlHours { return inviter }
         clearCache()
         return nil
     }
 
     private static func clearCache() {
         let ud = UserDefaults.standard
-        ud.removeObject(forKey: kCodeKey)
+        ud.removeObject(forKey: kInviterKey)
         ud.removeObject(forKey: kSavedAtKey)
         ud.synchronize()
     }
 }
-
+*/
 // MARK: - Small convenience
 fileprivate extension Error {
     func localizedMessageOrDefault() -> String {

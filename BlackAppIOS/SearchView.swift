@@ -19,15 +19,15 @@ struct UserProfile: Identifiable, Hashable, Codable {
     let username: String
     let bio: String
     let profileImageURL: String?
-    let circleSize: Int?
+    let inviteCount: Int?
 
-    init(id: String, name: String, username: String, bio: String = "", profileImageURL: String? = nil, circleSize: Int? = nil) {
+    init(id: String, name: String, username: String, bio: String = "", profileImageURL: String? = nil, inviteCount: Int? = nil) {
         self.id = id
         self.name = name
         self.username = username
         self.bio = bio
         self.profileImageURL = profileImageURL
-        self.circleSize = circleSize
+        self.inviteCount = inviteCount
     }
 
     init?(snapshot: DataSnapshot) {
@@ -50,18 +50,20 @@ struct UserProfile: Identifiable, Hashable, Codable {
         guard !name.isEmpty else { return nil }
         if uname.isEmpty { uname = deriveUsername(fromName: name, id: snapshot.key) }
 
-        var cs: Int? = nil
-        if let n = dict["circleSize"] as? NSNumber { cs = n.intValue }
-        else if let n = dict["circleSize"] as? Int { cs = n }
+        var invites: Int? = nil
+        if let n = dict["inviteCount"] as? NSNumber { invites = n.intValue }
+        else if let n = dict["inviteCount"] as? Int { invites = n }
+        else if let s = dict["inviteCount"] as? String, let n = Int(s) { invites = n }
 
         self.id = snapshot.key
         self.name = name
         self.username = uname.replacingOccurrences(of: " ", with: "")
         self.bio = bio
         self.profileImageURL = photo
-        self.circleSize = cs
+        self.inviteCount = invites
     }
 }
+
 
 struct BrandSummary: Identifiable, Hashable, Codable {
     let id: String
@@ -99,7 +101,8 @@ private final class Debouncer {
 
 // MARK: - Scope
 
-private enum SearchScope: String, CaseIterable, Identifiable {
+enum SearchScope: String, CaseIterable, Identifiable {
+
     case all = "All"
     case people = "People"
     case hashtags = "Hashtags"
@@ -109,9 +112,15 @@ private enum SearchScope: String, CaseIterable, Identifiable {
 // MARK: - Search Screen
 
 struct SearchView: View {
+
     // Query & state
-    @State private var searchText: String = ""
-    @State private var scope: SearchScope = .all
+    @State private var searchText: String
+    @State private var scope: SearchScope
+
+    init(initialQuery: String = "", initialScope: SearchScope = .all) {
+        _searchText = State(initialValue: initialQuery)
+        _scope = State(initialValue: initialScope)
+    }
 
     // Results
     @State private var userResults: [UserProfile] = []
@@ -361,7 +370,8 @@ struct SearchView: View {
                 let username = (d["username"] as? String) ?? (d["handle"] as? String) ?? deriveUsername(fromName: name, id: doc.documentID)
                 let bio = (d["bio"] as? String) ?? (d["about"] as? String) ?? ""
                 let photo = (d["profileImageURL"] as? String) ?? (d["photoURL"] as? String) ?? (d["avatarUrl"] as? String)
-                let circleSize = (d["circleSize"] as? Int) ?? (d["circleSize"] as? NSNumber)?.intValue
+                let inviteCount = (d["inviteCount"] as? Int) ?? (d["inviteCount"] as? NSNumber)?.intValue
+                    ?? Int((d["inviteCount"] as? String) ?? "")
 
                 out[doc.documentID] = UserProfile(
                     id: doc.documentID,
@@ -369,7 +379,7 @@ struct SearchView: View {
                     username: username.replacingOccurrences(of: " ", with: ""),
                     bio: bio,
                     profileImageURL: photo,
-                    circleSize: circleSize
+                    inviteCount: inviteCount
                 )
             }
         }
@@ -725,7 +735,7 @@ private struct UserRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(user.name).font(.headline).foregroundColor(.white)
-                    CircleSizeBadgeInline(userId: user.id, initial: user.circleSize ?? 0)
+                    InviteCountStarBadgeInline(userId: user.id, initial: user.inviteCount ?? 0)
                 }
                 Text("@\(user.username)").font(.subheadline).foregroundColor(.gray)
             }
@@ -791,7 +801,8 @@ private struct UserPreviewSheet: View {
                             .font(.title3).bold()
                             .foregroundColor(.white)
                         // Live badge near the name
-                        LivePreviewStarBadgeArea(userId: user.id, initial: user.circleSize ?? 0)
+                        LivePreviewStarBadgeArea(userId: user.id, initial: user.inviteCount ?? 0)
+
                     }
                     Text("@\(user.username)")
                         .foregroundColor(.gray)
@@ -833,7 +844,8 @@ private struct UserPreviewSheet: View {
             }
 
             // Star Power: level 0 = white, then rainbow with current highlighted
-            StarPowerBarView(currentLevel: max(0, user.circleSize ?? 0))
+            StarPowerBarView(inviteCount: max(0, user.inviteCount ?? 0))
+
                 .padding(.horizontal)
 
             // Brands (auto-fetch)
@@ -1212,40 +1224,47 @@ private struct CachedSquare: View {
 
 // MARK: - Live star badge (kept)
 
-private struct CircleSizeBadgeInline: View {
+private struct InviteCountStarBadgeInline: View {
     let userId: String
     let initial: Int
-    @State private var size: Int
+
+    @State private var invites: Int
     @State private var ref: DatabaseReference?
     @State private var handle: DatabaseHandle?
-    init(userId: String, initial: Int) { self.userId = userId; self.initial = initial; _size = State(initialValue: initial) }
+
+    init(userId: String, initial: Int) {
+        self.userId = userId
+        self.initial = initial
+        _invites = State(initialValue: initial)
+    }
+
     var body: some View {
+        let tier = deriveTier(fromInviteCount: invites)
         Group {
-            if size > 0 {
-                Image(systemName: "star.fill")
-                    .foregroundColor(.yellow)
-                    .font(.caption2)
-                    .overlay(
-                        Text("\(min(9, max(1, size)))")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundColor(.black)
-                            .offset(y: 0)
-                    )
-                    .transition(.opacity.combined(with: .scale))
-            }
+            Image(systemName: "star.fill")
+                .foregroundColor(colorForTier(tier))
+                .font(.caption2)
+                .transition(.opacity.combined(with: .scale))
         }
         .onAppear(perform: start)
         .onDisappear(perform: stop)
     }
+
     private func start() {
-        let r = Database.database().reference().child("users").child(userId).child("circleSize")
+        let r = Database.database().reference().child("users").child(userId).child("inviteCount")
         ref = r
         handle = r.observe(.value) { snap in
-            if let n = snap.value as? NSNumber { size = n.intValue }
-            else if let n = snap.value as? Int { size = n }
+            if let n = snap.value as? NSNumber { invites = n.intValue }
+            else if let n = snap.value as? Int { invites = n }
+            else if let s = snap.value as? String, let n = Int(s) { invites = n }
         }
     }
-    private func stop() { if let r = ref, let h = handle { r.removeObserver(withHandle: h) }; ref = nil; handle = nil }
+
+    private func stop() {
+        if let r = ref, let h = handle { r.removeObserver(withHandle: h) }
+        ref = nil
+        handle = nil
+    }
 }
 
 // MARK: - Helpers
@@ -1486,28 +1505,34 @@ private struct LivePreviewStarBadgeArea: View {
     let userId: String
     let initial: Int
     var body: some View {
-        CircleSizeBadgeInline(userId: userId, initial: initial)
+        InviteCountStarBadgeInline(userId: userId, initial: initial)
     }
 }
+
 
 // =====================================================
 // StarPowerBarView (level 0 = white, then rainbow; current highlighted)
 // =====================================================
 
 private struct StarPowerBarView: View {
-    /// 0 = white, 1 = red, 2 = orange, 3 = yellow, 4 = green, 5 = blue, 6 = indigo, 7 = violet
-    let currentLevel: Int
+    let inviteCount: Int
 
-    private let levels: [Color] = [
-        .white,                                  // 0
-        Color(red: 1.00, green: 0.20, blue: 0.20), // 1 red
-        .orange,                                 // 2 orange
-        .yellow,                                 // 3 yellow
-        .green,                                  // 4 green
-        .blue,                                   // 5 blue
-        Color(red: 0.29, green: 0.00, blue: 0.51), // 6 indigo (approx)
-        .purple                                  // 7 violet
+    // Same thresholds as Profile: 0,5,10,20,40,80,160,320,640
+    private let tiers: [(name: String, threshold: Int)] = [
+        ("white", 0),
+        ("red", 5),
+        ("orange", 10),
+        ("yellow", 20),
+        ("green", 40),
+        ("blue", 80),
+        ("indigo", 160),
+        ("violet", 320),
+        ("black", 640)
     ]
+
+    private var currentTier: String {
+        deriveTier(fromInviteCount: inviteCount)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1516,14 +1541,15 @@ private struct StarPowerBarView: View {
                 .foregroundColor(.white)
 
             HStack(spacing: 10) {
-                ForEach(levels.indices, id: \.self) { idx in
-                    let isCurrent = idx == clampedIndex
-                    Image(systemName: isCurrent ? "star.fill" : "star")
+                ForEach(tiers, id: \.name) { t in
+                    let achieved = inviteCount >= t.threshold
+                    let isCurrent = (t.name == currentTier)
+
+                    Image(systemName: achieved ? "star.fill" : "star")
                         .font(.system(size: isCurrent ? 20 : 18, weight: isCurrent ? .bold : .regular))
-                        .foregroundColor(levels[idx])
-                        .opacity(isCurrent ? 1.0 : 0.38)
+                        .foregroundColor(colorForTier(t.name))
+                        .opacity(achieved ? 1.0 : 0.30)
                         .scaleEffect(isCurrent ? 1.05 : 1.0)
-                        .accessibilityLabel(isCurrent ? "Current star level \(idx)" : "Star level \(idx)")
                 }
                 Spacer()
             }
@@ -1535,8 +1561,33 @@ private struct StarPowerBarView: View {
             )
         }
     }
+}
 
-    private var clampedIndex: Int {
-        min(max(currentLevel, 0), levels.count - 1)
+
+fileprivate func deriveTier(fromInviteCount inviteCount: Int) -> String {
+    if inviteCount >= 640 { return "black" }
+    if inviteCount >= 320 { return "violet" }
+    if inviteCount >= 160 { return "indigo" }
+    if inviteCount >= 80  { return "blue" }
+    if inviteCount >= 40  { return "green" }
+    if inviteCount >= 20  { return "yellow" }
+    if inviteCount >= 10  { return "orange" }
+    if inviteCount >= 5   { return "red" }
+    return "white"
+}
+
+fileprivate func colorForTier(_ tier: String) -> Color {
+    switch tier.lowercased() {
+    case "white": return .white
+    case "red": return .red
+    case "orange": return .orange
+    case "yellow": return .yellow
+    case "green": return .green
+    case "blue": return .blue
+    case "indigo": return .indigo
+    case "violet": return .purple
+    case "black": return .black
+    default: return .gray
     }
 }
+

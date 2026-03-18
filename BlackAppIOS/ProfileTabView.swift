@@ -1,4 +1,5 @@
 // ProfileTabView.swift — Social sync + star badge + AG Dashboard (hardcoded superadmin)
+// Star Power is driven ONLY by inviteCount (RTDB users/{uid}/inviteCount)
 
 import SwiftUI
 import Firebase
@@ -13,12 +14,18 @@ private let SUPERADMIN_UID = "XszTTDbebpcYjiqYqgQPAlxWEs82"
 struct ProfileTabView: View {
     @EnvironmentObject var authVM: AuthViewModel
 
+    @State private var showProfileValidationError = false
+    @State private var profileValidationMessage = ""
     @State private var name: String = ""
     @State private var bio: String = ""
     @State private var profileImage: UIImage? = nil
     @State private var profileImageURL: String? = nil
     @State private var showImagePicker = false
     @State private var brands: [BrandModel] = []
+    // 💸 BlackAppMoney (Stripe Connect)
+    @State private var showBlackAppMoney = false
+    @State private var stripeAccountId: String = ""
+    @State private var stripeConnected: Bool = false
 
     // Admin / superadmin gate for AGDashboard
     @State private var isAdmin = false
@@ -37,24 +44,24 @@ struct ProfileTabView: View {
     @State private var handleInput: String = ""
     @State private var showInputPrompt = false
 
-    // ⭐️ Popularity (live)
-    @State private var circleSize: Int = 0
-    @State private var badgeTier: String = "white"   // default baseline
+    // ⭐️ Star Power (LIVE) — inviteCount only
+    @State private var inviteCount: Int = 0
+    @State private var badgeTier: String = "white"   // optional; if missing, we derive from inviteCount
     @State private var showAllBadges: Bool = false
 
     // RTDB observers
-    @State private var circleRef: DatabaseReference?
-    @State private var circleHandle: DatabaseHandle?
+    @State private var inviteRef: DatabaseReference?
+    @State private var inviteHandle: DatabaseHandle?
     @State private var badgeRef: DatabaseReference?
     @State private var badgeHandle: DatabaseHandle?
 
     var body: some View {
         NavigationView {
             VStack(spacing: 16) {
-                TopToolbarView(onLogoTap: {}, onSearchTap: {})
+               /* TopToolbarView(onLogoTap: {}, onSearchTap: {})
                     .padding(.horizontal)
                     .frame(height: 60)
-
+*/
                 ScrollView {
                     VStack(spacing: 20) {
                         profileSection
@@ -98,17 +105,16 @@ struct ProfileTabView: View {
                 }
             }
             .navigationBarTitleDisplayMode(.inline)
-
         }
         .onAppear {
             fetchProfile()
             fetchBrands()
-            checkIfAdminHardAndSoft()   // ← hardcoded + RTDB roles
+            checkIfAdminHardAndSoft()
             loadSyncedAccounts()
-            startObservingPopularity()
+            startObservingStarPower()
         }
         .onDisappear {
-            stopObservingPopularity()
+            stopObservingStarPower()
         }
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(selectedImage: $profileImage)
@@ -190,13 +196,13 @@ struct ProfileTabView: View {
                     .padding(.horizontal)
 
                 Button("Save") {
-                    saveProfile()
-                    withAnimation { isEditingProfile = false }
+                    validateAndSaveProfile()
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(.bottom)
+
             } else {
-                // 🟡 Name + star badge (always visible; defaults to white)
+                // 🟡 Name + star badge (inviteCount-driven)
                 VStack(spacing: 8) {
                     HStack(spacing: 8) {
                         Text(name.isEmpty ? "Unnamed" : name)
@@ -204,18 +210,25 @@ struct ProfileTabView: View {
                             .foregroundColor(.white)
                             .fontWeight(.bold)
 
-                        let currentTier = effectiveBadgeTier(circleSize: circleSize, storedTier: badgeTier)
+                        // Stored badgeTier is allowed, but inviteCount-derived tier always wins if higher
+                        let currentTier = effectiveBadgeTier(inviteCount: inviteCount, storedTier: badgeTier)
 
-                        ProfileStarBadgeInline(tier: currentTier, circleSize: circleSize)
+                        ProfileStarBadgeInline(tier: currentTier, inviteCount: inviteCount)
                             .onTapGesture {
                                 withAnimation(.easeInOut) { showAllBadges.toggle() }
                             }
                     }
 
                     if showAllBadges {
-                        ProfileStarBadgeProgressRow(circleSize: circleSize)
+                        ProfileStarBadgeProgressRow(inviteCount: inviteCount)
                             .transition(.opacity)
                     }
+
+                    // Optional: show the count (helpful for clarity; remove if you don’t want it)
+                    Text("\(inviteCount) invites")
+                        .font(.footnote)
+                        .foregroundColor(.white.opacity(0.65))
+                        .padding(.top, 2)
                 }
 
                 Text(bio.isEmpty ? "No bio added yet." : bio)
@@ -315,38 +328,43 @@ struct ProfileTabView: View {
         .padding(.horizontal)
     }
 
-    // MARK: - Popularity Live Observers
+    // MARK: - Star Power (InviteCount) Live Observers
 
-    private func startObservingPopularity() {
+    private func startObservingStarPower() {
         guard let uid = authVM.user?.uid else { return }
-        // circleSize
-        let cRef = Database.database().reference().child("users").child(uid).child("circleSize")
-        circleRef = cRef
-        circleHandle = cRef.observe(.value) { snap in
-            if let n = snap.value as? NSNumber {
-                circleSize = n.intValue
-            } else if let n = snap.value as? Int {
-                circleSize = n
-            } else {
-                circleSize = 0
-            }
+
+        let uref = Database.database().reference().child("users").child(uid)
+
+        // inviteCount is the ONLY star power driver
+        let iRef = uref.child("inviteCount")
+        inviteRef = iRef
+        inviteHandle = iRef.observe(.value) { snap in
+            let val: Int = {
+                if let n = snap.value as? NSNumber { return n.intValue }
+                if let n = snap.value as? Int { return n }
+                return 0
+            }()
+            DispatchQueue.main.async { self.inviteCount = val }
         }
-        // badgeTier (optional; falls back to derived if missing)
-        let bRef = Database.database().reference().child("users").child(uid).child("badgeTier")
+
+        // badgeTier (optional; derived tier will win if higher)
+        let bRef = uref.child("badgeTier")
         badgeRef = bRef
         badgeHandle = bRef.observe(.value) { snap in
-            if let s = snap.value as? String, !s.isEmpty {
-                badgeTier = s
-            } else {
-                badgeTier = "white"
+            DispatchQueue.main.async {
+                if let s = snap.value as? String, !s.isEmpty {
+                    self.badgeTier = s
+                } else {
+                    self.badgeTier = "white"
+                }
             }
         }
     }
 
-    private func stopObservingPopularity() {
-        if let ref = circleRef, let handle = circleHandle { ref.removeObserver(withHandle: handle) }
+    private func stopObservingStarPower() {
+        if let ref = inviteRef, let handle = inviteHandle { ref.removeObserver(withHandle: handle) }
         if let ref = badgeRef,  let handle = badgeHandle  { ref.removeObserver(withHandle: handle) }
-        circleRef = nil; circleHandle = nil
+        inviteRef = nil; inviteHandle = nil
         badgeRef  = nil; badgeHandle  = nil
     }
 
@@ -373,90 +391,109 @@ struct ProfileTabView: View {
         }
     }
 
-    private func saveProfile() {
+    private func validateAndSaveProfile() {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedName.isEmpty {
+            profileValidationMessage = "Please add your name before saving your profile."
+            showProfileValidationError = true
+            return
+        }
+
+        // We must inspect existing photo from RTDB to decide if completely missing
+        guard let uid = Auth.auth().currentUser?.uid else { return }
+        let rtdbRef = Database.database().reference().child("users").child(uid)
+
+        rtdbRef.observeSingleEvent(of: .value) { snapshot in
+            let existing = snapshot.value as? [String: Any] ?? [:]
+            let existingPhoto = (existing["profileImageURL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            // If no existing photo AND no newly picked image => block
+            if existingPhoto.isEmpty && profileImage == nil {
+                profileValidationMessage = "Please add a profile picture before saving your profile."
+                showProfileValidationError = true
+                return
+            }
+
+            // If we reach here, validation passed → proceed with actual save
+            saveProfile(existingSnapshot: existing, existingPhoto: existingPhoto)
+            withAnimation { isEditingProfile = false }
+        }
+    }
+
+    /// Actual save logic, now receives existing profile snapshot + photo URL.
+    /// This is mostly your original saveProfile, just refactored a bit.
+    private func saveProfile(existingSnapshot existing: [String: Any], existingPhoto: String?) {
         guard let uid = Auth.auth().currentUser?.uid else { return }
 
         let rtdbRef = Database.database().reference().child("users").child(uid)
         let fsRef   = Firestore.firestore().collection("users").document(uid)
 
-        // 1) Read existing to preserve photo/username if you didn't change them here
-        rtdbRef.observeSingleEvent(of: .value) { snapshot in
-            let existing = snapshot.value as? [String: Any] ?? [:]
-            let existingPhoto = (existing["profileImageURL"] as? String)
-            let existingUsername = (existing["username"] as? String)
+        let existingUsername = (existing["username"] as? String)
 
-            // If you have a `username` text field in this view, prefer that; otherwise keep existing or derive.
-            let derivedFallback = self.deriveUsername(fromName: self.name, uid: uid)
-            let baseUsername = (existingUsername?.isEmpty == false ? existingUsername! : derivedFallback)
-            let cleanUsername = baseUsername.replacingOccurrences(of: " ", with: "")
-            let nameLower = self.name.lowercased()
-            let usernameLower = cleanUsername.lowercased()
+        let derivedFallback = self.deriveUsername(fromName: self.name, uid: uid)
+        let baseUsername = (existingUsername?.isEmpty == false ? existingUsername! : derivedFallback)
+        let cleanUsername = baseUsername.replacingOccurrences(of: " ", with: "")
+        let nameLower = self.name.lowercased()
+        let usernameLower = cleanUsername.lowercased()
 
-            // Helper to proceed with final photo url (existing or newly uploaded)
-            func finishWrite(using finalPhotoURL: String?) {
-                // Build a single payload for both Firestore & RTDB
-                var doc: [String: Any] = [
-                    "name": self.name,
-                    "bio": self.bio,
-                    "username": cleanUsername,
-                    "profileImageURL": finalPhotoURL ?? existingPhoto ?? "",
-                    // normalized, indexed fields for fast search
-                    "nameLower": nameLower,
-                    "usernameLower": usernameLower
-                ]
+        func finishWrite(using finalPhotoURL: String?) {
+            var doc: [String: Any] = [
+                "name": self.name,
+                "bio": self.bio,
+                "username": cleanUsername,
+                "profileImageURL": finalPhotoURL ?? existingPhoto ?? "",
+                "nameLower": nameLower,
+                "usernameLower": usernameLower
+            ]
 
-                // 2) Firestore (merge)
-                fsRef.setData(doc, merge: true) { err in
-                    if let err = err { print("❌ Firestore profile update failed: \(err.localizedDescription)") }
-                }
-
-                // 3) RTDB (no FieldValue types here)
-                rtdbRef.updateChildValues(doc) { error, _ in
-                    if let error = error {
-                        print("❌ RTDB profile update failed: \(error.localizedDescription)")
-                    } else {
-                        print("✅ Profile saved (RTDB + Firestore) with normalized fields.")
-                    }
-                }
+            // Firestore (merge)
+            fsRef.setData(doc, merge: true) { err in
+                if let err = err { print("❌ Firestore profile update failed: \(err.localizedDescription)") }
             }
 
-            // 4) Upload image only if you picked a new one; else reuse existing
-            guard let image = self.profileImage else {
-                finishWrite(using: existingPhoto) // no new image; keep what we had
-                return
+            // RTDB update
+            rtdbRef.updateChildValues(doc) { error, _ in
+                if let error = error {
+                    print("❌ RTDB profile update failed: \(error.localizedDescription)")
+                } else {
+                    print("✅ Profile saved (RTDB + Firestore) with normalized fields.")
+                }
             }
+        }
 
-            // Compress & upload avatar
-            guard let data = image.jpegData(compressionQuality: 0.82) else {
-                print("⚠️ Couldn’t encode JPEG; keeping previous photo.")
+        // Upload image only if you picked a new one; else reuse existing
+        guard let image = self.profileImage else {
+            finishWrite(using: existingPhoto)
+            return
+        }
+
+        guard let data = image.jpegData(compressionQuality: 0.82) else {
+            print("⚠️ Couldn’t encode JPEG; keeping previous photo.")
+            finishWrite(using: existingPhoto)
+            return
+        }
+
+        let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
+        let meta = StorageMetadata(); meta.contentType = "image/jpeg"
+
+        storageRef.putData(data, metadata: meta) { _, uploadError in
+            if let uploadError = uploadError {
+                print("❌ Avatar upload failed: \(uploadError.localizedDescription)")
                 finishWrite(using: existingPhoto)
                 return
             }
-
-            let storageRef = Storage.storage().reference().child("profile_images/\(uid).jpg")
-            let meta = StorageMetadata(); meta.contentType = "image/jpeg"
-
-            storageRef.putData(data, metadata: meta) { _, uploadError in
-                if let uploadError = uploadError {
-                    print("❌ Avatar upload failed: \(uploadError.localizedDescription)")
-                    finishWrite(using: existingPhoto) // don’t block profile save
-                    return
-                }
-                storageRef.downloadURL { url, _ in
-                    finishWrite(using: url?.absoluteString ?? existingPhoto)
-                }
+            storageRef.downloadURL { url, _ in
+                finishWrite(using: url?.absoluteString ?? existingPhoto)
             }
         }
     }
 
-    // MARK: - Local helper (same file)
+
     private func deriveUsername(fromName name: String, uid: String) -> String {
-        // Prefer email handle when available
         if let email = Auth.auth().currentUser?.email,
            let handle = email.split(separator: "@").first, !handle.isEmpty {
             return String(handle)
         }
-        // Fallback: alphanumerics from name, otherwise suffix of uid
         let allowed = CharacterSet.alphanumerics
         let base = name.lowercased()
             .components(separatedBy: allowed.inverted)
@@ -474,30 +511,39 @@ struct ProfileTabView: View {
                 self.name = value["name"] as? String ?? ""
                 self.bio = value["bio"] as? String ?? ""
                 self.profileImageURL = value["profileImageURL"] as? String
-                if let n = value["circleSize"] as? Int { self.circleSize = n }
-                if let s = value["badgeTier"] as? String, !s.isEmpty { self.badgeTier = s }
+
+                // ⭐️ inviteCount ONLY
+                if let n = value["inviteCount"] as? Int {
+                    self.inviteCount = n
+                } else if let n = value["inviteCount"] as? NSNumber {
+                    self.inviteCount = n.intValue
+                } else {
+                    self.inviteCount = 0
+                }
+
+                // badgeTier optional
+                if let s = value["badgeTier"] as? String, !s.isEmpty {
+                    self.badgeTier = s
+                } else {
+                    self.badgeTier = "white"
+                }
             }
         }
     }
 
     // MARK: - Admin Gate (hardcoded + RTDB)
 
-    /// Sets `isAdmin` true if:
-    /// 1) current user matches the hardcoded SUPERADMIN_UID, OR
-    /// 2) user is present in /admins or /superadmin in RTDB.
     private func checkIfAdminHardAndSoft() {
         guard let uid = Auth.auth().currentUser?.uid else {
             isAdmin = false
             return
         }
 
-        // Hard override first
         if uid == SUPERADMIN_UID {
             isAdmin = true
             return
         }
 
-        // Then fall back to RTDB roles
         let root = Database.database().reference()
         let adminsRef = root.child("admins").child(uid)
         let superRef  = root.child("superadmin").child(uid)
@@ -520,34 +566,31 @@ struct ProfileTabView: View {
 }
 
 // MARK: - Star Badge UI (Profile-prefixed to avoid collisions elsewhere)
+
 private struct ProfileStarBadgeInline: View {
     let tier: String
-    let circleSize: Int
+    let inviteCount: Int
 
     @State private var pulse = false
 
-    // Use whichever is higher: stored tier or derived-from-circleSize
+    // Use whichever is higher: stored tier or derived-from-inviteCount
     private var level: Int {
-        max(tierOrder(tier), tierOrder(deriveTier(from: circleSize)))
+        max(tierOrder(tier), tierOrder(deriveTier(from: inviteCount)))
     }
 
-    // Pulse amplitude scales gently with level:
-    // baseline ~±6%, max tier ~±22%
     private var scaleRange: ClosedRange<CGFloat> {
-        let base: CGFloat = 0.06     // baseline amplitude
-        let step: CGFloat = 0.02     // per-tier increase
+        let base: CGFloat = 0.06
+        let step: CGFloat = 0.02
         let amp = min(base + step * CGFloat(max(0, level)), 0.22)
         return (1.0 - amp)...(1.0 + amp)
     }
 
-    // Softer ring at baseline, brighter as level rises
     private var ringOpacity: Double {
         level == 0 ? 0.18 : 0.35
     }
 
     var body: some View {
         ZStack {
-            // Breathing ring behind star (always on, subtle at baseline)
             Circle()
                 .stroke(colorForTier(tier).opacity(ringOpacity), lineWidth: 2)
                 .frame(width: 18, height: 18)
@@ -559,26 +602,25 @@ private struct ProfileStarBadgeInline: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(colorForTier(tier))
                 .shadow(color: .white.opacity(0.25), radius: 3)
-                // Throb scale — always active, amplitude from scaleRange
                 .scaleEffect(pulse ? scaleRange.upperBound : scaleRange.lowerBound)
                 .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulse)
-                // Keep your smooth color/tier transition
                 .animation(.easeInOut(duration: 0.25), value: tier)
-                .accessibilityLabel(Text("\(tier.capitalized) popularity star, circle size \(circleSize)"))
+                .accessibilityLabel(Text("\(tier.capitalized) popularity star, invites \(inviteCount)"))
         }
         .onAppear { pulse = true }
     }
 }
 
 private struct ProfileStarBadgeProgressRow: View {
-    let circleSize: Int
+    let inviteCount: Int
     private var tiers: [(String, Int)] {
         [("white",0),("red",5),("orange",10),("yellow",20),("green",40),("blue",80),("indigo",160),("violet",320),("black",640)]
     }
+
     var body: some View {
         HStack(spacing: 8) {
             ForEach(tiers, id: \.0) { (name, threshold) in
-                let achieved = circleSize >= threshold
+                let achieved = inviteCount >= threshold
                 Image(systemName: achieved ? "star.fill" : "star")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundColor(colorForTier(name).opacity(achieved ? 1 : 0.35))
@@ -588,26 +630,27 @@ private struct ProfileStarBadgeProgressRow: View {
     }
 }
 
+// MARK: - Badge helpers (inviteCount-only)
 
-// MARK: - Badge helpers
-
-fileprivate func effectiveBadgeTier(circleSize: Int, storedTier: String) -> String {
+fileprivate func effectiveBadgeTier(inviteCount: Int, storedTier: String) -> String {
     let normalized = storedTier.lowercased()
-    if normalized.isEmpty { return deriveTier(from: circleSize) }
-    let derived = deriveTier(from: circleSize)
+    let derived = deriveTier(from: inviteCount)
+    if normalized.isEmpty { return derived }
     return max(tierOrder(normalized), tierOrder(derived)) == tierOrder(derived) ? derived : normalized
 }
-fileprivate func deriveTier(from circleSize: Int) -> String {
-    if circleSize >= 640 { return "black" }
-    if circleSize >= 320 { return "violet" }
-    if circleSize >= 160 { return "indigo" }
-    if circleSize >= 80  { return "blue" }
-    if circleSize >= 40  { return "green" }
-    if circleSize >= 20  { return "yellow" }
-    if circleSize >= 10  { return "orange" }
-    if circleSize >= 5   { return "red" }
+
+fileprivate func deriveTier(from inviteCount: Int) -> String {
+    if inviteCount >= 640 { return "black" }
+    if inviteCount >= 320 { return "violet" }
+    if inviteCount >= 160 { return "indigo" }
+    if inviteCount >= 80  { return "blue" }
+    if inviteCount >= 40  { return "green" }
+    if inviteCount >= 20  { return "yellow" }
+    if inviteCount >= 10  { return "orange" }
+    if inviteCount >= 5   { return "red" }
     return "white"
 }
+
 fileprivate func colorForTier(_ tier: String) -> Color {
     switch tier.lowercased() {
     case "white": return .white
@@ -622,6 +665,7 @@ fileprivate func colorForTier(_ tier: String) -> Color {
     default: return .gray
     }
 }
+
 fileprivate func tierOrder(_ tier: String) -> Int {
     switch tier.lowercased() {
     case "white": return 0
@@ -650,7 +694,6 @@ extension ProfileTabView {
                     let dict = child.value as? [String: Any],
                     let brand = BrandModel.from(dict: dict, id: child.key)
                 else { continue }
-                // Prefer brand.ownerId; fall back to userId if needed
                 let owner = brand.ownerId.isEmpty ? (dict["userId"] as? String ?? "") : brand.ownerId
                 if owner == uid { userBrands.append(brand) }
             }

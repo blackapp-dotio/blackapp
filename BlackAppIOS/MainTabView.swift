@@ -23,12 +23,12 @@ struct MainTabView: View {
     @State private var deepLinkedTableId: String?
     @State private var showGuestlistSheet = false
 
-    // Admin-only dashboard (reserved)
+    // Admin-only dashboard
     @State private var showAdminDashboard = false
     @State private var isAdminUser = false
 
-    // NEW: make TabView addressable so we can jump to Chat on push tap
-    private enum Tab: Int { case gossip = 0, events, explore, chat, profile }
+    // Addressable TabView so we can jump between tabs programmatically
+    private enum Tab: Int { case gossip = 0, events, explore, communities, profile, passport }
     @State private var selectedTab: Tab = .gossip
 
     // SETTINGS STATE
@@ -36,6 +36,12 @@ struct MainTabView: View {
     @State private var showBlockedUsers = false
     @State private var deletingAccount = false
     @State private var deleteError: String?
+
+    // BLACKAPPMONEY STATE
+    @State private var showBlackAppMoney = false
+
+    // Global search sheet
+    @State private var showGlobalSearch = false
 
     // Fix: explicit binding to avoid generic parameter inference issue in .alert
     private var hasDeleteError: Binding<Bool> {
@@ -50,24 +56,14 @@ struct MainTabView: View {
             if acceptedEULA {
                 mainAppContent
             } else {
-                // Show the gate until the user accepts.
-                // EULAGateView sets acceptedEULA_v1 = true on tap “I Agree”
                 EULAGateView()
             }
         }
     }
 
-    // MARK: - Extracted original content (unchanged logic)
+    // MARK: - Main App Content
     private var mainAppContent: some View {
         ZStack {
-            // Navigate to direct chat if tapped (existing)
-            NavigationLink(
-                destination: DirectChatDestination(profile: router.selectedChatUser),
-                isActive: Binding(
-                    get: { router.selectedChatUser != nil },
-                    set: { newValue in if !newValue { router.selectedChatUser = nil } }
-                )
-            ) { EmptyView() }.hidden()
 
             // Nightlife venue push (from deep-link)
             NavigationLink(
@@ -80,18 +76,20 @@ struct MainTabView: View {
                     )
                 },
                 isActive: $showNightlifeVenue
-            ) { EmptyView() }.hidden()
+            ) { EmptyView() }
+            .hidden()
 
-            // (Reserved) Admin dashboard push – admins only
+            // Admin dashboard push – admins only
             NavigationLink(
-                destination: AdminDashboardViewPlaceholder(), // Replace with your real AGDashboard entry view
+                destination: AdminDashboardViewPlaceholder(),
                 isActive: $showAdminDashboard
-            ) { EmptyView() }.hidden()
+            ) { EmptyView() }
+            .hidden()
 
-            // Main tabs (existing, now with selection so we can switch programmatically)
+            // ✅ Main tabs
             TabView(selection: $selectedTab) {
                 GossipTabView()
-                    .tabItem { Label("Gossip", systemImage: "quote.bubble") }
+                    .tabItem { Label("Feed", systemImage: "quote.bubble") }
                     .tag(Tab.gossip)
 
                 EventTabView()
@@ -102,28 +100,59 @@ struct MainTabView: View {
                     .tabItem { Image(systemName: "globe"); Text("Explore") }
                     .tag(Tab.explore)
 
-                ChatTabView()
-                    .tabItem { Label("Chat", systemImage: "message") }
-                    .tag(Tab.chat)
+                // ✅ IMPORTANT: use your new NjangiGroupsTabView.swift
+                NjangiGroupsTabView()
+                    .tabItem { Label("Communities", systemImage: "person.3.sequence.fill") }
+                    .tag(Tab.communities)
 
                 ProfileTabView()
                     .tabItem { Image(systemName: "person.crop.circle"); Text("Profile") }
                     .tag(Tab.profile)
+
+                PassportTabView()
+                    .tabItem { Image(systemName: "person.text.rectangle"); Text("Passport") }
+                    .tag(Tab.passport)
             }
             .accentColor(.blue)
+
+            // ✅ UNIVERSAL TOP TOOLBAR
+            .safeAreaInset(edge: .top, spacing: 0) {
+                TopToolbarView(
+                    onLogoTap: {
+                        NotificationCenter.default.post(name: .globalLogoTapped, object: nil)
+                    },
+                    onSearchTap: {
+                        showGlobalSearch = true
+                        NotificationCenter.default.post(name: .globalSearchTapped, object: nil)
+                    },
+                    adminButton: isAdminUser
+                        ? AnyView(
+                            Button(action: { showAdminDashboard = true }) {
+                                Image(systemName: "lock.shield.fill")
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundColor(.white)
+                            }
+                        )
+                        : nil,
+                    onMoneyTap: {
+                        showBlackAppMoney = true
+                    }
+                )
+                .background(Color.black.ignoresSafeArea(edges: .top))
+                .zIndex(999)
+            }
+
+            // MARK: Lifecycle / routing hooks
             .onAppear {
-                // Existing FCM sync / monitors
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
                     print("👀 MainTabView appeared. Delayed FCM sync triggered")
                     FCMTokenManager.syncFCMTokenToFirestore()
                     _ = TokenSyncMonitor.shared
                     TokenSyncMonitor.shared.startRecurringCheck(every: 3600)
                 }
-                // Cache admin bit for later
                 refreshIsAdminFlag()
             }
             .onOpenURL { url in
-                // Handle both legacy event links & new Nightlife/Admin deep-links here
                 handleIncomingURL(url)
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
@@ -132,39 +161,32 @@ struct MainTabView: View {
                 _ = TokenSyncMonitor.shared
                 refreshIsAdminFlag()
             }
-            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("NotificationTapped"))) { notif in
-                if let userInfo = notif.userInfo,
-                   let senderId = userInfo["senderId"] as? String {
-                    print("📬 Notification tapped for senderId: \(senderId)")
-                    // Flip to Chat tab for context, then navigate
-                    selectedTab = .chat
-                    fetchUserProfile(uid: senderId) { profile in
-                        if let profile = profile { router.selectedChatUser = profile }
-                        else { print("❌ No user found for senderId \(senderId)") }
-                    }
-                }
-            }
+
+            // ✅ KEEP: open event from deep link
             .onReceive(NotificationCenter.default.publisher(for: .openEventFromDeepLink)) { notif in
                 if let eventId = notif.userInfo?["eventId"] as? String {
                     fetchEventModel(eventId: eventId) { model in
                         if let model = model {
                             selectedEvent = model
                             showEventDetailFromLink = true
-                            // Optional: selectedTab = .events
                         }
                     }
                 }
             }
-            // 👇 NEW: open Settings from Profile (post .openSettings)
+
+            // MARK: Global sheets / modals
             .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
                 selectedTab = .profile
                 showSettings = true
             }
-            // 👇 NEW: open Blocked Users directly if someone posts .openBlockedUsers
             .onReceive(NotificationCenter.default.publisher(for: .openBlockedUsers)) { _ in
                 selectedTab = .profile
                 showBlockedUsers = true
             }
+            .onReceive(NotificationCenter.default.publisher(for: .openBlackAppMoney)) { _ in
+                showBlackAppMoney = true
+            }
+
             .sheet(isPresented: $showEventDetailFromLink) {
                 if let event = selectedEvent {
                     EventDetailView(event: event)
@@ -178,7 +200,8 @@ struct MainTabView: View {
                         .padding()
                 }
             }
-            // 👇 NEW: Settings Sheet
+
+            // ✅ Settings Sheet
             .sheet(isPresented: $showSettings) {
                 SettingsSheet(
                     close: { showSettings = false },
@@ -191,11 +214,32 @@ struct MainTabView: View {
                     startDeletion: { confirmDeleteAccount() }
                 )
             }
-            // 👇 NEW: Manage Blocked Users (replace with your BlockedUsersView if you have it)
+
+            // ✅ Manage Blocked Users
             .sheet(isPresented: $showBlockedUsers) {
                 ManageBlockedUsersView(close: { showBlockedUsers = false })
             }
-            // 👇 NEW: Deletion progress + errors
+
+            // ✅ BlackAppMoney sheet
+            .sheet(isPresented: $showBlackAppMoney) {
+                BlackAppMoneyView()
+            }
+
+            // ✅ Global search
+            .sheet(isPresented: $showGlobalSearch) {
+                NavigationStack {
+                    SearchView()
+                        .navigationTitle("Search")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Close") { showGlobalSearch = false }
+                            }
+                        }
+                }
+            }
+
+            // ✅ Deletion progress + errors
             .alert("Deleting Account…", isPresented: $deletingAccount) {
                 Button("OK") { }
             } message: {
@@ -209,8 +253,8 @@ struct MainTabView: View {
         }
     }
 
-    // MARK: - Token Sync (existing)
-    func syncPushNotificationToken() {
+    // MARK: - Token Sync
+    private func syncPushNotificationToken() {
         print("🟡 syncPushNotificationToken() triggered")
         guard let userId = Auth.auth().currentUser?.uid else { return }
 
@@ -237,23 +281,8 @@ struct MainTabView: View {
         }
     }
 
-    // MARK: - Fetch Chat User Profile (existing)
-    func fetchUserProfile(uid: String, completion: @escaping (ChatUserProfile?) -> Void) {
-        let ref = Firestore.firestore().collection("users").document(uid)
-        ref.getDocument { doc, _ in
-            if let data = doc?.data(),
-               let name = data["name"] as? String {
-                let username = data["username"] as? String ?? ""
-                let image = data["profileImageURL"] as? String
-                completion(ChatUserProfile(id: uid, name: name, username: username, profileImageURL: image))
-            } else {
-                completion(nil)
-            }
-        }
-    }
-
-    // MARK: - Fetch Event Model (fixed: no nested function)
-    func fetchEventModel(eventId: String, completion: @escaping (EventModel?) -> Void) {
+    // MARK: - Fetch Event Model (RTDB)
+    private func fetchEventModel(eventId: String, completion: @escaping (EventModel?) -> Void) {
         let ref = Database.database().reference().child("events").child(eventId)
         ref.observeSingleEvent(of: .value, with: { snapshot in
             completion(EventModel.from(snapshot: snapshot))
@@ -261,15 +290,16 @@ struct MainTabView: View {
     }
 
     // MARK: - Admin flag (RTDB: /admins and /superadmin)
-    func refreshIsAdminFlag() {
+    private func refreshIsAdminFlag() {
         guard let uid = Auth.auth().currentUser?.uid else {
-            isAdminUser = false; return
+            isAdminUser = false
+            return
         }
+
         let db = Database.database().reference()
         let adminsRef = db.child("admins").child(uid)
         let superRef = db.child("superadmin").child(uid)
 
-        // Read both and set true if either exists == true
         adminsRef.observeSingleEvent(of: .value) { aSnap in
             superRef.observeSingleEvent(of: .value) { sSnap in
                 let isAdmin = (aSnap.value as? Bool) == true || (sSnap.value as? Bool) == true
@@ -279,13 +309,7 @@ struct MainTabView: View {
     }
 
     // MARK: - Deep-link handling
-    func handleIncomingURL(_ url: URL) {
-        // Support both custom scheme and universal links
-        // Expected patterns:
-        // - blackappios://nightlife/venue/<venueId>?nightId=&tableId=&guestlist=true
-        // - https://blackapp.app/nightlife/venue/<venueId>?nightId=&tableId=&guestlist=true
-        // - (reserved) https://blackapp.app/admin/dashboard  (admins only)
-
+    private func handleIncomingURL(_ url: URL) {
         let absolute = url.absoluteString
         print("🔗 OpenURL: \(absolute)")
 
@@ -300,24 +324,19 @@ struct MainTabView: View {
         }
 
         guard absolute.contains("/nightlife/venue/") || absolute.contains("://nightlife/venue/") else {
-            // Not a nightlife deep-link; your existing handlers can manage it
             return
         }
 
-        // Parse path & query
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        let path = url.path // e.g., /nightlife/venue/<venueId>
+        let path = url.path
         let parts = path.split(separator: "/").map(String.init)
         guard parts.count >= 3 else { return }
 
-        // parts[0] = "nightlife", parts[1] = "venue", parts[2] = "<venueId>"
         let venueId = parts[2]
-
         let nightId = comps?.queryItems?.first(where: { $0.name == "nightId" })?.value
         let tableId = comps?.queryItems?.first(where: { $0.name == "tableId" })?.value
         let guestlistFlag = (comps?.queryItems?.first(where: { $0.name == "guestlist" })?.value?.lowercased() == "true")
 
-        // Fetch venue then navigate
         fetchVenue(venueId: venueId) { venue in
             guard let venue = venue else {
                 print("❌ Deep-link venue not found: \(venueId)")
@@ -327,8 +346,8 @@ struct MainTabView: View {
             self.deepLinkedNightId = nightId
             self.deepLinkedTableId = tableId
             self.showNightlifeVenue = true
+
             if guestlistFlag {
-                // Present guestlist sheet after push
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                     self.showGuestlistSheet = true
                 }
@@ -337,7 +356,7 @@ struct MainTabView: View {
     }
 
     // MARK: - Minimal venue fetch (Nightlife)
-    func fetchVenue(venueId: String, completion: @escaping (VenueModel?) -> Void) {
+    private func fetchVenue(venueId: String, completion: @escaping (VenueModel?) -> Void) {
         let ref = Database.database().reference().child("venues").child(venueId)
         ref.observeSingleEvent(of: .value) { snap in
             completion(VenueModel.from(snap))
@@ -366,16 +385,9 @@ struct MainTabView: View {
 
         let uid = user.uid
         do {
-            // 1) Clear push token record so we stop sending notifications
             try await clearPushToken(uid: uid)
-
-            // 2) Delete profile docs (Firestore + RTDB basic node)
             try await deleteUserDocuments(uid: uid)
-
-            // 3) Delete the Auth user (may require recent login)
             try await user.delete()
-
-            // 4) Sign out locally
             try? Auth.auth().signOut()
         } catch {
             let nsErr = error as NSError
@@ -396,317 +408,276 @@ struct MainTabView: View {
     }
 
     private func deleteUserDocuments(uid: String) async throws {
-        // Firestore: users/{uid}
         let fs = Firestore.firestore()
         try await fs.collection("users").document(uid).delete()
 
-        // RTDB: users/{uid}  (adjust if your user path differs)
         let rtdb = Database.database().reference()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             rtdb.child("users").child(uid).removeValue { err, _ in
                 if let err = err {
                     cont.resume(throwing: err)
                 } else {
-                    cont.resume(returning: ()) // ✅ must return a Void value
+                    cont.resume(returning: ())
                 }
             }
         }
     }
 
-        // TODO: Add other per-user deletions (posts, purchases, chats…) or move to a Cloud Function.
-    }
+    // MARK: - NightlifeVenueWrapper
+    private struct NightlifeVenueWrapper: View {
+        let venue: VenueModel
+        let preselectNightId: String?
+        let preselectTableId: String?
+        @Binding var presentGuestlist: Bool
 
+        @State private var nights: [NightModel] = []
+        @State private var selectedNight: NightModel?
 
-// MARK: - Wrapper for optional chat destination (prevents generic inference issues)
-private struct DirectChatDestination: View {
-    let profile: ChatUserProfile?
-    var body: some View {
-        Group {
-            if let p = profile {
-                DirectChatRoomView(recipient: p)
-            } else {
-                EmptyView()
-            }
-        }
-    }
-}
-
-// MARK: - NightlifeVenueWrapper
-// Wraps VenueDetailView and optionally preselects night/table or opens guestlist
-private struct NightlifeVenueWrapper: View {
-    let venue: VenueModel
-    let preselectNightId: String?
-    let preselectTableId: String?
-    @Binding var presentGuestlist: Bool
-
-    @State private var nights: [NightModel] = []
-    @State private var selectedNight: NightModel?
-
-    var body: some View {
-        VenueDetailView(venue: venue)
-            .onAppear {
-                // Preload nights to help user land closer to target (non-invasive)
-                NightlifeService.shared.fetchNights(for: venue.id) { list in
-                    self.nights = list
-                    if let target = preselectNightId,
-                       let n = list.first(where: { $0.id == target }) {
-                        self.selectedNight = n
+        var body: some View {
+            VenueDetailView(venue: venue)
+                .onAppear {
+                    NightlifeService.shared.fetchNights(for: venue.id) { list in
+                        self.nights = list
+                        if let target = preselectNightId,
+                           let n = list.first(where: { $0.id == target }) {
+                            self.selectedNight = n
+                        }
                     }
                 }
-            }
-    }
-}
-
-// MARK: - Settings Sheet UI
-private struct SettingsSheet: View {
-    var close: () -> Void
-    var openBlockedUsers: () -> Void
-    var startDeletion: () -> Void
-
-    @State private var pushEnabled = true
-    @State private var loading = false
-    @State private var errorText: String?
-
-    var body: some View {
-        NavigationView {
-            List {
-                Section(header: Text("Account")) {
-                    Button {
-                        openBlockedUsers()
-                    } label: {
-                        Label("Manage Blocked Users", systemImage: "eye.slash")
-                    }
-
-                    Button(role: .destructive) {
-                        startDeletion()
-                    } label: {
-                        Label("Delete Account", systemImage: "trash")
-                    }
-                }
-
-                Section(header: Text("Notifications")) {
-                    Toggle(isOn: $pushEnabled) {
-                        Label("Enable Push Notifications", systemImage: "bell.badge")
-                    }
-                    .onChange(of: pushEnabled) { newValue in
-                        Task { await savePushPreference(enabled: newValue) }
-                    }
-                }
-
-                Section(header: Text("Legal")) {
-                    Link(destination: URL(string: "https://blackapp.io/privacy.html")!) {
-                        Label("Privacy Policy", systemImage: "hand.raised")
-                    }
-                    Link(destination: URL(string: "https://blackapp.io/terms.html")!) {
-                        Label("Terms of Service", systemImage: "doc.plaintext")
-                    }
-                }
-
-                Section {
-                    Button {
-                        Task { await signOut() }
-                    } label: {
-                        Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
-                    }
-                }
-            }
-            .navigationTitle("Settings")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { close() }
-                }
-            }
-            .overlay {
-                if loading { ProgressView().controlSize(.large) }
-            }
-            .alert("Error", isPresented: Binding(
-                get: { errorText != nil },
-                set: { if !$0 { errorText = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(errorText ?? "")
-            }
-            .task {
-                // Load current push setting from Firestore
-                await loadPushPreference()
-            }
         }
     }
 
-    private func loadPushPreference() async {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        loading = true
-        defer { loading = false }
-        do {
-            let doc = try await Firestore.firestore().collection("users").document(uid).getDocument()
-            if let enabled = doc.data()?["pushEnabled"] as? Bool {
-                pushEnabled = enabled
-            }
-        } catch {
-            errorText = "Failed to load settings: \(error.localizedDescription)"
-        }
-    }
+    // MARK: - Settings Sheet UI
+    private struct SettingsSheet: View {
+        var close: () -> Void
+        var openBlockedUsers: () -> Void
+        var startDeletion: () -> Void
 
-    private func savePushPreference(enabled: Bool) async {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
-        do {
-            try await Firestore.firestore().collection("users").document(uid).setData([
-                "pushEnabled": enabled,
-                "settingsUpdatedAt": FieldValue.serverTimestamp()
-            ], merge: true)
-        } catch {
-            errorText = "Failed to save: \(error.localizedDescription)"
-        }
-    }
+        @State private var pushEnabled = true
+        @State private var loading = false
+        @State private var errorText: String?
 
-    private func signOut() async {
-        do {
-            try Auth.auth().signOut()
-            close()
-        } catch {
-            errorText = "Failed to sign out: \(error.localizedDescription)"
-        }
-    }
-}
+        var body: some View {
+            NavigationView {
+                List {
+                    Section(header: Text("Account")) {
+                        Button { openBlockedUsers() } label: {
+                            Label("Manage Blocked Users", systemImage: "eye.slash")
+                        }
 
-// MARK: - Simple Blocked Users Manager
-/// If you already have a full-featured `BlockedUsersView.swift`, replace this sheet with it.
-/// This minimal version uses RTDB path: `blockedUsers/{uid}/{blockedId} = true`
-private struct ManageBlockedUsersView: View {
-    var close: () -> Void
-    @State private var blocked: [String] = []
-    @State private var loading = true
-    @State private var errorText: String?
-
-    var body: some View {
-        NavigationView {
-            Group {
-                if loading {
-                    ProgressView()
-                } else if blocked.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: "person.crop.circle.badge.exclam")
-                            .font(.system(size: 40))
-                        Text("No blocked users")
-                            .foregroundColor(.secondary)
+                        Button(role: .destructive) { startDeletion() } label: {
+                            Label("Delete Account", systemImage: "trash")
+                        }
                     }
-                } else {
-                    List {
-                        ForEach(blocked, id: \.self) { uid in
-                            HStack {
-                                Image(systemName: "person.crop.circle")
-                                    .font(.system(size: 24))
-                                Text(uid).lineLimit(1)
-                                Spacer()
-                                Button(role: .destructive) {
-                                    Task { await unblock(uid) }
-                                } label: {
-                                    Text("Unblock")
+
+                    Section(header: Text("Notifications")) {
+                        Toggle(isOn: $pushEnabled) {
+                            Label("Enable Push Notifications", systemImage: "bell.badge")
+                        }
+                        .onChange(of: pushEnabled) { newValue in
+                            Task { await savePushPreference(enabled: newValue) }
+                        }
+                    }
+
+                    Section(header: Text("Legal")) {
+                        Link(destination: URL(string: "https://blackapp.io/privacy.html")!) {
+                            Label("Privacy Policy", systemImage: "hand.raised")
+                        }
+                        Link(destination: URL(string: "https://blackapp.io/terms.html")!) {
+                            Label("Terms of Service", systemImage: "doc.plaintext")
+                        }
+                    }
+
+                    Section {
+                        Button { Task { await signOut() } } label: {
+                            Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                    }
+                }
+                .navigationTitle("Settings")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Close") { close() }
+                    }
+                }
+                .overlay {
+                    if loading { ProgressView().controlSize(.large) }
+                }
+                .alert("Error", isPresented: Binding(
+                    get: { errorText != nil },
+                    set: { if !$0 { errorText = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(errorText ?? "")
+                }
+                .task { await loadPushPreference() }
+            }
+        }
+
+        private func loadPushPreference() async {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            loading = true
+            defer { loading = false }
+            do {
+                let doc = try await Firestore.firestore().collection("users").document(uid).getDocument()
+                if let enabled = doc.data()?["pushEnabled"] as? Bool {
+                    pushEnabled = enabled
+                }
+            } catch {
+                errorText = "Failed to load settings: \(error.localizedDescription)"
+            }
+        }
+
+        private func savePushPreference(enabled: Bool) async {
+            guard let uid = Auth.auth().currentUser?.uid else { return }
+            do {
+                try await Firestore.firestore().collection("users").document(uid).setData([
+                    "pushEnabled": enabled,
+                    "settingsUpdatedAt": FieldValue.serverTimestamp()
+                ], merge: true)
+            } catch {
+                errorText = "Failed to save: \(error.localizedDescription)"
+            }
+        }
+
+        private func signOut() async {
+            do {
+                try Auth.auth().signOut()
+                close()
+            } catch {
+                errorText = "Failed to sign out: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: - Simple Blocked Users Manager
+    private struct ManageBlockedUsersView: View {
+        var close: () -> Void
+        @State private var blocked: [String] = []
+        @State private var loading = true
+        @State private var errorText: String?
+
+        var body: some View {
+            NavigationView {
+                Group {
+                    if loading {
+                        ProgressView()
+                    } else if blocked.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "person.crop.circle.badge.exclam")
+                                .font(.system(size: 40))
+                            Text("No blocked users")
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        List {
+                            ForEach(blocked, id: \.self) { uid in
+                                HStack {
+                                    Image(systemName: "person.crop.circle")
+                                        .font(.system(size: 24))
+                                    Text(uid).lineLimit(1)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        Task { await unblock(uid) }
+                                    } label: { Text("Unblock") }
                                 }
                             }
                         }
                     }
                 }
+                .navigationTitle("Blocked Users")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Close") { close() }
+                    }
+                }
+                .alert("Error", isPresented: Binding(
+                    get: { errorText != nil },
+                    set: { if !$0 { errorText = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: { Text(errorText ?? "") }
+                .task { await loadBlocked() }
             }
-            .navigationTitle("Blocked Users")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") { close() }
+        }
+
+        private func loadBlocked() async {
+            guard let me = Auth.auth().currentUser?.uid else { return }
+            loading = true
+            defer { loading = false }
+            let ref = Database.database().reference().child("blockedUsers").child(me)
+            await withCheckedContinuation { cont in
+                ref.observeSingleEvent(of: .value) { snap in
+                    if let dict = snap.value as? [String: Any] {
+                        self.blocked = dict.keys.sorted()
+                    } else {
+                        self.blocked = []
+                    }
+                    cont.resume()
                 }
             }
-            .alert("Error", isPresented: Binding(
-                get: { errorText != nil },
-                set: { if !$0 { errorText = nil } }
-            )) {
-                Button("OK", role: .cancel) {}
-            } message: { Text(errorText ?? "") }
-            .task { await loadBlocked() }
+        }
+
+        private func unblock(_ other: String) async {
+            guard let me = Auth.auth().currentUser?.uid else { return }
+            let ref = Database.database().reference().child("blockedUsers").child(me).child(other)
+            await withCheckedContinuation { cont in
+                ref.removeValue { error, _ in
+                    if let error = error {
+                        self.errorText = "Failed to unblock: \(error.localizedDescription)"
+                    } else {
+                        self.blocked.removeAll(where: { $0 == other })
+                    }
+                    cont.resume()
+                }
+            }
         }
     }
 
-    private func loadBlocked() async {
-        guard let me = Auth.auth().currentUser?.uid else { return }
-        loading = true
-        defer { loading = false }
-        let ref = Database.database().reference().child("blockedUsers").child(me)
-        await withCheckedContinuation { cont in
-            ref.observeSingleEvent(of: .value) { snap in
-                if let dict = snap.value as? [String: Any] {
-                    self.blocked = dict.keys.sorted()
-                } else {
-                    self.blocked = []
-                }
-                cont.resume()
+    // MARK: - AdminDashboard placeholder
+    private struct AdminDashboardViewPlaceholder: View {
+        var body: some View {
+            VStack(spacing: 12) {
+                Image(systemName: "lock.shield")
+                    .font(.system(size: 40, weight: .semibold))
+                Text("Admin Dashboard")
+                    .font(.title3).bold()
+                Text("Admins only. Promoters cannot access this area.")
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
             }
+            .padding()
         }
     }
 
-    private func unblock(_ other: String) async {
-        guard let me = Auth.auth().currentUser?.uid else { return }
-        let ref = Database.database().reference().child("blockedUsers").child(me).child(other)
-        await withCheckedContinuation { cont in
-            ref.removeValue { error, _ in
-                if let error = error {
-                    self.errorText = "Failed to unblock: \(error.localizedDescription)"
-                } else {
-                    self.blocked.removeAll(where: { $0 == other })
-                }
-                cont.resume()
-            }
+    // MARK: - Promoter helper
+    private func isPromoter(_ completion: @escaping (Bool) -> Void) {
+        guard let uid = Auth.auth().currentUser?.uid else { completion(false); return }
+        let db = Database.database().reference()
+        db.child("promoters").child(uid).observeSingleEvent(of: .value) { snap in
+            completion(snap.exists())
         }
     }
 }
 
-// MARK: - AdminDashboard placeholder
-// Replace with your real dashboard entry view. Protected by isAdminUser guard above.
-private struct AdminDashboardViewPlaceholder: View {
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "lock.shield")
-                .font(.system(size: 40, weight: .semibold))
-            Text("Admin Dashboard")
-                .font(.title3).bold()
-            Text("Admins only. Promoters cannot access this area.")
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-        }
-        .padding()
-    }
-}
-
-func isPromoter(_ completion: @escaping (Bool) -> Void) {
-    guard let uid = Auth.auth().currentUser?.uid else { completion(false); return }
-    let db = Database.database().reference()
-    db.child("promoters").child(uid).observeSingleEvent(of: .value) { snap in
-        completion(snap.exists())
-    }
-}
-
-// MARK: - Notification helpers
-// NOTE: We intentionally DO NOT redeclare `.openEventFromDeepLink` here to avoid duplicate symbol.
-// Keep only the ones unlikely to exist elsewhere. If you already declared these in another file,
-// remove this extension.
+// MARK: - Notifications
 extension Notification.Name {
     static let openSettings = Notification.Name("openSettings")
     static let openBlockedUsers = Notification.Name("openBlockedUsers")
+    static let openBlackAppMoney = Notification.Name("openBlackAppMoney")
+    static let globalSearchTapped = Notification.Name("globalSearchTapped")
+    static let globalLogoTapped = Notification.Name("globalLogoTapped")
 }
 
 // MARK: - UIKit helper
-private extension UIApplication {
-    var keyWindow: UIWindow? {
-        connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first { $0.isKeyWindow }
-    }
-
+extension UIApplication {
     var topMostController: UIViewController? {
-        guard var top = keyWindow?.rootViewController else { return nil }
-        while let presented = top.presentedViewController {
-            top = presented
-        }
+        guard let scene = connectedScenes.first as? UIWindowScene else { return nil }
+        guard let key = scene.windows.first(where: { $0.isKeyWindow }) else { return nil }
+        var top = key.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
         return top
     }
 }

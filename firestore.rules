@@ -1,0 +1,204 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Keep your current public readability for everything by default
+    match /{document=**} {
+      allow read: if true;
+    }
+
+    /* ----------------- Helpers ----------------- */
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function isReservedCollection(c) {
+      return c == "usernames" || c == "displaynames" || c == "users";
+    }
+
+    // Check if either user has blocked the other
+    function isBlocked(a, b) {
+      return exists(/databases/$(database)/documents/blocks/$(a)/blocked/$(b)) ||
+             exists(/databases/$(database)/documents/blocks/$(b)/blocked/$(a));
+    }
+
+    // NEW: DM unlock gate based on mutual accepted contacts
+    function contactsAccepted(a, b) {
+      return
+        exists(/databases/$(database)/documents/users/$(a)/contacts/$(b)) &&
+        exists(/databases/$(database)/documents/users/$(b)/contacts/$(a)) &&
+        get(/databases/$(database)/documents/users/$(a)/contacts/$(b)).data.accepted == true &&
+        get(/databases/$(database)/documents/users/$(b)/contacts/$(a)).data.accepted == true;
+    }
+
+    /* ---------- Username / Displayname (unchanged) ---------- */
+    match /usernames/{uname} {
+      allow create: if !exists(/databases/$(database)/documents/usernames/$(uname))
+                    && request.resource.data.keys().hasOnly(["reservedAt","uid"])
+                    && request.resource.data.uid == ""
+                    && request.resource.data.reservedAt is timestamp;
+      allow update: if signedIn()
+                    && resource.data.uid == ""
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasOnly(["reservedAt","uid"]);
+      allow delete: if false;
+    }
+
+    match /displaynames/{nameLower} {
+      allow create: if !exists(/databases/$(database)/documents/displaynames/$(nameLower))
+                    && request.resource.data.keys().hasOnly(["reservedAt","uid"])
+                    && request.resource.data.uid == ""
+                    && request.resource.data.reservedAt is timestamp;
+      allow update: if signedIn()
+                    && resource.data.uid == ""
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasOnly(["reservedAt","uid"]);
+      allow delete: if false;
+    }
+
+    /* ---------------- Users + contacts (unchanged) ---------------- */
+    match /users/{uid} {
+      allow read: if true;
+      allow write: if signedIn() && request.auth.uid == uid;
+
+      match /contacts/{otherUid} {
+        allow read, create, update, delete: if isSelf(uid);
+      }
+    }
+
+    /* ---------------------- Blocks ---------------------- */
+    // blocks/{uid}/blocked/{otherUid}
+    // Users can read/manage only their own blocked list.
+    match /blocks/{uid} {
+      allow read: if isSelf(uid);
+      allow write: if false; // subcollection rules handle writes
+
+      match /blocked/{otherUid} {
+        allow read: if isSelf(uid);
+        // Create/delete only by the owner of {uid}
+        allow create, update, delete: if isSelf(uid);
+      }
+    }
+
+    /* -------------------- Direct Chats -------------------- */
+    // directChats/{chatId} must have participants: [uidA, uidB]
+    function dmDoc(chatId) {
+      return get(/databases/$(database)/documents/directChats/$(chatId));
+    }
+
+    function dmParticipants(chatId) {
+      return dmDoc(chatId).data.participants;
+    }
+
+    function isDmMember(chatId) {
+      return signedIn()
+             && dmDoc(chatId).data.participants != null
+             && request.auth.uid in dmParticipants(chatId);
+    }
+
+    // NEW: DM is only usable when mutual acceptance exists
+    function isDmUnlocked(chatId) {
+      // Require exactly 2 participants for DMs
+      return dmParticipants(chatId) != null
+             && dmParticipants(chatId).size() == 2
+             && contactsAccepted(dmParticipants(chatId)[0], dmParticipants(chatId)[1]);
+    }
+
+    match /directChats/{chatId} {
+
+      // Create: user must be in participants[] AND chat must be unlocked already
+      // (This prevents creating/using DMs before accept.)
+      allow create: if signedIn()
+                    && request.resource.data.participants is list
+                    && request.resource.data.participants.size() == 2
+                    && request.auth.uid in request.resource.data.participants
+                    && contactsAccepted(
+                      request.resource.data.participants[0],
+                      request.resource.data.participants[1]
+                    );
+
+      // Read/Update: only members AND unlocked
+      allow read, update: if isDmMember(chatId) && isDmUnlocked(chatId);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        // Read: member + unlocked
+        allow read: if isDmMember(chatId) && isDmUnlocked(chatId);
+
+        // Create: member + unlocked + senderId matches + not blocked
+        // Expect senderId and recipientId stored on the message doc.
+        allow create: if isDmMember(chatId)
+                      && isDmUnlocked(chatId)
+                      && request.resource.data.senderId == request.auth.uid
+                      && request.resource.data.recipientId is string
+                      && !isBlocked(request.auth.uid, request.resource.data.recipientId);
+
+        allow update, delete: if false;
+      }
+
+      match /readStatus/{uid} {
+        // Gate read receipts behind unlocked chat too
+        allow read, create, update: if isDmMember(chatId) && isDmUnlocked(chatId) && isSelf(uid);
+        allow delete: if false;
+      }
+    }
+
+    /* ---------------------- Groups ----------------------- */
+    // groups/{groupId} has fields: members[], adminIds[], ownerId, ...
+    function groupDoc(groupId) {
+      return get(/databases/$(database)/documents/groups/$(groupId));
+    }
+    function isGroupMember(groupId) {
+      return signedIn()
+             && groupDoc(groupId).data.members != null
+             && request.auth.uid in groupDoc(groupId).data.members;
+    }
+    function isGroupAdminOrOwner(groupId) {
+      return signedIn() && (
+        groupDoc(groupId).data.ownerId == request.auth.uid ||
+        (groupDoc(groupId).data.adminIds != null
+         && request.auth.uid in groupDoc(groupId).data.adminIds)
+      );
+    }
+
+    match /groups/{groupId} {
+      allow read: if true;                 // keep your global read
+      allow create: if signedIn();
+      allow update, delete: if isGroupAdminOrOwner(groupId);
+
+      match /messages/{messageId} {
+        allow read: if true;               // keep global read
+        allow create: if isGroupMember(groupId)
+                      && request.resource.data.senderId == request.auth.uid;
+        allow update, delete: if false;
+      }
+
+      match /readStatus/{uid} {
+        allow read, create, update: if isGroupMember(groupId) && isSelf(uid);
+        allow delete: if false;
+      }
+    }
+
+    /* ---------------------- Posts ------------------------ */
+    // Hide posts marked flagged=true from everyone except the owner.
+    match /posts/{postId} {
+      allow read: if !resource.data.flagged
+                  || (signedIn() && request.auth.uid == resource.data.userId);
+      // Owners can write their own post docs
+      allow write: if signedIn() && request.auth.uid == request.resource.data.userId;
+    }
+
+    /* ---------------------- Reports ---------------------- */
+    // Keep reports private but allow any signed-in user to submit.
+    match /reports/{reportId} {
+      allow create: if signedIn();
+      allow read: if false; // overrides global read above for this path
+      allow update, delete: if false;
+    }
+
+    /* ---- Generic 2-level writer (kept as in your file) ---- */
+    match /{collection}/{doc} {
+      // Prevent writes to reserved collections via this catch-all.
+      allow write: if signedIn() && !isReservedCollection(collection);
+    }
+  }
+}
+

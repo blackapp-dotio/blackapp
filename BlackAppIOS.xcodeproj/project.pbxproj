@@ -12,6 +12,16 @@
 		4D0407312E1182240005F8B3 /* OneSignalInAppMessages in Frameworks */ = {isa = PBXBuildFile; productRef = 4D0407302E1182240005F8B3 /* OneSignalInAppMessages */; };
 		4D0407332E1182240005F8B3 /* OneSignalLocation in Frameworks */ = {isa = PBXBuildFile; productRef = 4D0407322E1182240005F8B3 /* OneSignalLocation */; };
 		4D145EED2DD81E8800187598 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 4D145EEC2DD81E8800187598 /* FirebaseMessaging */; };
+		4D64C5342EE877FD0096A354 /* Stripe in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5332EE877FD0096A354 /* Stripe */; };
+		4D64C5362EE877FD0096A354 /* StripeApplePay in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5352EE877FD0096A354 /* StripeApplePay */; };
+		4D64C5382EE877FD0096A354 /* StripeCardScan in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5372EE877FD0096A354 /* StripeCardScan */; };
+		4D64C53A2EE877FD0096A354 /* StripeConnect in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5392EE877FD0096A354 /* StripeConnect */; };
+		4D64C53C2EE877FD0096A354 /* StripeFinancialConnections in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C53B2EE877FD0096A354 /* StripeFinancialConnections */; };
+		4D64C53E2EE877FD0096A354 /* StripeIdentity in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C53D2EE877FD0096A354 /* StripeIdentity */; };
+		4D64C5402EE877FD0096A354 /* StripeIssuing in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C53F2EE877FD0096A354 /* StripeIssuing */; };
+		4D64C5422EE877FD0096A354 /* StripePaymentSheet in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5412EE877FD0096A354 /* StripePaymentSheet */; };
+		4D64C5442EE877FD0096A354 /* StripePayments in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5432EE877FD0096A354 /* StripePayments */; };
+		4D64C5462EE877FD0096A354 /* StripePaymentsUI in Frameworks */ = {isa = PBXBuildFile; productRef = 4D64C5452EE877FD0096A354 /* StripePaymentsUI */; };
 		4D95E4952E11CCE00094970F /* FirebaseFunctions in Frameworks */ = {isa = PBXBuildFile; productRef = 4D95E4942E11CCE00094970F /* FirebaseFunctions */; };
 		4D95E4972E11CD520094970F /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = 4D95E4962E11CD520094970F /* FirebaseAnalytics */; };
 		4D95E4992E11CD520094970F /* FirebaseAnalyticsOnDeviceConversion in Frameworks */ = {isa = PBXBuildFile; productRef = 4D95E4982E11CD520094970F /* FirebaseAnalyticsOnDeviceConversion */; };
@@ -122,6 +132,7 @@
 				DF2C69282D9E52D4006B738D /* BraintreeVenmo in Frameworks */,
 				DF3D08C22D9B88D600674B8E /* FirebaseDatabase in Frameworks */,
 				4D95E4992E11CD520094970F /* FirebaseAnalyticsOnDeviceConversion in Frameworks */,
+				4D64C5382EE877FD0096A354 /* StripeCardScan in Frameworks */,
 				4D95E49D2E11CD520094970F /* FirebaseAppCheck in Frameworks */,
 				4D95E4952E11CCE00094970F /* FirebaseFunctions in Frameworks */,
 				DF3D08C42D9B9EB900674B8E /* FirebaseAuth in Frameworks */,
@@ -131,8 +142,13 @@
 				DF2C695E2D9ED959006B738D /* BraintreeAmericanExpress in Frameworks */,
 				4D95E4B12E11CD520094970F /* FirebasePerformance in Frameworks */,
 				DF3D08BC2D9B7BF500674B8E /* FirebaseCore in Frameworks */,
+				4D64C5422EE877FD0096A354 /* StripePaymentSheet in Frameworks */,
 				4D95E4A32E11CD520094970F /* FirebaseCrashlytics in Frameworks */,
+				4D64C5442EE877FD0096A354 /* StripePayments in Frameworks */,
+				4D64C53C2EE877FD0096A354 /* StripeFinancialConnections in Frameworks */,
+				4D64C53A2EE877FD0096A354 /* StripeConnect in Frameworks */,
 				4D145EED2DD81E8800187598 /* FirebaseMessaging in Frameworks */,
+				4D64C5402EE877FD0096A354 /* StripeIssuing in Frameworks */,
 				DF3D08C92D9BA0E000674B8E /* GoogleSignInSwift in Frameworks */,
 				DF2C692A2D9E543D006B738D /* BraintreeCore in Frameworks */,
 				DF3D08C02D9B7BF500674B8E /* FirebaseStorage in Frameworks */,
@@ -144,11 +160,15 @@
 				4DC652C82DC48F6C00647786 /* FontAwesome in Frameworks */,
 				4D04072D2E1182240005F8B3 /* OneSignalExtension in Frameworks */,
 				4D0407332E1182240005F8B3 /* OneSignalLocation in Frameworks */,
+				4D64C5362EE877FD0096A354 /* StripeApplePay in Frameworks */,
 				4D04072F2E1182240005F8B3 /* OneSignalFramework in Frameworks */,
 				DF2C692C2D9E5915006B738D /* BraintreeDataCollector in Frameworks */,
 				4D95E4A72E11CD520094970F /* FirebaseFirestoreCombine-Community in Frameworks */,
 				4D95E4AB2E11CD520094970F /* FirebaseInAppMessaging-Beta in Frameworks */,
+				4D64C53E2EE877FD0096A354 /* StripeIdentity in Frameworks */,
+				4D64C5462EE877FD0096A354 /* StripePaymentsUI in Frameworks */,
 				4D95E4A52E11CD520094970F /* FirebaseDynamicLinks in Frameworks */,
+				4D64C5342EE877FD0096A354 /* Stripe in Frameworks */,
 				4D95E4B72E11CD520094970F /* FirebaseVertexAI in Frameworks */,
 				DF3D08BE2D9B7BF500674B8E /* FirebaseFirestore in Frameworks */,
 				DF3D08C72D9BA0E000674B8E /* GoogleSignIn in Frameworks */,
@@ -266,6 +286,16 @@
 				4D95E4B22E11CD520094970F /* FirebaseRemoteConfig */,
 				4D95E4B42E11CD520094970F /* FirebaseStorageCombine-Community */,
 				4D95E4B62E11CD520094970F /* FirebaseVertexAI */,
+				4D64C5332EE877FD0096A354 /* Stripe */,
+				4D64C5352EE877FD0096A354 /* StripeApplePay */,
+				4D64C5372EE877FD0096A354 /* StripeCardScan */,
+				4D64C5392EE877FD0096A354 /* StripeConnect */,
+				4D64C53B2EE877FD0096A354 /* StripeFinancialConnections */,
+				4D64C53D2EE877FD0096A354 /* StripeIdentity */,
+				4D64C53F2EE877FD0096A354 /* StripeIssuing */,
+				4D64C5412EE877FD0096A354 /* StripePaymentSheet */,
+				4D64C5432EE877FD0096A354 /* StripePayments */,
+				4D64C5452EE877FD0096A354 /* StripePaymentsUI */,
 			);
 			productName = BlackAppIOS;
 			productReference = DFFD0B082D97B84100202596 /* BlackAppIOS.app */;
@@ -357,6 +387,7 @@
 				DF6B9A472DADAE7200C228A2 /* XCRemoteSwiftPackageReference "SDWebImageSwiftUI" */,
 				4DC652C62DC48F6C00647786 /* XCRemoteSwiftPackageReference "FontAwesome" */,
 				4D0407292E1077690005F8B3 /* XCRemoteSwiftPackageReference "OneSignal-iOS-SDK" */,
+				4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = DFFD0B092D97B84100202596 /* Products */;
@@ -556,7 +587,7 @@
 				CODE_SIGN_ENTITLEMENTS = BlackAppIOS/BlackAppIOS.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"BlackAppIOS/Preview Content\"";
 				DEVELOPMENT_TEAM = A7Q8XT75CC;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -585,7 +616,7 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.7;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.blackapp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -594,7 +625,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 2.2;
+				XROS_DEPLOYMENT_TARGET = 3.0;
 			};
 			name = Debug;
 		};
@@ -607,7 +638,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"BlackAppIOS/Preview Content\"";
 				DEVELOPMENT_TEAM = A7Q8XT75CC;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -636,7 +667,7 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 14.7;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.blackapp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -644,7 +675,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 2.2;
+				XROS_DEPLOYMENT_TARGET = 3.0;
 			};
 			name = Release;
 		};
@@ -788,6 +819,14 @@
 				minimumVersion = 5.2.14;
 			};
 		};
+		4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stripe/stripe-ios";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 25.2.0;
+			};
+		};
 		4DC652C62DC48F6C00647786 /* XCRemoteSwiftPackageReference "FontAwesome" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/thii/FontAwesome.swift";
@@ -863,6 +902,56 @@
 			isa = XCSwiftPackageProductDependency;
 			package = DF3D08BA2D9B302900674B8E /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseMessaging;
+		};
+		4D64C5332EE877FD0096A354 /* Stripe */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = Stripe;
+		};
+		4D64C5352EE877FD0096A354 /* StripeApplePay */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeApplePay;
+		};
+		4D64C5372EE877FD0096A354 /* StripeCardScan */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeCardScan;
+		};
+		4D64C5392EE877FD0096A354 /* StripeConnect */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeConnect;
+		};
+		4D64C53B2EE877FD0096A354 /* StripeFinancialConnections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeFinancialConnections;
+		};
+		4D64C53D2EE877FD0096A354 /* StripeIdentity */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeIdentity;
+		};
+		4D64C53F2EE877FD0096A354 /* StripeIssuing */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripeIssuing;
+		};
+		4D64C5412EE877FD0096A354 /* StripePaymentSheet */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripePaymentSheet;
+		};
+		4D64C5432EE877FD0096A354 /* StripePayments */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripePayments;
+		};
+		4D64C5452EE877FD0096A354 /* StripePaymentsUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D64C5322EE877FD0096A354 /* XCRemoteSwiftPackageReference "stripe-ios" */;
+			productName = StripePaymentsUI;
 		};
 		4D95E4942E11CCE00094970F /* FirebaseFunctions */ = {
 			isa = XCSwiftPackageProductDependency;
